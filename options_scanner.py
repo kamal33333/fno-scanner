@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import warnings
 warnings.filterwarnings('ignore')
@@ -13,28 +14,33 @@ import numpy as np
 from scipy.stats import norm
 
 # ==============================================================================
-# 🔐 CREDENTIALS & ENVIRONMENT VARIABLES (AUTO-READS FROM GITHUB SECRETS)
+# 🔐 CREDENTIALS & ENVIRONMENT VARIABLES (AUTO-SANITIZES GITHUB SECRETS)
 # ==============================================================================
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
-EVENT_NAME         = os.environ.get("GITHUB_EVENT_NAME", "manual")
+RAW_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+RAW_CHATID = os.environ.get("TELEGRAM_CHAT_ID", "").strip().strip('"').strip("'")
+EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "manual")
+
+# Automatically extract valid "123456789:ABC-DEF..." token even if "bot" or quotes were pasted
+token_match = re.search(r'(\d+:[A-Za-z0-9_-]+)', RAW_TOKEN)
+TELEGRAM_BOT_TOKEN = token_match.group(1) if token_match else RAW_TOKEN.lstrip("bot").strip('"').strip("'")
+TELEGRAM_CHAT_ID   = RAW_CHATID
 
 RISK_PER_TRADE        = 3000      # Max Rupee risk per option trade (₹)
 MAX_CAPITAL_PER_TRADE = 45000     # Max Option Premium outlay per trade (₹)
 
-# Intraday 15-Minute Scalping Parameters (Calibrated for 15m Option Momentum)
-INTRA_RR_RATIO        = 1.6       # 1:1.6 Underlying RR (~1:2.0 Option Premium RR with Gamma)
-INTRA_ATR_SL_MULT     = 1.0       # 1.0x 15m-ATR Stop Loss
+# Intraday 15-Minute Scalping Parameters
+INTRA_RR_RATIO        = 1.6
+INTRA_ATR_SL_MULT     = 1.0
 INTRA_MAX_BARS        = 12        # 12 bars (3 hours) intraday window
-INTRA_MIN_SETUPS      = 5         # Minimum historical setups in 60 days
-INTRA_MIN_WIN_PROB    = 28.0      # Captures 28%-55% win-prob distribution, sorted highest first
+INTRA_MIN_SETUPS      = 5
+INTRA_MIN_WIN_PROB    = 28.0
 
-# Daily Short-Term F&O Parameters (Calibrated for 3-5 Day F&O Momentum)
-SWING_RR_RATIO        = 1.8       # 1:1.8 Underlying RR (~1:2.2 Option Premium RR with Gamma)
-SWING_ATR_SL_MULT     = 1.0       # 1.0x Daily-ATR Stop Loss
+# Daily Short-Term F&O Parameters (3-5 Days Validity)
+SWING_RR_RATIO        = 1.8
+SWING_ATR_SL_MULT     = 1.0
 SWING_MAX_DAYS        = 6         # 6 trading days max hold before Theta decay
-SWING_MIN_SETUPS      = 6         # Minimum historical setups in 2 years
-SWING_MIN_WIN_PROB    = 28.0      # Captures 28%-55% win-prob distribution, sorted highest first
+SWING_MIN_SETUPS      = 6
+SWING_MIN_WIN_PROB    = 28.0
 
 RISK_FREE_RATE        = 0.068
 
@@ -60,7 +66,7 @@ FNO_UNIVERSE = {
     "HDFCBANK.NS":   {"name": "HDFCBANK",   "nse": "HDFCBANK",   "lot": 550,  "step": 20,  "is_idx": False},
     "ICICIBANK.NS":  {"name": "ICICIBANK",  "nse": "ICICIBANK",  "lot": 700,  "step": 20,  "is_idx": False},
     "SBIN.NS":       {"name": "SBIN",       "nse": "SBIN",       "lot": 750,  "step": 10,  "is_idx": False},
-    "TATAMOTORS.NS": {"name": "TATAMOTORS", "nse": "TATAMOTORS", "lot": 550,  "step": 10,  "is_idx": False},
+    "TATASTEEL.NS":  {"name": "TATASTEEL",  "nse": "TATASTEEL",  "lot": 5500, "step": 2.5, "is_idx": False},
     "BAJFINANCE.NS": {"name": "BAJFINANCE", "nse": "BAJFINANCE", "lot": 125,  "step": 100, "is_idx": False},
     "HAL.NS":        {"name": "HAL",        "nse": "HAL",        "lot": 150,  "step": 50,  "is_idx": False},
     "BEL.NS":        {"name": "BEL",        "nse": "BEL",        "lot": 2850, "step": 5,   "is_idx": False},
@@ -78,9 +84,6 @@ FNO_UNIVERSE = {
     "GLAND.NS":      {"name": "GLAND",      "nse": "GLAND",      "lot": 250,  "step": 20,  "is_idx": False},
 }
 
-# ==============================================================================
-# 🧹 MULTI-INDEX SAFE DATAFRAME EXTRACTOR
-# ==============================================================================
 def extract_ticker_df(raw_data, ticker):
     if raw_data is None or raw_data.empty:
         return pd.DataFrame()
@@ -117,9 +120,6 @@ def extract_ticker_df(raw_data, ticker):
     except Exception:
         return pd.DataFrame()
 
-# ==============================================================================
-# 🧮 BLACK-SCHOLES OPTION PRICER & GREEKS TRANSLATOR
-# ==============================================================================
 def black_scholes_greeks(S, K, T, r, sigma, option_type="CE"):
     T = max(T, 2.0 / 365.0)
     sigma = max(sigma, 0.12)
@@ -146,9 +146,6 @@ def get_dte(is_intraday=False):
     dte = (last_thursday - today).days
     return dte if dte >= 6 else dte + 28
 
-# ==============================================================================
-# 📊 TECHNICAL INDICATORS (DAILY & 15-MINUTE ENGINES)
-# ==============================================================================
 def compute_daily_indicators(df):
     df = df.copy()
     df['EMA21']  = df['Close'].ewm(span=21, adjust=False).mean()
@@ -220,9 +217,6 @@ def compute_intraday_15m_indicators(df):
     )
     return df
 
-# ==============================================================================
-# ⏱️ NON-OVERLAPPING BACKTEST ENGINE (EXACT SETUP COUNT & WIN PROBABILITY)
-# ==============================================================================
 def backtest_signals(df, direction="CE", atr_mult=1.0, rr=1.8, max_bars=6, is_intraday=False):
     sig_col = 'CE_Signal' if direction == "CE" else 'PE_Signal'
     closes, highs, lows, atrs, sigs = (
@@ -261,7 +255,6 @@ def backtest_signals(df, direction="CE", atr_mult=1.0, rr=1.8, max_bars=6, is_in
                     break
         if won:
             wins += 1
-        # Advance past current trade so consecutive bars aren't double-counted
         i = max(i + 1, exit_bar)
     win_prob = (wins / total * 100.0) if total > 0 else 0.0
     return wins, total, win_prob
@@ -328,16 +321,25 @@ def format_table(records, title):
     return "\n".join(lines)
 
 def send_telegram_alert(message_text):
-    if not TELEGRAM_BOT_TOKEN or "YOUR_TELEGRAM" in TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or "YOUR_TELEGRAM" in TELEGRAM_CHAT_ID:
-        print("❌ ERROR: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing in GitHub Repository Secrets!")
+    if not TELEGRAM_BOT_TOKEN or ":" not in TELEGRAM_BOT_TOKEN:
+        print(
+            f"❌ INVALID TELEGRAM_BOT_TOKEN FORMAT! "
+            f"(Length: {len(TELEGRAM_BOT_TOKEN)}, Contains ':': {':' in TELEGRAM_BOT_TOKEN}). "
+            f"A valid token from @BotFather must look like '1234567890:AAHxyz...'."
+        )
         sys.exit(1)
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": f"<pre>{message_text}</pre>", "parse_mode": "HTML"}
     r = requests.post(url, data=payload, timeout=15)
     if r.status_code == 200:
         print("✅ Telegram notification delivered successfully!")
     else:
-        print(f"❌ Telegram API rejected the message ({r.status_code}): {r.text}")
+        print(
+            f"❌ Telegram API rejected the message ({r.status_code}): {r.text}\n"
+            f"🔍 Diagnostic -> Token starts with digits: {TELEGRAM_BOT_TOKEN[:4].isdigit()}, "
+            f"Token length: {len(TELEGRAM_BOT_TOKEN)}, Chat ID length: {len(TELEGRAM_CHAT_ID)}"
+        )
         sys.exit(1)
 
 def get_live_vix():
@@ -369,11 +371,9 @@ def main():
     india_vix = get_live_vix()
     print(f"🕒 IST Time: {now_ist.strftime('%Y-%m-%d %H:%M')} | Event: {EVENT_NAME} | India VIX: {india_vix*100:.2f}%")
 
-    messages_sent = 0
-
     if run_intraday:
         raw_15m = yf.download(tickers, period="60d", interval="15m", group_by="ticker", progress=False)
-        intra_live, intra_watch = [], []
+        intra_all, intra_live_count = [], 0
         for tk, meta in FNO_UNIVERSE.items():
             df15 = extract_ticker_df(raw_15m, tk)
             if len(df15) < 80:
@@ -385,19 +385,20 @@ def main():
             wins, tot, wp = backtest_signals(df15, opt_type, INTRA_ATR_SL_MULT, INTRA_RR_RATIO, INTRA_MAX_BARS, True)
             if tot >= INTRA_MIN_SETUPS and wp >= INTRA_MIN_WIN_PROB:
                 row = build_option_trade_row(meta, df15, opt_type, is_live, wins, tot, wp, india_vix, True)
-                (intra_live if is_live else intra_watch).append(row)
+                intra_all.append(row)
+                if is_live:
+                    intra_live_count += 1
 
-        intra_final = sorted(intra_live, key=lambda x: x["WinProbNum"], reverse=True) + \
-                      sorted(intra_watch, key=lambda x: x["WinProbNum"], reverse=True)
-        if (intra_live or EVENT_NAME != "schedule") and intra_final:
+        # Strictly sort from Highest Win Prob to Lowest Win Prob
+        intra_final = sorted(intra_all, key=lambda x: x["WinProbNum"], reverse=True)
+        if (intra_live_count > 0 or EVENT_NAME != "schedule") and intra_final:
             msg = format_table(intra_final, f"15M INTRADAY SCALPS ({now_ist.strftime('%H:%M IST')})")
             print("\n" + msg)
             send_telegram_alert(msg)
-            messages_sent += 1
 
     if run_swing:
         raw_1d = yf.download(tickers, period="2y", interval="1d", group_by="ticker", progress=False)
-        swing_live, swing_watch = [], []
+        swing_all = []
         for tk, meta in FNO_UNIVERSE.items():
             df1d = extract_ticker_df(raw_1d, tk)
             if len(df1d) < 100:
@@ -409,18 +410,14 @@ def main():
             wins, tot, wp = backtest_signals(df1d, opt_type, SWING_ATR_SL_MULT, SWING_RR_RATIO, SWING_MAX_DAYS, False)
             if tot >= SWING_MIN_SETUPS and wp >= SWING_MIN_WIN_PROB:
                 row = build_option_trade_row(meta, df1d, opt_type, is_live, wins, tot, wp, india_vix, False)
-                (swing_live if is_live else swing_watch).append(row)
+                swing_all.append(row)
 
-        swing_final = sorted(swing_live, key=lambda x: x["WinProbNum"], reverse=True) + \
-                      sorted(swing_watch, key=lambda x: x["WinProbNum"], reverse=True)
+        # Strictly sort from Highest Win Prob to Lowest Win Prob
+        swing_final = sorted(swing_all, key=lambda x: x["WinProbNum"], reverse=True)
         if swing_final:
             msg = format_table(swing_final, f"3-5D POSITIONAL F&O ({now_ist.strftime('%d %b')})")
             print("\n" + msg)
             send_telegram_alert(msg)
-            messages_sent += 1
-
-    if messages_sent == 0 and EVENT_NAME != "schedule":
-        send_telegram_alert("ℹ️ Scanner ran successfully, but no tickers returned data.")
 
 if __name__ == "__main__":
     main()
