@@ -31,14 +31,14 @@ MAX_CAPITAL_PER_TRADE = 45000     # Max Option Premium outlay per trade (₹)
 INTRA_RR_RATIO        = 2.2       # Intraday Risk/Reward (1:2.2)
 INTRA_ATR_SL_MULT     = 0.9       # Tighter 0.9x ATR stop loss
 INTRA_MAX_BARS        = 10        # 10 bars intraday window
-INTRA_MIN_SETUPS      = 10        # Minimum historical setups
-INTRA_MIN_WIN_PROB    = 30.0      # Minimum Win Prob % filter
+INTRA_MIN_SETUPS      = 8        # Minimum historical setups
+INTRA_MIN_WIN_PROB    = 26.0      # Minimum Win Prob % filter
 
 SWING_RR_RATIO        = 2.8       # Swing Risk/Reward (1:2.8)
 SWING_ATR_SL_MULT     = 1.0       # 1.0x Daily ATR stop loss
 SWING_MAX_DAYS        = 5         # 5 trading days max hold before Theta decay
-SWING_MIN_SETUPS      = 12        # Minimum historical setups in 5 years
-SWING_MIN_WIN_PROB    = 30.0      # Minimum Win Prob % filter
+SWING_MIN_SETUPS      = 8        # Minimum historical setups in 5 years
+SWING_MIN_WIN_PROB    = 26      # Minimum Win Prob % filter
 
 RISK_FREE_RATE        = 0.068
 
