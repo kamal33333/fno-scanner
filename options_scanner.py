@@ -28,17 +28,17 @@ RISK_PER_TRADE        = 3000      # Max Rupee risk per option trade (₹)
 MAX_CAPITAL_PER_TRADE = 45000     # Max Option Premium outlay per trade (₹)
 
 # Upgraded Parameters for 5-Year High-Probability Options Buying
-INTRA_RR_RATIO        = 2.2       # Upgraded Intraday Risk/Reward (1:2.2)
-INTRA_ATR_SL_MULT     = 0.9       # Tighter 0.9x ATR stop loss for higher accuracy
+INTRA_RR_RATIO        = 2.2       # Intraday Risk/Reward (1:2.2)
+INTRA_ATR_SL_MULT     = 0.9       # Tighter 0.9x ATR stop loss
 INTRA_MAX_BARS        = 10        # 10 bars intraday window
-INTRA_MIN_SETUPS      = 12        # Minimum historical setups in 5-year lookback
-INTRA_MIN_WIN_PROB    = 34.0      # Minimum Win Prob % filter
+INTRA_MIN_SETUPS      = 10        # Minimum historical setups
+INTRA_MIN_WIN_PROB    = 30.0      # Minimum Win Prob % filter
 
-SWING_RR_RATIO        = 2.8       # Upgraded Swing Risk/Reward (1:2.8)
+SWING_RR_RATIO        = 2.8       # Swing Risk/Reward (1:2.8)
 SWING_ATR_SL_MULT     = 1.0       # 1.0x Daily ATR stop loss
 SWING_MAX_DAYS        = 5         # 5 trading days max hold before Theta decay
-SWING_MIN_SETUPS      = 15        # Minimum historical setups in 5 years
-SWING_MIN_WIN_PROB    = 34.0      # Minimum Win Prob % filter
+SWING_MIN_SETUPS      = 12        # Minimum historical setups in 5 years
+SWING_MIN_WIN_PROB    = 30.0      # Minimum Win Prob % filter
 
 RISK_FREE_RATE        = 0.068
 
@@ -168,12 +168,12 @@ def compute_daily_indicators(df):
 
     df['CE_Signal'] = (
         (df['Close'] > df['EMA21']) &
-        (df['RSI'] >= 48) & (df['RSI'] <= 72) &
+        (df['RSI'] >= 45) & (df['RSI'] <= 75) &
         (df['MACD_Hist'] > df['MACD_Hist'].shift(1))
     )
     df['PE_Signal'] = (
         (df['Close'] < df['EMA21']) &
-        (df['RSI'] >= 28) & (df['RSI'] <= 52) &
+        (df['RSI'] >= 25) & (df['RSI'] <= 55) &
         (df['MACD_Hist'] < df['MACD_Hist'].shift(1))
     )
     return df
@@ -204,13 +204,13 @@ def compute_intraday_15m_indicators(df):
     df['HV20'] = np.log(df['Close'] / df['Close'].shift(1)).rolling(50).std() * np.sqrt(252 * 25)
 
     df['CE_Signal'] = (
-        (df['Close'] > df['VWAP']) & (df['Close'] > df['EMA21']) &
-        (df['RSI'] >= 50) & (df['RSI'] <= 74) &
+        (df['Close'] > df['VWAP']) &
+        (df['RSI'] >= 48) & (df['RSI'] <= 76) &
         (df['MACD_Hist'] > df['MACD_Hist'].shift(1))
     )
     df['PE_Signal'] = (
-        (df['Close'] < df['VWAP']) & (df['Close'] < df['EMA21']) &
-        (df['RSI'] >= 26) & (df['RSI'] <= 50) &
+        (df['Close'] < df['VWAP']) &
+        (df['RSI'] >= 24) & (df['RSI'] <= 52) &
         (df['MACD_Hist'] < df['MACD_Hist'].shift(1))
     )
     return df
@@ -257,7 +257,7 @@ def backtest_signals(df, direction="CE", atr_mult=1.0, rr=2.2, max_bars=6, is_in
     win_prob = (wins / total * 100.0) if total > 0 else 0.0
     return wins, total, win_prob
 
-def build_option_trade_row(meta, df, opt_type, is_live, wins, total, win_prob, india_vix, is_intraday):
+def build_option_trade_row(meta, df, opt_type, wins, total, win_prob, india_vix, is_intraday):
     latest = df.iloc[-1]
     spot   = float(latest['Close'])
     atr    = float(latest['ATR'])
@@ -286,11 +286,10 @@ def build_option_trade_row(meta, df, opt_type, is_live, wins, total, win_prob, i
     opt_tgt   = round(opt_entry + opt_reward, 2)
     opt_entry = round(opt_entry, 2)
 
-    # Calculate exact Option Risk/Reward Ratio string (e.g. 1:2.4)
-    opt_risk_pts  = max(opt_entry - opt_sl, 0.05)
+    opt_risk_pts   = max(opt_entry - opt_sl, 0.05)
     opt_reward_pts = max(opt_tgt - opt_entry, 0.05)
-    actual_rr     = round(opt_reward_pts / opt_risk_pts, 1)
-    rr_str        = f"1:{actual_rr}"
+    actual_rr      = round(opt_reward_pts / opt_risk_pts, 1)
+    rr_str         = f"1:{actual_rr}"
 
     lot_size     = meta["lot"]
     risk_per_lot = max((opt_entry - opt_sl) * lot_size, 1.0)
@@ -310,8 +309,7 @@ def build_option_trade_row(meta, df, opt_type, is_live, wins, total, win_prob, i
         "RR": rr_str,
         "Setups": f"{wins}/{total}",
         "Win Prob": f"{win_prob:.1f}%",
-        "WinProbNum": win_prob,
-        "Live": is_live
+        "WinProbNum": win_prob
     }
 
 def format_table(records, title):
@@ -360,61 +358,61 @@ def main():
             print(f"⏸️ Outside Indian Market Hours ({now_ist.strftime('%H:%M IST')}). Exiting.")
             return
 
-    run_intraday = True
-    run_swing = (EVENT_NAME != "schedule") or (current_minutes <= 9 * 60 + 45) or (current_minutes >= 14 * 60 + 45)
-
     tickers = list(FNO_UNIVERSE.keys())
     india_vix = get_live_vix()
     print(f"🕒 IST Time: {now_ist.strftime('%Y-%m-%d %H:%M')} | 5-Year Backtest Engine | India VIX: {india_vix*100:.2f}%")
 
-    if run_intraday:
-        # Intraday 15m data max fetch limit on Yahoo Finance is 60 days
-        raw_15m = yf.download(tickers, period="60d", interval="15m", group_by="ticker", progress=False)
-        intra_all, intra_live_count = [], 0
-        for tk, meta in FNO_UNIVERSE.items():
-            df15 = extract_ticker_df(raw_15m, tk)
-            if len(df15) < 80:
-                continue
-            df15 = compute_intraday_15m_indicators(df15)
-            last = df15.iloc[-1]
-            opt_type = "CE" if float(last['Close']) >= float(last['VWAP']) else "PE"
-            is_live  = bool(last['CE_Signal']) if opt_type == "CE" else bool(last['PE_Signal'])
-            wins, tot, wp = backtest_signals(df15, opt_type, INTRA_ATR_SL_MULT, INTRA_RR_RATIO, INTRA_MAX_BARS, True)
-            if tot >= INTRA_MIN_SETUPS and wp >= INTRA_MIN_WIN_PROB:
-                row = build_option_trade_row(meta, df15, opt_type, is_live, wins, tot, wp, india_vix, True)
-                intra_all.append(row)
-                if is_live:
-                    intra_live_count += 1
+    messages_sent = 0
 
-        intra_final = sorted(intra_all, key=lambda x: x["WinProbNum"], reverse=True)
-        if (intra_live_count > 0 or EVENT_NAME != "schedule") and intra_final:
-            msg = format_table(intra_final, f"15M INTRADAY SCALPS ({now_ist.strftime('%H:%M IST')})")
-            print("\n" + msg)
-            send_telegram_alert(msg)
+    # 1. Intraday 15M Scalps Scan
+    raw_15m = yf.download(tickers, period="60d", interval="15m", group_by="ticker", progress=False)
+    intra_all = []
+    for tk, meta in FNO_UNIVERSE.items():
+        df15 = extract_ticker_df(raw_15m, tk)
+        if len(df15) < 80:
+            continue
+        df15 = compute_intraday_15m_indicators(df15)
+        last = df15.iloc[-1]
+        opt_type = "CE" if float(last['Close']) >= float(last['VWAP']) else "PE"
+        wins, tot, wp = backtest_signals(df15, opt_type, INTRA_ATR_SL_MULT, INTRA_RR_RATIO, INTRA_MAX_BARS, True)
+        if tot >= INTRA_MIN_SETUPS and wp >= INTRA_MIN_WIN_PROB:
+            row = build_option_trade_row(meta, df15, opt_type, wins, tot, wp, india_vix, True)
+            intra_all.append(row)
 
-    if run_swing:
-        # Upgraded to 5-Year Daily Backtesting (`period="5y"`)
-        print("⏳ Downloading 5-Year Daily Historical Data for Backtesting...")
-        raw_1d = yf.download(tickers, period="5y", interval="1d", group_by="ticker", progress=False)
-        swing_all = []
-        for tk, meta in FNO_UNIVERSE.items():
-            df1d = extract_ticker_df(raw_1d, tk)
-            if len(df1d) < 250:
-                continue
-            df1d = compute_daily_indicators(df1d)
-            last = df1d.iloc[-1]
-            opt_type = "CE" if float(last['Close']) >= float(last['EMA21']) else "PE"
-            is_live  = bool(last['CE_Signal']) if opt_type == "CE" else bool(last['PE_Signal'])
-            wins, tot, wp = backtest_signals(df1d, opt_type, SWING_ATR_SL_MULT, SWING_RR_RATIO, SWING_MAX_DAYS, False)
-            if tot >= SWING_MIN_SETUPS and wp >= SWING_MIN_WIN_PROB:
-                row = build_option_trade_row(meta, df1d, opt_type, is_live, wins, tot, wp, india_vix, False)
-                swing_all.append(row)
+    intra_final = sorted(intra_all, key=lambda x: x["WinProbNum"], reverse=True)
+    if intra_final:
+        msg = format_table(intra_final, f"15M INTRADAY SCALPS ({now_ist.strftime('%H:%M IST')})")
+        print("\n" + msg)
+        send_telegram_alert(msg)
+        messages_sent += 1
 
-        swing_final = sorted(swing_all, key=lambda x: x["WinProbNum"], reverse=True)
-        if swing_final:
-            msg = format_table(swing_final, f"3-5D POSITIONAL F&O (5Y BACKTEST)")
-            print("\n" + msg)
-            send_telegram_alert(msg)
+    # 2. 5-Year Positional Swing Scan
+    print("⏳ Downloading 5-Year Daily Historical Data for Backtesting...")
+    raw_1d = yf.download(tickers, period="5y", interval="1d", group_by="ticker", progress=False)
+    swing_all = []
+    for tk, meta in FNO_UNIVERSE.items():
+        df1d = extract_ticker_df(raw_1d, tk)
+        if len(df1d) < 250:
+            continue
+        df1d = compute_daily_indicators(df1d)
+        last = df1d.iloc[-1]
+        opt_type = "CE" if float(last['Close']) >= float(last['EMA21']) else "PE"
+        wins, tot, wp = backtest_signals(df1d, opt_type, SWING_ATR_SL_MULT, SWING_RR_RATIO, SWING_MAX_DAYS, False)
+        if tot >= SWING_MIN_SETUPS and wp >= SWING_MIN_WIN_PROB:
+            row = build_option_trade_row(meta, df1d, opt_type, wins, tot, wp, india_vix, False)
+            swing_all.append(row)
+
+    swing_final = sorted(swing_all, key=lambda x: x["WinProbNum"], reverse=True)
+    if swing_final:
+        msg = format_table(swing_final, f"3-5D POSITIONAL F&O (5Y BACKTEST)")
+        print("\n" + msg)
+        send_telegram_alert(msg)
+        messages_sent += 1
+
+    if messages_sent == 0:
+        fallback_msg = "ℹ️ Scanner ran successfully, but no setups met the minimum win probability threshold."
+        print("\n" + fallback_msg)
+        send_telegram_alert(fallback_msg)
 
 if __name__ == "__main__":
     main()
