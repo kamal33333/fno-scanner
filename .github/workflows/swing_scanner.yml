@@ -1,0 +1,33 @@
+name: Nifty 500 5Y Swing Scanner (swing_scanner)
+
+on:
+  schedule:
+    # 1. Live Closing-Bell Scan at 03:15 PM IST (09:45 UTC), Mon-Fri
+    - cron: '45 9 * * 1-5'
+    # 2. Final EOD Settlement Scan at 04:00 PM IST (10:30 UTC), Mon-Fri
+    - cron: '30 10 * * 1-5'
+  workflow_dispatch: # Manual "Run workflow" button
+
+jobs:
+  run-swing-scanner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout Repository Code
+        uses: actions/checkout@v4
+
+      - name: Set Up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run 5Y Nifty 500 Swing Scanner & Send Telegram Alert
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: python swing_scanner.py
