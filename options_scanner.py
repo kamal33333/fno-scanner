@@ -2,19 +2,14 @@ import os
 import warnings
 warnings.filterwarnings('ignore')
 
+from datetime import datetime
+import calendar
+import pytz
+import requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
 from scipy.stats import norm
-from datetime import datetime, calendar
-import pytz
-import requests
-
-try:
-    from nsepythonserver import nsefetch
-    NSE_LIVE_AVAILABLE = True
-except Exception:
-    NSE_LIVE_AVAILABLE = False
 
 # ==============================================================================
 # 🔐 CREDENTIALS & ENVIRONMENT VARIABLES (AUTO-READS FROM GITHUB SECRETS)
@@ -78,17 +73,38 @@ FNO_UNIVERSE = {
     "NYKAA.NS":      {"name": "NYKAA",      "nse": "NYKAA",      "lot": 3125, "step": 5,   "is_idx": False},
 }
 
+# ==============================================================================
+# 🌐 FAST NSE OPTION CHAIN FETCHER WITH 2-SECOND CIRCUIT BREAKER
+# ==============================================================================
+NSE_CIRCUIT_OPEN = False
+NSE_SESSION = None
+
 def fetch_live_nse_oi_and_chain(nse_symbol, is_index, atm_strike, opt_type):
-    if not NSE_LIVE_AVAILABLE or nse_symbol == "SENSEX":
+    global NSE_CIRCUIT_OPEN, NSE_SESSION
+    if NSE_CIRCUIT_OPEN or nse_symbol == "SENSEX":
         return None, None, None, None
     try:
+        if NSE_SESSION is None:
+            NSE_SESSION = requests.Session()
+            NSE_SESSION.headers.update({
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            })
+            NSE_SESSION.get("https://www.nseindia.com", timeout=2.5)
+            
         url = (f"https://www.nseindia.com/api/option-chain-indices?symbol={nse_symbol}"
                if is_index else
                f"https://www.nseindia.com/api/option-chain-equities?symbol={nse_symbol}")
-        payload = nsefetch(url)
+        resp = NSE_SESSION.get(url, timeout=2.5)
+        if resp.status_code != 200:
+            NSE_CIRCUIT_OPEN = True
+            return None, None, None, None
+            
+        payload = resp.json()
         records = payload.get("records", {}).get("data", [])
         if not records:
             return None, None, None, None
+            
         tot_ce_oi = sum(r.get("CE", {}).get("openInterest", 0) for r in records if "CE" in r)
         tot_pe_oi = sum(r.get("PE", {}).get("openInterest", 0) for r in records if "PE" in r)
         pcr = round(tot_pe_oi / max(tot_ce_oi, 1), 2)
@@ -100,8 +116,30 @@ def fetch_live_nse_oi_and_chain(nse_symbol, is_index, atm_strike, opt_type):
         oi_tag = "LB" if (opt_type == "CE" and chg_oi > 0) else ("SB" if (opt_type == "PE" and chg_oi > 0) else "SC")
         return (ltp if ltp and ltp > 0 else None), (iv / 100.0 if iv and iv > 0 else None), pcr, oi_tag
     except Exception:
+        # Open circuit breaker so GitHub US runner doesn't waste time on blocked requests
+        NSE_CIRCUIT_OPEN = True
         return None, None, None, None
 
+# ==============================================================================
+# 🧹 YFINANCE DATAFRAME EXTRACTOR (HANDLES PYTHON 3.11 MULTIINDEX CLEANLY)
+# ==============================================================================
+def extract_ticker_df(raw_data, ticker):
+    if ticker not in raw_data:
+        return pd.DataFrame()
+    df = raw_data[ticker].copy()
+    if isinstance(df.columns, pd.MultiIndex):
+        df.columns = df.columns.get_level_values(0)
+    required = ['Close', 'High', 'Low', 'Volume']
+    for col in required:
+        if col not in df.columns:
+            return pd.DataFrame()
+        if isinstance(df[col], pd.DataFrame):
+            df[col] = df[col].iloc[:, 0]
+    return df.dropna(subset=['Close', 'High', 'Low']).copy()
+
+# ==============================================================================
+# 🧮 BLACK-SCHOLES OPTION PRICER & GREEKS TRANSLATOR
+# ==============================================================================
 def black_scholes_greeks(S, K, T, r, sigma, option_type="CE"):
     T = max(T, 2.0 / 365.0)
     sigma = max(sigma, 0.11)
@@ -114,7 +152,7 @@ def black_scholes_greeks(S, K, T, r, sigma, option_type="CE"):
     else:
         price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
         delta = -norm.cdf(-d1)
-    return max(price, 1.0), abs(delta), gamma
+    return max(float(price), 1.0), abs(float(delta)), float(gamma)
 
 def get_dte(is_intraday=False):
     ist = pytz.timezone('Asia/Kolkata')
@@ -128,6 +166,9 @@ def get_dte(is_intraday=False):
     dte = (last_thursday - today).days
     return dte if dte >= 6 else dte + 28
 
+# ==============================================================================
+# 📊 TECHNICAL INDICATORS (DAILY & 15-MINUTE ENGINES)
+# ==============================================================================
 def compute_daily_indicators(df):
     df = df.copy()
     df['EMA21']  = df['Close'].ewm(span=21, adjust=False).mean()
@@ -301,8 +342,8 @@ def format_table(records, title):
     return "\n".join(lines)
 
 def send_telegram_alert(message_text):
-    if "YOUR_TELEGRAM" in TELEGRAM_BOT_TOKEN or "YOUR_TELEGRAM" in TELEGRAM_CHAT_ID:
-        print("\nℹ️ Telegram credentials not configured. Skipping push.")
+    if not TELEGRAM_BOT_TOKEN or "YOUR_TELEGRAM" in TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or "YOUR_TELEGRAM" in TELEGRAM_CHAT_ID:
+        print("\nℹ️ Telegram Secrets not detected. Check Settings -> Secrets and variables -> Actions.")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": f"<pre>{message_text}</pre>", "parse_mode": "HTML"}
@@ -312,24 +353,33 @@ def send_telegram_alert(message_text):
     except Exception as e:
         print(f"⚠️ Telegram Exception: {e}")
 
+def get_live_vix():
+    try:
+        vix_df = yf.download("^INDIAVIX", period="5d", interval="1d", progress=False)
+        if vix_df.empty:
+            return 0.135
+        close_col = vix_df['Close']
+        if isinstance(close_col, pd.DataFrame):
+            close_col = close_col.iloc[:, 0]
+        return float(close_col.dropna().iloc[-1]) / 100.0
+    except Exception:
+        return 0.135
+
 def main():
     ist = pytz.timezone('Asia/Kolkata')
     now_ist = datetime.now(ist)
     current_minutes = now_ist.hour * 60 + now_ist.minute
     
-    # If triggered by scheduled cron outside 09:15 AM - 03:35 PM IST, exit cleanly
     if EVENT_NAME == "schedule":
         if now_ist.weekday() >= 5 or current_minutes < (9 * 60 + 15) or current_minutes > (15 * 60 + 35):
             print(f"⏸️ Outside Indian Market Hours ({now_ist.strftime('%H:%M IST')}). Exiting.")
             return
 
-    # Run Intraday 15m on every scheduled run; Run Daily Swing at Opening (9:15-9:45), Closing (14:45-15:35), or Manual Trigger
     run_intraday = True
     run_swing = (EVENT_NAME != "schedule") or (current_minutes <= 9 * 60 + 45) or (current_minutes >= 14 * 60 + 45)
 
     tickers = list(FNO_UNIVERSE.keys())
-    vix_df = yf.download("^INDIAVIX", period="5d", interval="1d", progress=False)
-    india_vix = float(vix_df['Close'].dropna().iloc[-1]) / 100.0 if not vix_df.empty else 0.135
+    india_vix = get_live_vix()
     print(f"🕒 IST Time: {now_ist.strftime('%Y-%m-%d %H:%M')} | India VIX: {india_vix*100:.2f}%")
 
     if run_intraday:
@@ -337,14 +387,14 @@ def main():
         intra_live, intra_watch = [], []
         for tk, meta in FNO_UNIVERSE.items():
             try:
-                df15 = raw_15m[tk].dropna(subset=['Close', 'High', 'Low']).copy()
+                df15 = extract_ticker_df(raw_15m, tk)
                 if len(df15) < 120:
                     continue
                 df15 = compute_intraday_15m_indicators(df15)
                 last = df15.iloc[-1]
-                checks = [("CE", True)] if last['CE_Signal'] else ([("PE", True)] if last['PE_Signal'] else (
-                    [("CE", False)] if last['Close'] > last['VWAP'] and last['RSI'] >= 50 else (
-                    [("PE", False)] if last['Close'] < last['VWAP'] and last['RSI'] <= 48 else [])))
+                checks = [("CE", True)] if bool(last['CE_Signal']) else ([("PE", True)] if bool(last['PE_Signal']) else (
+                    [("CE", False)] if float(last['Close']) > float(last['VWAP']) and float(last['RSI']) >= 50 else (
+                    [("PE", False)] if float(last['Close']) < float(last['VWAP']) and float(last['RSI']) <= 48 else [])))
                 for opt_type, is_live in checks:
                     wins, tot, wp = backtest_signals(df15, opt_type, INTRA_ATR_SL_MULT, INTRA_RR_RATIO, INTRA_MAX_BARS, True)
                     if tot >= INTRA_MIN_SETUPS and wp >= INTRA_MIN_WIN_PROB:
@@ -352,10 +402,9 @@ def main():
                         (intra_live if is_live else intra_watch).append(row)
             except Exception:
                 continue
-        # Only push 15m alert on schedule if at least 1 LIVE breakout candle triggered (or if manually triggered)
         intra_final = sorted(intra_live, key=lambda x: x["WinProbNum"], reverse=True) + \
                       sorted(intra_watch, key=lambda x: x["WinProbNum"], reverse=True)
-        if intra_live or EVENT_NAME != "schedule":
+        if (intra_live or EVENT_NAME != "schedule") and intra_final:
             msg = format_table(intra_final, f"15M INTRADAY SCALPS ({now_ist.strftime('%H:%M IST')})")
             print("\n" + msg)
             send_telegram_alert(msg)
@@ -365,14 +414,14 @@ def main():
         swing_live, swing_watch = [], []
         for tk, meta in FNO_UNIVERSE.items():
             try:
-                df1d = raw_1d[tk].dropna(subset=['Close', 'High', 'Low']).copy()
+                df1d = extract_ticker_df(raw_1d, tk)
                 if len(df1d) < 220:
                     continue
                 df1d = compute_daily_indicators(df1d)
                 last = df1d.iloc[-1]
-                checks = [("CE", True)] if last['CE_Signal'] else ([("PE", True)] if last['PE_Signal'] else (
-                    [("CE", False)] if last['Close'] > last['EMA21'] and last['RSI'] >= 50 else (
-                    [("PE", False)] if last['Close'] < last['EMA21'] and last['RSI'] <= 48 else [])))
+                checks = [("CE", True)] if bool(last['CE_Signal']) else ([("PE", True)] if bool(last['PE_Signal']) else (
+                    [("CE", False)] if float(last['Close']) > float(last['EMA21']) and float(last['RSI']) >= 50 else (
+                    [("PE", False)] if float(last['Close']) < float(last['EMA21']) and float(last['RSI']) <= 48 else [])))
                 for opt_type, is_live in checks:
                     wins, tot, wp = backtest_signals(df1d, opt_type, SWING_ATR_SL_MULT, SWING_RR_RATIO, SWING_MAX_DAYS, False)
                     if tot >= SWING_MIN_SETUPS and wp >= SWING_MIN_WIN_PROB:
