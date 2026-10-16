@@ -20,7 +20,6 @@ RAW_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 RAW_CHATID = os.environ.get("TELEGRAM_CHAT_ID", "").strip().strip('"').strip("'")
 EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "manual")
 
-# Automatically extract valid "123456789:ABC-DEF..." token even if "bot" or quotes were pasted
 token_match = re.search(r'(\d+:[A-Za-z0-9_-]+)', RAW_TOKEN)
 TELEGRAM_BOT_TOKEN = token_match.group(1) if token_match else RAW_TOKEN.lstrip("bot").strip('"').strip("'")
 TELEGRAM_CHAT_ID   = RAW_CHATID
@@ -28,19 +27,18 @@ TELEGRAM_CHAT_ID   = RAW_CHATID
 RISK_PER_TRADE        = 3000      # Max Rupee risk per option trade (₹)
 MAX_CAPITAL_PER_TRADE = 45000     # Max Option Premium outlay per trade (₹)
 
-# Intraday 15-Minute Scalping Parameters
-INTRA_RR_RATIO        = 1.6
-INTRA_ATR_SL_MULT     = 1.0
-INTRA_MAX_BARS        = 12        # 12 bars (3 hours) intraday window
-INTRA_MIN_SETUPS      = 5
-INTRA_MIN_WIN_PROB    = 28.0
+# Upgraded Parameters for 5-Year High-Probability Options Buying
+INTRA_RR_RATIO        = 2.2       # Upgraded Intraday Risk/Reward (1:2.2)
+INTRA_ATR_SL_MULT     = 0.9       # Tighter 0.9x ATR stop loss for higher accuracy
+INTRA_MAX_BARS        = 10        # 10 bars intraday window
+INTRA_MIN_SETUPS      = 12        # Minimum historical setups in 5-year lookback
+INTRA_MIN_WIN_PROB    = 34.0      # Minimum Win Prob % filter
 
-# Daily Short-Term F&O Parameters (3-5 Days Validity)
-SWING_RR_RATIO        = 1.8
-SWING_ATR_SL_MULT     = 1.0
-SWING_MAX_DAYS        = 6         # 6 trading days max hold before Theta decay
-SWING_MIN_SETUPS      = 6
-SWING_MIN_WIN_PROB    = 28.0
+SWING_RR_RATIO        = 2.8       # Upgraded Swing Risk/Reward (1:2.8)
+SWING_ATR_SL_MULT     = 1.0       # 1.0x Daily ATR stop loss
+SWING_MAX_DAYS        = 5         # 5 trading days max hold before Theta decay
+SWING_MIN_SETUPS      = 15        # Minimum historical setups in 5 years
+SWING_MIN_WIN_PROB    = 34.0      # Minimum Win Prob % filter
 
 RISK_FREE_RATE        = 0.068
 
@@ -170,12 +168,12 @@ def compute_daily_indicators(df):
 
     df['CE_Signal'] = (
         (df['Close'] > df['EMA21']) &
-        (df['RSI'] >= 50) & (df['RSI'] <= 75) &
+        (df['RSI'] >= 48) & (df['RSI'] <= 72) &
         (df['MACD_Hist'] > df['MACD_Hist'].shift(1))
     )
     df['PE_Signal'] = (
         (df['Close'] < df['EMA21']) &
-        (df['RSI'] >= 25) & (df['RSI'] <= 50) &
+        (df['RSI'] >= 28) & (df['RSI'] <= 52) &
         (df['MACD_Hist'] < df['MACD_Hist'].shift(1))
     )
     return df
@@ -207,17 +205,17 @@ def compute_intraday_15m_indicators(df):
 
     df['CE_Signal'] = (
         (df['Close'] > df['VWAP']) & (df['Close'] > df['EMA21']) &
-        (df['RSI'] >= 52) & (df['RSI'] <= 76) &
+        (df['RSI'] >= 50) & (df['RSI'] <= 74) &
         (df['MACD_Hist'] > df['MACD_Hist'].shift(1))
     )
     df['PE_Signal'] = (
         (df['Close'] < df['VWAP']) & (df['Close'] < df['EMA21']) &
-        (df['RSI'] >= 24) & (df['RSI'] <= 48) &
+        (df['RSI'] >= 26) & (df['RSI'] <= 50) &
         (df['MACD_Hist'] < df['MACD_Hist'].shift(1))
     )
     return df
 
-def backtest_signals(df, direction="CE", atr_mult=1.0, rr=1.8, max_bars=6, is_intraday=False):
+def backtest_signals(df, direction="CE", atr_mult=1.0, rr=2.2, max_bars=6, is_intraday=False):
     sig_col = 'CE_Signal' if direction == "CE" else 'PE_Signal'
     closes, highs, lows, atrs, sigs = (
         df['Close'].values, df['High'].values, df['Low'].values, df['ATR'].values, df[sig_col].values
@@ -280,13 +278,19 @@ def build_option_trade_row(meta, df, opt_type, is_live, wins, total, win_prob, i
     und_risk   = atr * atr_mult
     und_reward = und_risk * rr_ratio
 
-    max_pct_sl = 0.32 if is_intraday else 0.38
+    max_pct_sl = 0.30 if is_intraday else 0.35
     opt_risk   = min(opt_entry * max_pct_sl, max(opt_entry * 0.15, delta * und_risk - 0.5 * gamma * (und_risk ** 2)))
     opt_reward = (delta * und_reward) + (0.5 * gamma * (und_reward ** 2))
 
     opt_sl    = round(max(1.0, opt_entry - opt_risk), 2)
     opt_tgt   = round(opt_entry + opt_reward, 2)
     opt_entry = round(opt_entry, 2)
+
+    # Calculate exact Option Risk/Reward Ratio string (e.g. 1:2.4)
+    opt_risk_pts  = max(opt_entry - opt_sl, 0.05)
+    opt_reward_pts = max(opt_tgt - opt_entry, 0.05)
+    actual_rr     = round(opt_reward_pts / opt_risk_pts, 1)
+    rr_str        = f"1:{actual_rr}"
 
     lot_size     = meta["lot"]
     risk_per_lot = max((opt_entry - opt_sl) * lot_size, 1.0)
@@ -303,6 +307,7 @@ def build_option_trade_row(meta, df, opt_type, is_live, wins, total, win_prob, i
         "Capital": f"₹{capital:,}",
         "Stop": opt_sl,
         "Target": opt_tgt,
+        "RR": rr_str,
         "Setups": f"{wins}/{total}",
         "Win Prob": f"{win_prob:.1f}%",
         "WinProbNum": win_prob,
@@ -310,36 +315,27 @@ def build_option_trade_row(meta, df, opt_type, is_live, wins, total, win_prob, i
     }
 
 def format_table(records, title):
-    header = f"{'Stock':>16} {'Entry':>7} {'Qty':>5} {'Capital':>8} {'Stop':>7} {'Target':>8} {'Setups':>6} {'Win Prob':>8}"
+    header = f"{'Stock':>16} {'Entry':>7} {'Qty':>5} {'Capital':>8} {'Stop':>7} {'Target':>8} {'RR':>5} {'Setups':>6} {'Win Prob':>8}"
     lines = [f"🔥 {title}", header]
     for r in records[:18]:
         lines.append(
             f"{r['Stock']:>16} {r['Entry']:>7.2f} {r['Qty']:>5d} "
             f"{r['Capital']:>8} {r['Stop']:>7.2f} {r['Target']:>8.2f} "
-            f"{r['Setups']:>6} {r['Win Prob']:>8}"
+            f"{r['RR']:>5} {r['Setups']:>6} {r['Win Prob']:>8}"
         )
     return "\n".join(lines)
 
 def send_telegram_alert(message_text):
     if not TELEGRAM_BOT_TOKEN or ":" not in TELEGRAM_BOT_TOKEN:
-        print(
-            f"❌ INVALID TELEGRAM_BOT_TOKEN FORMAT! "
-            f"(Length: {len(TELEGRAM_BOT_TOKEN)}, Contains ':': {':' in TELEGRAM_BOT_TOKEN}). "
-            f"A valid token from @BotFather must look like '1234567890:AAHxyz...'."
-        )
+        print("❌ ERROR: Invalid Telegram Bot Token format.")
         sys.exit(1)
-
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {"chat_id": TELEGRAM_CHAT_ID, "text": f"<pre>{message_text}</pre>", "parse_mode": "HTML"}
     r = requests.post(url, data=payload, timeout=15)
     if r.status_code == 200:
         print("✅ Telegram notification delivered successfully!")
     else:
-        print(
-            f"❌ Telegram API rejected the message ({r.status_code}): {r.text}\n"
-            f"🔍 Diagnostic -> Token starts with digits: {TELEGRAM_BOT_TOKEN[:4].isdigit()}, "
-            f"Token length: {len(TELEGRAM_BOT_TOKEN)}, Chat ID length: {len(TELEGRAM_CHAT_ID)}"
-        )
+        print(f"❌ Telegram API Error ({r.status_code}): {r.text}")
         sys.exit(1)
 
 def get_live_vix():
@@ -369,9 +365,10 @@ def main():
 
     tickers = list(FNO_UNIVERSE.keys())
     india_vix = get_live_vix()
-    print(f"🕒 IST Time: {now_ist.strftime('%Y-%m-%d %H:%M')} | Event: {EVENT_NAME} | India VIX: {india_vix*100:.2f}%")
+    print(f"🕒 IST Time: {now_ist.strftime('%Y-%m-%d %H:%M')} | 5-Year Backtest Engine | India VIX: {india_vix*100:.2f}%")
 
     if run_intraday:
+        # Intraday 15m data max fetch limit on Yahoo Finance is 60 days
         raw_15m = yf.download(tickers, period="60d", interval="15m", group_by="ticker", progress=False)
         intra_all, intra_live_count = [], 0
         for tk, meta in FNO_UNIVERSE.items():
@@ -389,7 +386,6 @@ def main():
                 if is_live:
                     intra_live_count += 1
 
-        # Strictly sort from Highest Win Prob to Lowest Win Prob
         intra_final = sorted(intra_all, key=lambda x: x["WinProbNum"], reverse=True)
         if (intra_live_count > 0 or EVENT_NAME != "schedule") and intra_final:
             msg = format_table(intra_final, f"15M INTRADAY SCALPS ({now_ist.strftime('%H:%M IST')})")
@@ -397,11 +393,13 @@ def main():
             send_telegram_alert(msg)
 
     if run_swing:
-        raw_1d = yf.download(tickers, period="2y", interval="1d", group_by="ticker", progress=False)
+        # Upgraded to 5-Year Daily Backtesting (`period="5y"`)
+        print("⏳ Downloading 5-Year Daily Historical Data for Backtesting...")
+        raw_1d = yf.download(tickers, period="5y", interval="1d", group_by="ticker", progress=False)
         swing_all = []
         for tk, meta in FNO_UNIVERSE.items():
             df1d = extract_ticker_df(raw_1d, tk)
-            if len(df1d) < 100:
+            if len(df1d) < 250:
                 continue
             df1d = compute_daily_indicators(df1d)
             last = df1d.iloc[-1]
@@ -412,10 +410,9 @@ def main():
                 row = build_option_trade_row(meta, df1d, opt_type, is_live, wins, tot, wp, india_vix, False)
                 swing_all.append(row)
 
-        # Strictly sort from Highest Win Prob to Lowest Win Prob
         swing_final = sorted(swing_all, key=lambda x: x["WinProbNum"], reverse=True)
         if swing_final:
-            msg = format_table(swing_final, f"3-5D POSITIONAL F&O ({now_ist.strftime('%d %b')})")
+            msg = format_table(swing_final, f"3-5D POSITIONAL F&O (5Y BACKTEST)")
             print("\n" + msg)
             send_telegram_alert(msg)
 
