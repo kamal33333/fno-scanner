@@ -228,22 +228,24 @@ def extract_ticker_df(batch_data: pd.DataFrame, ticker: str) -> pd.DataFrame:
 # ==============================================================================
 # 5. ₹1,00,000 PORTFOLIO ALLOCATOR (EQUALIZED RISK & LOCKED 1:2.5 RR)
 # ==============================================================================
+# ==============================================================================
+# 5. ₹1,05,000 PORTFOLIO ALLOCATOR (WITH BUFFER CEILING)
+# ==============================================================================
 def build_100k_portfolio_plan(signals: list) -> tuple[list, dict]:
     """
     Selects up to PORTFOLIO_BASKET_SLOTS (4) top stocks and sizes them so:
-    1. Total Capital deployed fits inside ₹1,00,000.
-    2. No single stock exceeds ₹35,000 capital (prevents ₹68k single-stock concentration).
-    3. Every stock has Target = +2.5R, guaranteeing Total Portfolio Profit = 2.5x Total SL!
+    1. Total Capital deployed fits strictly under the ₹1,05,000 buffer ceiling.
+    2. No single stock exceeds ₹35,000 capital.
+    3. Every stock has Target = +2.5R, guaranteeing locked 1:2.5 RR math.
     """
     basket = [s.copy() for s in signals[:PORTFOLIO_BASKET_SLOTS]]
     if not basket:
         return [], {}
 
-    # Target equal risk per slot (e.g., ₹1,500 risk per stock = ₹6,000 max risk across 4 stocks),
-    # then dynamically scale so total capital fits <= ₹1,00,000 and each stock <= ₹35,000.
-    target_risk_per_stock = (TOTAL_PORTFOLIO_CAPITAL * MAX_PORTFOLIO_RISK_PCT) / len(basket)
+    total_buffer_cap = 105000.0  # Your updated capital ceiling
+    target_risk_per_stock = (total_buffer_cap * MAX_PORTFOLIO_RISK_PCT) / len(basket)
 
-    # First pass: size each stock by target_risk_per_stock, capped at MAX_CAPITAL_PER_STOCK
+    # First pass: size each stock by target risk, capped at MAX_CAPITAL_PER_STOCK
     for item in basket:
         risk_per_share = item["RiskPerShare"]
         qty_risk = math.floor(target_risk_per_stock / risk_per_share)
@@ -253,20 +255,15 @@ def build_100k_portfolio_plan(signals: list) -> tuple[list, dict]:
 
     total_cap = sum(x["PortCap"] for x in basket)
 
-    # Second pass: if total_cap > ₹1,00,000, scale down proportionally;
-    # if total_cap < ₹90,000, scale up uncapped stocks up to MAX_CAPITAL_PER_STOCK
-    if total_cap > TOTAL_PORTFOLIO_CAPITAL:
-        scale = TOTAL_PORTFOLIO_CAPITAL / total_cap
+    # Strict Buffer Enforcement: Scale down smoothly if total capital crosses ₹1,05,000
+    if total_cap > total_buffer_cap:
+        scale = total_buffer_cap / total_cap
         for item in basket:
             item["PortQty"] = max(1, math.floor(item["PortQty"] * scale))
-    elif total_cap < TOTAL_PORTFOLIO_CAPITAL * 0.95:
-        scale = TOTAL_PORTFOLIO_CAPITAL / total_cap
-        for item in basket:
-            scaled_qty = math.floor(item["PortQty"] * scale)
-            max_qty_cap = math.floor(MAX_CAPITAL_PER_STOCK / item["Entry"])
-            item["PortQty"] = max(1, min(scaled_qty, max_qty_cap))
+            item["PortCap"] = item["PortQty"] * item["Entry"]
+        total_cap = sum(x["PortCap"] for x in basket)
 
-    # Finalize exact Rupee numbers for each stock in the ₹1,00,000 basket
+    # Finalize exact Rupee numbers
     tot_capital = 0
     tot_risk = 0.0
     tot_t1_profit = 0.0
@@ -277,9 +274,7 @@ def build_100k_portfolio_plan(signals: list) -> tuple[list, dict]:
         rps = item["RiskPerShare"]
         cap = round(q * item["Entry"], 0)
         sl_rupees = round(q * rps, 0)
-        # Full 1:2.5 Target Profit = 2.5 * Risk
         target_profit_rupees = round(q * (RR_FINAL * rps), 0)
-        # 2-Stage Blended Profit if 50% booked at +1.25R and 50% at +2.5R (+1.875R)
         t1_blended_rupees = round(q * (1.875 * rps), 0)
 
         item["PortCap"] = int(cap)
@@ -294,13 +289,12 @@ def build_100k_portfolio_plan(signals: list) -> tuple[list, dict]:
 
     summary = {
         "total_capital": int(tot_capital),
-        "unused_cash": int(max(0, TOTAL_PORTFOLIO_CAPITAL - tot_capital)),
+        "unused_cash": int(max(0, total_buffer_cap - tot_capital)),
         "total_risk": int(round(tot_risk, 0)),
         "total_profit_25r": int(round(tot_target_profit, 0)),
         "total_profit_blended": int(round(tot_t1_profit, 0)),
     }
     return basket, summary
-
 
 # ==============================================================================
 # 6. MAIN SCANNER ENGINE
