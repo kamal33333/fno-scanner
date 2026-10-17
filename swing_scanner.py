@@ -225,16 +225,12 @@ def extract_ticker_df(batch_data: pd.DataFrame, ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-# ==============================================================================
-# 5. ₹1,00,000 PORTFOLIO ALLOCATOR (EQUALIZED RISK & LOCKED 1:2.5 RR)
-# ==============================================================================
-# ==============================================================================
-# 5. ₹1,05,000 PORTFOLIO ALLOCATOR (WITH BUFFER CEILING)
+# 5. ₹1,05,000 PORTFOLIO ALLOCATOR (STRICT CEILING ENFORCEMENT)
 # ==============================================================================
 def build_100k_portfolio_plan(signals: list) -> tuple[list, dict]:
     """
     Selects up to PORTFOLIO_BASKET_SLOTS (4) top stocks and sizes them so:
-    1. Total Capital deployed fits strictly under the ₹1,05,000 buffer ceiling.
+    1. Total Capital deployed is GUARANTEED never to exceed ₹1,05,000.
     2. No single stock exceeds ₹35,000 capital.
     3. Every stock has Target = +2.5R, guaranteeing locked 1:2.5 RR math.
     """
@@ -242,7 +238,7 @@ def build_100k_portfolio_plan(signals: list) -> tuple[list, dict]:
     if not basket:
         return [], {}
 
-    total_buffer_cap = 105000.0  # Your updated capital ceiling
+    total_buffer_cap = 105000.0  # Absolute hard ceiling
     target_risk_per_stock = (total_buffer_cap * MAX_PORTFOLIO_RISK_PCT) / len(basket)
 
     # First pass: size each stock by target risk, capped at MAX_CAPITAL_PER_STOCK
@@ -253,14 +249,16 @@ def build_100k_portfolio_plan(signals: list) -> tuple[list, dict]:
         item["PortQty"] = max(1, min(qty_risk, qty_cap))
         item["PortCap"] = item["PortQty"] * item["Entry"]
 
+    # Strict Iterative Trim: If total capital exceeds ₹1,05,000, reduce quantity of the highest-capital stock by 1
     total_cap = sum(x["PortCap"] for x in basket)
-
-    # Strict Buffer Enforcement: Scale down smoothly if total capital crosses ₹1,05,000
-    if total_cap > total_buffer_cap:
-        scale = total_buffer_cap / total_cap
-        for item in basket:
-            item["PortQty"] = max(1, math.floor(item["PortQty"] * scale))
-            item["PortCap"] = item["PortQty"] * item["Entry"]
+    while total_cap > total_buffer_cap:
+        # Find stock with highest capital allocation having quantity > 1
+        trimmable = [x for x in basket if x["PortQty"] > 1]
+        if not trimmable:
+            break
+        highest_stock = max(trimmable, key=lambda x: x["PortCap"])
+        highest_stock["PortQty"] -= 1
+        highest_stock["PortCap"] = highest_stock["PortQty"] * highest_stock["Entry"]
         total_cap = sum(x["PortCap"] for x in basket)
 
     # Finalize exact Rupee numbers
@@ -295,7 +293,6 @@ def build_100k_portfolio_plan(signals: list) -> tuple[list, dict]:
         "total_profit_blended": int(round(tot_t1_profit, 0)),
     }
     return basket, summary
-
 # ==============================================================================
 # 6. MAIN SCANNER ENGINE
 # ==============================================================================
