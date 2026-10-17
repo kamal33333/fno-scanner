@@ -111,11 +111,11 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     low = df["Low"]
     vol = df["Volume"]
 
-    # EMA 21 & 50
+    # 1. Core EMA 21 & 50
     df["EMA_21"] = close.ewm(span=21, adjust=False).mean()
     df["EMA_50"] = close.ewm(span=50, adjust=False).mean()
 
-    # Wilder's RSI(14) & SMA(14) of RSI
+    # 2. Wilder's RSI(14) & SMA(14) of RSI
     delta = close.diff()
     gain = delta.clip(lower=0.0)
     loss = -delta.clip(upper=0.0)
@@ -125,18 +125,16 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["RSI_14"] = (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
     df["RSI_SMA_14"] = df["RSI_14"].rolling(window=14).mean()
 
-    # Fibonacci Bollinger Bands (55 SMA, 1.618 StdDev)
-    df["BB_SMA_55"] = close.rolling(window=55).mean()
-    bb_std_55 = close.rolling(window=55).std(ddof=0)
-    df["BB_UPPER_1618"] = df["BB_SMA_55"] + (1.618 * bb_std_55)
+    # 3. Dual Fibonacci Bollinger Bands: BB(38, 2.0) & BB(61, 2.0)
+    df["BB_SMA_38"] = close.rolling(window=38).mean()
+    bb_std_38 = close.rolling(window=38).std(ddof=0)
+    df["BB_UPPER_38"] = df["BB_SMA_38"] + (2.0 * bb_std_38)
 
-    # Chaikin Money Flow (21)
-    hl_range = (high - low).replace(0, np.nan)
-    mf_mult = (((close - low) - (high - close)) / hl_range).fillna(0.0)
-    vol_sum_21 = vol.rolling(window=21).sum().replace(0, np.nan)
-    df["CMF_21"] = ((mf_mult * vol).rolling(window=21).sum() / vol_sum_21).fillna(0.0)
+    df["BB_SMA_61"] = close.rolling(window=61).mean()
+    bb_std_61 = close.rolling(window=61).std(ddof=0)
+    df["BB_LOWER_61"] = df["BB_SMA_61"] - (2.0 * bb_std_61)
 
-    # Core Proven Strategy: EMA Pullback (5Y Mathematical Winner)
+    # 4. Core Proven Strategy: EMA Pullback
     df["SIG_CORE"] = (
         (df["EMA_21"] > df["EMA_50"])
         & (df["RSI_14"] > 40.0)
@@ -144,16 +142,20 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
         & (df["Close"] > df["Open"])
     )
 
-    # Dhan Chart Confirmation Bonus (BB55 + RSI > SMA14 + CMF > 0)
+    # 5. Upgraded ⭐GRADE-A Bonus: BB(38/61) Value Ribbon Bounce + RSI > SMA(14)
+    # - Uptrend structure: 38 SMA > 61 SMA
+    # - Value Zone Pullback: Recent 3-day low tested near/inside the 38 SMA (within 1.5%), and Close held above 61 SMA
+    # - Momentum turn: RSI(14) > RSI_SMA(14) and plenty of headroom below BB_UPPER_38
+    recent_low_3d = low.rolling(window=3).min()
     df["SIG_DHAN_BONUS"] = (
-        (df["Close"] > df["BB_SMA_55"])
-        & (df["Close"] < df["BB_UPPER_1618"])
+        (df["BB_SMA_38"] > df["BB_SMA_61"])
+        & (recent_low_3d <= df["BB_SMA_38"] * 1.015)
+        & (df["Close"] >= df["BB_SMA_61"])
+        & (df["Close"] < df["BB_UPPER_38"] * 0.98)
         & (df["RSI_14"] > df["RSI_SMA_14"])
-        & (df["CMF_21"] > 0.0)
     )
 
     return df
-
 
 # ==============================================================================
 # 4. 5-YEAR IN-MEMORY BACKTESTER
