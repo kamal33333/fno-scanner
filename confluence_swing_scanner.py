@@ -286,8 +286,8 @@ def scan_market():
                 "IsGradeA": 1 if is_grade_a else 0,
             })
 
-    # Sort: ⭐GRADE-A setups first, then by highest 5-Year Win%
-    signals.sort(key=lambda x: (x["IsGradeA"], x["WinProb"]), reverse=True)
+    # NEW: Sorts strictly by highest 5-Year Win% first (and uses ⭐GRADE-A as a tie-breaker!)
+    signals.sort(key=lambda x: (x["WinProb"], x["IsGradeA"]), reverse=True)
     return signals[:TOP_N_RESULTS], now_ist
 
 
