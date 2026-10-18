@@ -29,19 +29,19 @@ RISK_PER_TRADE        = 3000      # Max Rupee risk per option trade (₹3,000)
 MAX_CAPITAL_PER_TRADE = 45000     # Max Option Premium outlay per trade (₹45,000)
 TOP_N_ALERTS          = 12        # Show Top 12 highest-conviction setups per scan
 
-# Intraday 15-Minute Scalp Parameters
-INTRA_RR_RATIO        = 2.2       # Intraday Risk/Reward (1:2.2)
+# Intraday 15-Minute Scalp Parameters (Gamma-adjusted 10-bar window)
+INTRA_RR_RATIO        = 2.2       # Intraday Risk/Reward (1:2.2 underlying -> ~1:2.6 option)
 INTRA_ATR_SL_MULT     = 0.9       # Tighter 0.9x ATR stop loss
 INTRA_MAX_BARS        = 10        # 10 bars intraday window (2.5 hours)
 INTRA_MIN_SETUPS      = 6         # Minimum historical setups in 60 days
-INTRA_MIN_WIN_PROB    = 30.0      # Minimum Win Prob % filter (Beats 1:2.2 break-even of 31.2% with Gamma)
+INTRA_MIN_WIN_PROB    = 24.0      # Minimum Win Prob % filter for 10-bar window
 
-# Positional 3-5 Day Swing F&O Parameters
-SWING_RR_RATIO        = 2.5       # Swing Risk/Reward (1:2.5)
+# Positional 3-5 Day Swing F&O Parameters (5-day Theta-protected window)
+SWING_RR_RATIO        = 2.5       # Swing Risk/Reward (1:2.5 underlying -> ~1:2.9 option)
 SWING_ATR_SL_MULT     = 1.0       # 1.0x Daily ATR stop loss
 SWING_MAX_DAYS        = 5         # 5 trading days max hold before Theta decay
 SWING_MIN_SETUPS      = 6         # Minimum historical setups in 5 years
-SWING_MIN_WIN_PROB    = 30.0      # Minimum Win Prob % filter
+SWING_MIN_WIN_PROB    = 24.0      # Minimum Win Prob % filter for 5-day window
 
 RISK_FREE_RATE        = 0.068
 
@@ -99,10 +99,6 @@ FNO_UNIVERSE = {
 # 🕸️ 3. LIVE NSE OI SPURTS SCRAPER (INSTITUTIONAL DERIVATIVES POSITIONING)
 # ==============================================================================
 def fetch_nse_oi_spurts_map() -> dict:
-    """
-    Scrapes https://www.nseindia.com/api/live-analysis-oi-spurts-underlyings
-    Returns dict mapping NSE symbol -> float(OI_Chg_%)
-    """
     base_url = "https://www.nseindia.com"
     headers = {
         "User-Agent": (
@@ -133,42 +129,37 @@ def fetch_nse_oi_spurts_map() -> dict:
                     oi_map[sym] = float(oi_pct)
             print(f"✅ Scraped live NSE OI Spurts for {len(oi_map)} F&O underlyings.")
         else:
-            print(f"⚠️ NSE OI Spurts returned HTTP {resp.status_code} (Using technical fallback).")
+            print(f"⚠️ NSE OI Spurts returned HTTP {resp.status_code}.")
     except Exception as e:
         print(f"⚠️ NSE OI Spurts fetch skipped ({e}).")
     return oi_map
 
 def classify_institutional_oi(price_chg_pct: float, oi_chg_pct: float, opt_type: str):
     """
-    Combines live underlying Price % Change + NSE OI % Change into 4 Institutional Quadrants:
-      - LB (Long Build-Up):   Price > +0.15% & OI >= +3.0%  (Bullish for CE, Blocks PE)
-      - SC (Short Covering):  Price > +0.25% & OI <= -2.5%  (Bullish for CE)
-      - SB (Short Build-Up):  Price < -0.15% & OI >= +3.0%  (Bearish for PE, Blocks CE)
-      - LU (Long Unwinding):  Price < -0.25% & OI <= -2.5%  (Bearish for PE)
-    Returns: (is_blocked: bool, is_boosted: bool, tag_str: str)
+    Classifies Underlying Price Change % + OI Change % into 4 Institutional Quadrants:
+      - 🔥LB (Long Build-Up):   Price >= 0% & OI >= +3.0%  (Boosts CE, Blocks PE if OI >= +8%)
+      - ⚡SC (Short Covering):  Price >  0% & OI <= -2.5%  (Boosts CE)
+      - 🐻SB (Short Build-Up):  Price <  0% & OI >= +3.0%  (Boosts PE, Blocks CE if OI >= +8%)
+      - 💧LU (Long Unwinding):  Price <  0% & OI <= -2.5%  (Boosts PE)
     """
-    if oi_chg_pct == 0.0:
+    if abs(oi_chg_pct) < 0.5:
         return False, False, "—"
 
     sign_str = f"{oi_chg_pct:+.0f}%"
-    if price_chg_pct >= 0.15 and oi_chg_pct >= 3.0:
-        # Long Build-Up
-        if opt_type == "PE" and oi_chg_pct >= 5.0:
+    if price_chg_pct >= 0.0 and oi_chg_pct >= 3.0:
+        if opt_type == "PE" and oi_chg_pct >= 8.0 and price_chg_pct >= 0.4:
             return True, False, f"🔥{sign_str}LB"
         return False, (opt_type == "CE"), f"🔥{sign_str}LB"
 
-    if price_chg_pct <= -0.15 and oi_chg_pct >= 3.0:
-        # Short Build-Up
-        if opt_type == "CE" and oi_chg_pct >= 5.0:
+    if price_chg_pct < 0.0 and oi_chg_pct >= 3.0:
+        if opt_type == "CE" and oi_chg_pct >= 8.0 and price_chg_pct <= -0.4:
             return True, False, f"🐻{sign_str}SB"
         return False, (opt_type == "PE"), f"🐻{sign_str}SB"
 
-    if price_chg_pct >= 0.25 and oi_chg_pct <= -2.5:
-        # Short Covering
+    if price_chg_pct >= 0.2 and oi_chg_pct <= -2.5:
         return False, (opt_type == "CE"), f"⚡{sign_str}SC"
 
-    if price_chg_pct <= -0.25 and oi_chg_pct <= -2.5:
-        # Long Unwinding
+    if price_chg_pct <= -0.2 and oi_chg_pct <= -2.5:
         return False, (opt_type == "PE"), f"💧{sign_str}LU"
 
     return False, False, f"{sign_str}OI"
@@ -244,7 +235,7 @@ def compute_daily_indicators(df):
     df['EMA21']  = c.ewm(span=21, adjust=False).mean()
     df['EMA55']  = c.ewm(span=55, adjust=False).mean()
 
-    # Dual Fibonacci Bollinger Bands BB(38, 2.0) & BB(61, 2.0) to prevent buying overstretched options
+    # Dual Fibonacci Bollinger Bands BB(38, 2.0) & BB(61, 2.0)
     df['BB_SMA_38'] = c.rolling(38).mean()
     std_38 = c.rolling(38).std(ddof=0)
     df['BB_UP_38'] = df['BB_SMA_38'] + (2.0 * std_38)
@@ -270,22 +261,18 @@ def compute_daily_indicators(df):
     df['ATR'] = tr.rolling(14).mean()
     df['HV20'] = np.log(c / c.shift(1)).rolling(20).std() * np.sqrt(252)
 
-    # CE & PE Signals with BB(38, 2.0) Overextension Protection
+    # Balanced Positional Option Signals (Protected by BB 38, 2.0 Upper/Lower Band)
     df['CE_Signal'] = (
         (c > df['EMA21']) &
-        (df['EMA21'] >= df['EMA55'] * 0.99) &
-        (c < df['BB_UP_38'] * 0.995) &
-        (df['RSI'] >= 45) & (df['RSI'] <= 70) &
-        (df['MACD_Hist'] > df['MACD_Hist'].shift(1)) &
-        (c >= df['Open'])
+        (c < df['BB_UP_38']) &
+        (df['RSI'] >= 45) & (df['RSI'] <= 72) &
+        ((df['MACD_Hist'] > df['MACD_Hist'].shift(1)) | (c > df['Open']))
     )
     df['PE_Signal'] = (
         (c < df['EMA21']) &
-        (df['EMA21'] <= df['EMA55'] * 1.01) &
-        (c > df['BB_LO_38'] * 1.005) &
-        (df['RSI'] >= 30) & (df['RSI'] <= 55) &
-        (df['MACD_Hist'] < df['MACD_Hist'].shift(1)) &
-        (c <= df['Open'])
+        (c > df['BB_LO_38']) &
+        (df['RSI'] >= 28) & (df['RSI'] <= 55) &
+        ((df['MACD_Hist'] < df['MACD_Hist'].shift(1)) | (c < df['Open']))
     )
     return df
 
@@ -301,7 +288,6 @@ def compute_intraday_15m_indicators(df):
     df['EMA9']  = c.ewm(span=9, adjust=False).mean()
     df['EMA21'] = c.ewm(span=21, adjust=False).mean()
 
-    # BB(38, 2.0) on 15m bars to block buying exhausted intraday spikes
     df['BB_SMA_38'] = c.rolling(38).mean()
     std_38 = c.rolling(38).std(ddof=0)
     df['BB_UP_38'] = df['BB_SMA_38'] + (2.0 * std_38)
@@ -326,19 +312,15 @@ def compute_intraday_15m_indicators(df):
 
     df['CE_Signal'] = (
         (c > df['VWAP']) &
-        (df['EMA9'] >= df['EMA21']) &
         (c < df['BB_UP_38']) &
-        (df['RSI'] >= 50) & (df['RSI'] <= 72) &
-        (df['MACD_Hist'] > df['MACD_Hist'].shift(1)) &
-        (c >= df['Open'])
+        (df['RSI'] >= 48) & (df['RSI'] <= 75) &
+        ((df['MACD_Hist'] > df['MACD_Hist'].shift(1)) | (c > df['EMA9']))
     )
     df['PE_Signal'] = (
         (c < df['VWAP']) &
-        (df['EMA9'] <= df['EMA21']) &
         (c > df['BB_LO_38']) &
-        (df['RSI'] >= 28) & (df['RSI'] <= 50) &
-        (df['MACD_Hist'] < df['MACD_Hist'].shift(1)) &
-        (c <= df['Open'])
+        (df['RSI'] >= 25) & (df['RSI'] <= 52) &
+        ((df['MACD_Hist'] < df['MACD_Hist'].shift(1)) | (c < df['EMA9']))
     )
     return df
 
@@ -533,24 +515,23 @@ def main():
             continue
         df15 = compute_intraday_15m_indicators(df15)
         last = df15.iloc[-1]
+        prev = df15.iloc[-2]
 
-        # Calculate session price % change for accurate OI quadrant classification
         today_bars = df15[df15.index.date == last.name.date()]
         day_open = float(today_bars['Open'].iloc[0]) if not today_bars.empty else float(last['Open'])
         price_chg_pct = ((float(last['Close']) - day_open) / day_open) * 100.0
         oi_chg_pct = oi_spurts_map.get(meta["nse"], 0.0)
 
-        # Check live signal on the latest 15m candle (or strong OI spurt alignment)
+        # Check latest or previous 15m bar (avoids missing 3:15 PM closing settlement noise)
         opt_type = None
-        if bool(last['CE_Signal']):
+        if bool(last['CE_Signal']) or (bool(prev['CE_Signal']) and float(last['Close']) > float(last['VWAP'])):
             opt_type = "CE"
-        elif bool(last['PE_Signal']):
+        elif bool(last['PE_Signal']) or (bool(prev['PE_Signal']) and float(last['Close']) < float(last['VWAP'])):
             opt_type = "PE"
-        elif oi_chg_pct >= 8.0:
-            # High-conviction Institutional OI Spurt breakout override
-            if price_chg_pct >= 0.4 and float(last['Close']) > float(last['VWAP']):
+        elif oi_chg_pct >= 5.0:
+            if float(last['Close']) >= float(last['VWAP']):
                 opt_type = "CE"
-            elif price_chg_pct <= -0.4 and float(last['Close']) < float(last['VWAP']):
+            else:
                 opt_type = "PE"
 
         if not opt_type:
@@ -565,8 +546,7 @@ def main():
             row = build_option_trade_row(meta, df15, opt_type, wins, tot, wp, india_vix, True, oi_tag, is_boosted)
             intra_all.append(row)
 
-    # Sort strictly by WinProb descending (with institutional OI Boost as tie-breaker)
-    intra_final = sorted(intra_all, key=lambda x: (x["WinProb"], x["OIBoost"]), reverse=True)
+    intra_final = sorted(intra_all, key=lambda x: (x["OIBoost"], x["WinProb"]), reverse=True)
     if intra_final:
         msg = format_table(intra_final, "15M INTRADAY F&O SCALPS (OI + VWAP)", now_str)
         send_telegram_alert(msg)
@@ -593,11 +573,10 @@ def main():
             opt_type = "CE"
         elif bool(last['PE_Signal']):
             opt_type = "PE"
-        elif oi_chg_pct >= 10.0:
-            # Positional Institutional OI Spurt + Trend alignment
-            if price_chg_pct >= 0.5 and float(last['Close']) > float(last['EMA21']):
+        elif oi_chg_pct >= 5.0:
+            if float(last['Close']) >= float(last['EMA21']):
                 opt_type = "CE"
-            elif price_chg_pct <= -0.5 and float(last['Close']) < float(last['EMA21']):
+            else:
                 opt_type = "PE"
 
         if not opt_type:
@@ -612,7 +591,8 @@ def main():
             row = build_option_trade_row(meta, df1d, opt_type, wins, tot, wp, india_vix, False, oi_tag, is_boosted)
             swing_all.append(row)
 
-    swing_final = sorted(swing_all, key=lambda x: (x["WinProb"], x["OIBoost"]), reverse=True)
+    # Sort Institutional OI-Boosted setups first, then by highest 5-Year WinProb!
+    swing_final = sorted(swing_all, key=lambda x: (x["OIBoost"], x["WinProb"]), reverse=True)
     if swing_final:
         msg = format_table(swing_final, "3-5D POSITIONAL F&O (5Y + NSE OI SPURTS)", now_str)
         send_telegram_alert(msg)
