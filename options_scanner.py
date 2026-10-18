@@ -34,7 +34,7 @@ DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN", "").strip().strip('"').s
 # ==============================================================================
 RISK_PER_TRADE        = 3000      # Max Rupee risk per option trade (₹3,000)
 MAX_CAPITAL_PER_TRADE = 45000     # Max Option Premium outlay per trade (₹45,000)
-TOP_N_ALERTS          = 10        # Top 10 best F&O setups per timeframe
+TOP_N_STOCKS          = 10        # Top 10 Stock Options (Indices are shown separately at top!)
 
 # Intraday 15-Minute Scalp Parameters (Locked 1:2.0 Option RR, T1 at +1.0R)
 INTRA_OPT_RR          = 2.0       # Locked 1:2.0 Option Risk:Reward for Intraday
@@ -42,7 +42,7 @@ INTRA_UND_RR          = 1.6       # Underlying ATR move required in backtest
 INTRA_ATR_SL_MULT     = 0.9       # 0.9x ATR stop loss
 INTRA_MAX_BARS        = 12        # 12 bars intraday window (3 hours)
 INTRA_MIN_SETUPS      = 5         # Minimum historical setups in 60 days
-INTRA_MIN_WIN_PROB    = 25.0      # Minimum Win% filter
+INTRA_MIN_WIN_PROB    = 25.0      # Minimum Win% filter for stocks
 
 # Positional 3-5 Day Swing F&O Parameters (Locked 1:2.5 Option RR, T1 at +1.25R)
 SWING_OPT_RR          = 2.5       # Locked 1:2.5 Option Risk:Reward for Positional
@@ -50,17 +50,23 @@ SWING_UND_RR          = 1.8       # Underlying ATR move required in 5-day backte
 SWING_ATR_SL_MULT     = 1.0       # 1.0x Daily ATR stop loss
 SWING_MAX_DAYS        = 6         # 6 trading days max hold before Theta decay
 SWING_MIN_SETUPS      = 5         # Minimum historical setups in 5 years
-SWING_MIN_WIN_PROB    = 25.0      # Minimum Win% filter
+SWING_MIN_WIN_PROB    = 25.0      # Minimum Win% filter for stocks
 
 RISK_FREE_RATE        = 0.068
 
 # ==============================================================================
-# 📋 3. 100% VERIFIED LIQUID NSE F&O UNIVERSE & 2026 LOT SIZES
+# 📋 3. MAJOR INDIAN INDICES + LIQUID NSE F&O STOCKS (2026 LOT SIZES)
 # ==============================================================================
 FNO_UNIVERSE = {
-    "^NSEI":          {"name": "NIFTY",      "nse": "NIFTY",      "lot": 65,   "step": 50,  "is_idx": True,  "dhan_id": 13, "dhan_seg": "IDX_I"},
-    "^NSEBANK":       {"name": "BANKNIFTY",  "nse": "BANKNIFTY",  "lot": 30,   "step": 100, "is_idx": True,  "dhan_id": 25, "dhan_seg": "IDX_I"},
-    "^BSESN":         {"name": "SENSEX",     "nse": "SENSEX",     "lot": 20,   "step": 100, "is_idx": True,  "dhan_id": 51, "dhan_seg": "IDX_I"},
+    # --- 6 MAJOR INDICES (Always Evaluated & Displayed in Index Block) ---
+    "^NSEI":                 {"name": "NIFTY",      "nse": "NIFTY",      "lot": 65,   "step": 50,  "is_idx": True,  "dhan_id": 13, "dhan_seg": "IDX_I"},
+    "^NSEBANK":              {"name": "BANKNIFTY",  "nse": "BANKNIFTY",  "lot": 30,   "step": 100, "is_idx": True,  "dhan_id": 25, "dhan_seg": "IDX_I"},
+    "^BSESN":                {"name": "SENSEX",     "nse": "SENSEX",     "lot": 20,   "step": 100, "is_idx": True,  "dhan_id": 51, "dhan_seg": "IDX_I"},
+    "NIFTY_MID_SELECT.NS":   {"name": "MIDCPNIFT",  "nse": "MIDCPNIFTY", "lot": 120,  "step": 25,  "is_idx": True,  "dhan_id": 442, "dhan_seg": "IDX_I"},
+    "NIFTY_FIN_SERVICE.NS":  {"name": "FINNIFTY",   "nse": "FINNIFTY",   "lot": 65,   "step": 50,  "is_idx": True,  "dhan_id": 27, "dhan_seg": "IDX_I"},
+    "^CNXIT":                {"name": "NIFTYIT",    "nse": "NIFTYIT",    "lot": 25,   "step": 100, "is_idx": True,  "dhan_id": 19, "dhan_seg": "IDX_I"},
+
+    # --- LIQUID F&O STOCKS ---
     "ETERNAL.NS":     {"name": "ETERNAL",    "nse": "ETERNAL",    "lot": 2000, "step": 5,   "is_idx": False},
     "ANGELONE.NS":    {"name": "ANGELONE",   "nse": "ANGELONE",   "lot": 200,  "step": 50,  "is_idx": False},
     "TECHM.NS":       {"name": "TECHM",      "nse": "TECHM",      "lot": 600,  "step": 20,  "is_idx": False},
@@ -509,7 +515,6 @@ def build_option_trade_row(meta, df, opt_type, wins, total, win_prob, india_vix,
 
     strike_str = f"{int(atm_strike)}" if atm_strike == int(atm_strike) else f"{atm_strike:.1f}"
 
-    # Calculate realistic Option Stop Loss (20% to 28% of option premium based on ATR & Delta)
     atr_mult   = INTRA_ATR_SL_MULT if is_intraday else SWING_ATR_SL_MULT
     und_risk   = atr * atr_mult
     raw_opt_sl_dist = delta * und_risk - 0.5 * gamma * (und_risk ** 2)
@@ -522,7 +527,6 @@ def build_option_trade_row(meta, df, opt_type, wins, total, win_prob, india_vix,
     opt_sl    = round(max(0.5, opt_entry - opt_risk), 1)
     actual_risk = max(round(opt_entry - opt_sl, 1), 0.2)
 
-    # Lock Option Target to realistic 1:2.0 (Intraday) and 1:2.5 (Positional) R:R!
     target_rr = INTRA_OPT_RR if is_intraday else SWING_OPT_RR
     t1_rr     = 1.0 if is_intraday else 1.25
     opt_t1    = round(opt_entry + (actual_risk * t1_rr), 1)
@@ -549,36 +553,64 @@ def build_option_trade_row(meta, df, opt_type, wins, total, win_prob, india_vix,
         "OI_Flow": oi_tag,
         "WinProb": round(win_prob, 1),
         "OIBoost": 1 if is_oi_boosted else 0,
+        "IsIdx": meta["is_idx"],
     }
 
 # ==============================================================================
-# 📱 8. CLEAN TELEGRAM FORMATTER & SENDER (INCLUDES T1-50% & LOCKED R:R)
+# 📱 8. CLEAN TELEGRAM FORMATTER (SEPARATE INDEX & STOCK BLOCKS)
 # ==============================================================================
-def format_table(records, title, now_str, dhan_active: bool):
+def format_combined_table(idx_records, stk_records, title, now_str, dhan_active: bool):
     feed_str = "Dhan Live API ⚡ + NSE OI" if dhan_active else "NSE OI Spurts + BS Model"
+    col_hdr = f"{'Contract':<15}|{'Entry':>6}|{'Qty':>5}|{'Cap(₹)':>6}|{'SL':>5}|{'T1-50%':>6}|{'Target':>6}|{'R:R':>5}|{'OI_Flow':<8}|{'Win%':>5}"
+    sep = "-" * 77
+
     lines = [
         f"<b>🔥 {title}</b>",
         f"🕒 <code>{now_str}</code> | Feed: <code>{feed_str}</code> | Risk: <code>₹{RISK_PER_TRADE:,}</code>\n",
-        "<pre>",
-        f"{'Contract':<15}|{'Entry':>6}|{'Qty':>5}|{'Cap(₹)':>6}|{'SL':>5}|{'T1-50%':>6}|{'Target':>6}|{'R:R':>5}|{'OI_Flow':<8}|{'Win%':>5}",
-        "-" * 77,
     ]
-    for r in records[:TOP_N_ALERTS]:
-        lines.append(
-            f"{r['Contract'][:15]:<15}|"
-            f"{r['Entry']:>6.1f}|"
-            f"{r['Qty']:>5d}|"
-            f"{r['Capital']:>6d}|"
-            f"{r['Stop']:>5.1f}|"
-            f"{r['T1']:>6.1f}|"
-            f"{r['Target']:>6.1f}|"
-            f"{r['RR']:>5}|"
-            f"{r['OI_Flow'][:8]:<8}|"
-            f"{r['WinProb']:>4.1f}%"
-        )
-    lines.append("</pre>")
+
+    if idx_records:
+        lines.append("<b>📌 MAJOR INDICES F&amp;O (NIFTY / BANKNIFTY / SENSEX / MIDCP / FIN / IT)</b>")
+        lines.append("<pre>")
+        lines.append(col_hdr)
+        lines.append(sep)
+        for r in idx_records:
+            lines.append(
+                f"{r['Contract'][:15]:<15}|"
+                f"{r['Entry']:>6.1f}|"
+                f"{r['Qty']:>5d}|"
+                f"{r['Capital']:>6d}|"
+                f"{r['Stop']:>5.1f}|"
+                f"{r['T1']:>6.1f}|"
+                f"{r['Target']:>6.1f}|"
+                f"{r['RR']:>5}|"
+                f"{r['OI_Flow'][:8]:<8}|"
+                f"{r['WinProb']:>4.1f}%"
+            )
+        lines.append("</pre>\n")
+
+    if stk_records:
+        lines.append(f"<b>🚀 TOP {len(stk_records[:TOP_N_STOCKS])} STOCK OPTIONS (SORTED BY WIN% &amp; OI FLOW)</b>")
+        lines.append("<pre>")
+        lines.append(col_hdr)
+        lines.append(sep)
+        for r in stk_records[:TOP_N_STOCKS]:
+            lines.append(
+                f"{r['Contract'][:15]:<15}|"
+                f"{r['Entry']:>6.1f}|"
+                f"{r['Qty']:>5d}|"
+                f"{r['Capital']:>6d}|"
+                f"{r['Stop']:>5.1f}|"
+                f"{r['T1']:>6.1f}|"
+                f"{r['Target']:>6.1f}|"
+                f"{r['RR']:>5}|"
+                f"{r['OI_Flow'][:8]:<8}|"
+                f"{r['WinProb']:>4.1f}%"
+            )
+        lines.append("</pre>")
+
     lines.append(
-        "💡 <i>OI_Flow: 🔥LB = Long Build-Up | ⚡SC = Short Cover | 🐻SB = Short Build-Up | 💧LU = Long Unwind</i>"
+        "💡 <i>⚡ = Live Dhan Option Chain | 🔥LB = Long Build | ⚡SC = Short Cover | 🐻SB = Short Build</i>"
     )
     return "\n".join(lines)
 
@@ -638,10 +670,12 @@ def main():
     messages_sent = 0
 
     # ------------------------------------------------------------------
-    # 1. INTRADAY 15-MINUTE F&O SCALPS
+    # 1. INTRADAY 15-MINUTE F&O SCALPS (INDICES + TOP STOCKS)
     # ------------------------------------------------------------------
     raw_15m = yf.download(tickers, period="60d", interval="15m", group_by="ticker", progress=False)
-    intra_candidates = []
+    intra_idx_cands = []
+    intra_stk_cands = []
+
     for tk, meta in FNO_UNIVERSE.items():
         df15 = extract_ticker_df(raw_15m, tk)
         if len(df15) < 80:
@@ -657,39 +691,49 @@ def main():
         opt_type = "CE" if float(last['Close']) >= float(last['VWAP']) else "PE"
         sig_col = 'CE_Signal' if opt_type == "CE" else 'PE_Signal'
 
-        if not (bool(last[sig_col]) or bool(df15.iloc[-2][sig_col]) or abs(oi_chg_pct) >= 3.0):
-            continue
-
         is_blocked, is_boosted, oi_tag = classify_institutional_oi(price_chg_pct, oi_chg_pct, opt_type)
-        if is_blocked:
-            continue
-
         wins, tot, wp = backtest_signals(df15, opt_type, INTRA_ATR_SL_MULT, INTRA_UND_RR, INTRA_MAX_BARS, True)
-        if tot >= INTRA_MIN_SETUPS and wp >= INTRA_MIN_WIN_PROB:
-            intra_candidates.append((wp, is_boosted, meta, df15, opt_type, wins, tot, oi_tag))
 
-    # Prioritize Institutional OI-Aligned setups with high Win%
-    intra_candidates.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
-    intra_final = []
-    for wp, is_boosted, meta, df15, opt_type, wins, tot, oi_tag in intra_candidates[:TOP_N_ALERTS]:
-        row = build_option_trade_row(meta, df15, opt_type, wins, tot, wp, india_vix, True, oi_tag, is_boosted, dhan_engine)
-        intra_final.append(row)
+        if meta["is_idx"]:
+            # Always include Major Indices so user sees Nifty, BankNifty, Sensex, MidcapSelect, FinNifty, NiftyIT
+            if tot >= 1:
+                intra_idx_cands.append((wp, is_boosted, meta, df15, opt_type, wins, tot, oi_tag))
+        else:
+            if is_blocked:
+                continue
+            if not (bool(last[sig_col]) or bool(df15.iloc[-2][sig_col]) or abs(oi_chg_pct) >= 3.0):
+                continue
+            if tot >= INTRA_MIN_SETUPS and wp >= INTRA_MIN_WIN_PROB:
+                intra_stk_cands.append((wp, is_boosted, meta, df15, opt_type, wins, tot, oi_tag))
 
-    # Resort final display strictly by Win% descending
-    intra_final.sort(key=lambda x: (x["WinProb"], x["OIBoost"]), reverse=True)
-    if intra_final:
-        msg = format_table(intra_final, "TOP 15M INTRADAY F&O SCALPS (LOCKED 1:2.0 RR)", now_str, dhan_engine.enabled)
+    intra_idx_cands.sort(key=lambda x: x[0], reverse=True)
+    intra_stk_cands.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
+
+    intra_idx_rows = [
+        build_option_trade_row(m, d, o, w, t, wp, india_vix, True, tag, b, dhan_engine)
+        for wp, b, m, d, o, w, t, tag in intra_idx_cands
+    ]
+    intra_stk_rows = [
+        build_option_trade_row(m, d, o, w, t, wp, india_vix, True, tag, b, dhan_engine)
+        for wp, b, m, d, o, w, t, tag in intra_stk_cands[:TOP_N_STOCKS]
+    ]
+    intra_stk_rows.sort(key=lambda x: (x["WinProb"], x["OIBoost"]), reverse=True)
+
+    if intra_idx_rows or intra_stk_rows:
+        msg = format_combined_table(intra_idx_rows, intra_stk_rows, "15M INTRADAY F&O SCALPS (LOCKED 1:2.0 RR)", now_str, dhan_engine.enabled)
         send_telegram_alert(msg)
         messages_sent += 1
 
     # ------------------------------------------------------------------
-    # 2. POSITIONAL 3-5 DAY F&O SWINGS
+    # 2. POSITIONAL 3-5 DAY F&O SWINGS (INDICES + TOP STOCKS)
     # ------------------------------------------------------------------
     raw_1d = yf.download(tickers, period="5y", interval="1d", group_by="ticker", progress=False)
-    swing_candidates = []
+    swing_idx_cands = []
+    swing_stk_cands = []
+
     for tk, meta in FNO_UNIVERSE.items():
         df1d = extract_ticker_df(raw_1d, tk)
-        if len(df1d) < 250:
+        if len(df1d) < 200:
             continue
         df1d = compute_daily_indicators(df1d)
         last = df1d.iloc[-1]
@@ -701,26 +745,35 @@ def main():
         opt_type = "CE" if float(last['Close']) >= float(last['EMA21']) else "PE"
         sig_col = 'CE_Signal' if opt_type == "CE" else 'PE_Signal'
 
-        if not (bool(last[sig_col]) or abs(oi_chg_pct) >= 3.0):
-            continue
-
         is_blocked, is_boosted, oi_tag = classify_institutional_oi(price_chg_pct, oi_chg_pct, opt_type)
-        if is_blocked:
-            continue
-
         wins, tot, wp = backtest_signals(df1d, opt_type, SWING_ATR_SL_MULT, SWING_UND_RR, SWING_MAX_DAYS, False)
-        if tot >= SWING_MIN_SETUPS and wp >= SWING_MIN_WIN_PROB:
-            swing_candidates.append((wp, is_boosted, meta, df1d, opt_type, wins, tot, oi_tag))
 
-    swing_candidates.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
-    swing_final = []
-    for wp, is_boosted, meta, df1d, opt_type, wins, tot, oi_tag in swing_candidates[:TOP_N_ALERTS]:
-        row = build_option_trade_row(meta, df1d, opt_type, wins, tot, wp, india_vix, False, oi_tag, is_boosted, dhan_engine)
-        swing_final.append(row)
+        if meta["is_idx"]:
+            if tot >= 1:
+                swing_idx_cands.append((wp, is_boosted, meta, df1d, opt_type, wins, tot, oi_tag))
+        else:
+            if is_blocked:
+                continue
+            if not (bool(last[sig_col]) or abs(oi_chg_pct) >= 3.0):
+                continue
+            if tot >= SWING_MIN_SETUPS and wp >= SWING_MIN_WIN_PROB:
+                swing_stk_cands.append((wp, is_boosted, meta, df1d, opt_type, wins, tot, oi_tag))
 
-    swing_final.sort(key=lambda x: (x["WinProb"], x["OIBoost"]), reverse=True)
-    if swing_final:
-        msg = format_table(swing_final, "TOP 3-5D POSITIONAL F&O (LOCKED 1:2.5 RR)", now_str, dhan_engine.enabled)
+    swing_idx_cands.sort(key=lambda x: x[0], reverse=True)
+    swing_stk_cands.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
+
+    swing_idx_rows = [
+        build_option_trade_row(m, d, o, w, t, wp, india_vix, False, tag, b, dhan_engine)
+        for wp, b, m, d, o, w, t, tag in swing_idx_cands
+    ]
+    swing_stk_rows = [
+        build_option_trade_row(m, d, o, w, t, wp, india_vix, False, tag, b, dhan_engine)
+        for wp, b, m, d, o, w, t, tag in swing_stk_cands[:TOP_N_STOCKS]
+    ]
+    swing_stk_rows.sort(key=lambda x: (x["WinProb"], x["OIBoost"]), reverse=True)
+
+    if swing_idx_rows or swing_stk_rows:
+        msg = format_combined_table(swing_idx_rows, swing_stk_rows, "3-5D POSITIONAL F&O (LOCKED 1:2.5 RR)", now_str, dhan_engine.enabled)
         send_telegram_alert(msg)
         messages_sent += 1
 
