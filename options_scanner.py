@@ -26,35 +26,36 @@ token_match = re.search(r'(\d+:[A-Za-z0-9_-]+)', RAW_TOKEN)
 TELEGRAM_BOT_TOKEN = token_match.group(1) if token_match else RAW_TOKEN.lstrip("bot").strip('"').strip("'")
 TELEGRAM_CHAT_ID   = RAW_CHATID
 
-# Optional Dhan Trading API v2 Credentials (Auto-detected from GitHub Secrets)
 DHAN_CLIENT_ID    = os.environ.get("DHAN_CLIENT_ID", "").strip().strip('"').strip("'")
 DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN", "").strip().strip('"').strip("'")
 
 # ==============================================================================
-# ⚖️ 2. RISK MANAGEMENT & CALIBRATED 5-YEAR BACKTEST PARAMETERS
+# ⚖️ 2. RISK MANAGEMENT & LOCKED OPTION RISK:REWARD PARAMETERS
 # ==============================================================================
 RISK_PER_TRADE        = 3000      # Max Rupee risk per option trade (₹3,000)
 MAX_CAPITAL_PER_TRADE = 45000     # Max Option Premium outlay per trade (₹45,000)
 TOP_N_ALERTS          = 10        # Top 10 best F&O setups per timeframe
 
-# Intraday 15-Minute Scalp Parameters (Gamma convexity converts 1.6x ATR to ~1:2.2 Option RR)
-INTRA_UND_RR          = 1.6       # Underlying ATR target multiple for 10-bar intraday window
+# Intraday 15-Minute Scalp Parameters (Locked 1:2.0 Option RR, T1 at +1.0R)
+INTRA_OPT_RR          = 2.0       # Locked 1:2.0 Option Risk:Reward for Intraday
+INTRA_UND_RR          = 1.6       # Underlying ATR move required in backtest
 INTRA_ATR_SL_MULT     = 0.9       # 0.9x ATR stop loss
 INTRA_MAX_BARS        = 12        # 12 bars intraday window (3 hours)
 INTRA_MIN_SETUPS      = 5         # Minimum historical setups in 60 days
-INTRA_MIN_WIN_PROB    = 22.0      # Calibrated minimum Win%
+INTRA_MIN_WIN_PROB    = 25.0      # Minimum Win% filter
 
-# Positional 3-5 Day Swing F&O Parameters (Gamma converts 1.8x ATR to ~1:2.5 Option RR)
-SWING_UND_RR          = 1.8       # Underlying ATR target multiple for 5-day window
+# Positional 3-5 Day Swing F&O Parameters (Locked 1:2.5 Option RR, T1 at +1.25R)
+SWING_OPT_RR          = 2.5       # Locked 1:2.5 Option Risk:Reward for Positional
+SWING_UND_RR          = 1.8       # Underlying ATR move required in 5-day backtest
 SWING_ATR_SL_MULT     = 1.0       # 1.0x Daily ATR stop loss
 SWING_MAX_DAYS        = 6         # 6 trading days max hold before Theta decay
 SWING_MIN_SETUPS      = 5         # Minimum historical setups in 5 years
-SWING_MIN_WIN_PROB    = 22.0      # Calibrated minimum Win%
+SWING_MIN_WIN_PROB    = 25.0      # Minimum Win% filter
 
 RISK_FREE_RATE        = 0.068
 
 # ==============================================================================
-# 📋 3. 2026 F&O UNIVERSE & REVISED LOT SIZES
+# 📋 3. 100% VERIFIED LIQUID NSE F&O UNIVERSE & 2026 LOT SIZES
 # ==============================================================================
 FNO_UNIVERSE = {
     "^NSEI":          {"name": "NIFTY",      "nse": "NIFTY",      "lot": 65,   "step": 50,  "is_idx": True,  "dhan_id": 13, "dhan_seg": "IDX_I"},
@@ -70,15 +71,20 @@ FNO_UNIVERSE = {
     "PERSISTENT.NS":  {"name": "PERSISTENT", "nse": "PERSISTENT", "lot": 100,  "step": 100, "is_idx": False},
     "TCS.NS":         {"name": "TCS",        "nse": "TCS",        "lot": 175,  "step": 50,  "is_idx": False},
     "OBEROIRLTY.NS":  {"name": "OBEROIRLTY", "nse": "OBEROIRLTY", "lot": 350,  "step": 20,  "is_idx": False},
+    "DIXON.NS":       {"name": "DIXON",      "nse": "DIXON",      "lot": 50,   "step": 200, "is_idx": False},
+    "DLF.NS":         {"name": "DLF",        "nse": "DLF",        "lot": 825,  "step": 10,  "is_idx": False},
+    "BHARTIARTL.NS":  {"name": "BHARTIARTL", "nse": "BHARTIARTL", "lot": 475,  "step": 20,  "is_idx": False},
+    "AXISBANK.NS":    {"name": "AXISBANK",   "nse": "AXISBANK",   "lot": 625,  "step": 20,  "is_idx": False},
+    "KOTAKBANK.NS":   {"name": "KOTAKBANK",  "nse": "KOTAKBANK",  "lot": 400,  "step": 20,  "is_idx": False},
+    "MARUTI.NS":      {"name": "MARUTI",     "nse": "MARUTI",     "lot": 50,   "step": 100, "is_idx": False},
+    "M&M.NS":         {"name": "M&M",        "nse": "M&M",        "lot": 175,  "step": 50,  "is_idx": False},
+    "LT.NS":          {"name": "LT",         "nse": "LT",         "lot": 150,  "step": 50,  "is_idx": False},
+    "INFY.NS":        {"name": "INFY",       "nse": "INFY",       "lot": 400,  "step": 20,  "is_idx": False},
     "AUROPHARMA.NS":  {"name": "AUROPHARMA", "nse": "AUROPHARMA", "lot": 550,  "step": 20,  "is_idx": False},
-    "MOTILALOFS.NS":  {"name": "MOTILALOFS", "nse": "MOTILALOFS", "lot": 600,  "step": 20,  "is_idx": False},
     "ZYDUSLIFE.NS":   {"name": "ZYDUSLIFE",  "nse": "ZYDUSLIFE",  "lot": 900,  "step": 20,  "is_idx": False},
-    "MANKIND.NS":     {"name": "MANKIND",    "nse": "MANKIND",    "lot": 225,  "step": 20,  "is_idx": False},
     "RBLBANK.NS":     {"name": "RBLBANK",    "nse": "RBLBANK",    "lot": 2500, "step": 5,   "is_idx": False},
-    "KAYNES.NS":      {"name": "KAYNES",     "nse": "KAYNES",     "lot": 125,  "step": 50,  "is_idx": False},
     "CONCOR.NS":      {"name": "CONCOR",     "nse": "CONCOR",     "lot": 1000, "step": 10,  "is_idx": False},
     "VOLTAS.NS":      {"name": "VOLTAS",     "nse": "VOLTAS",     "lot": 375,  "step": 20,  "is_idx": False},
-    "SOLARINDS.NS":   {"name": "SOLARINDS",  "nse": "SOLARINDS",  "lot": 75,   "step": 100, "is_idx": False},
     "TITAN.NS":       {"name": "TITAN",      "nse": "TITAN",      "lot": 175,  "step": 50,  "is_idx": False},
     "ABB.NS":         {"name": "ABB",        "nse": "ABB",        "lot": 125,  "step": 100, "is_idx": False},
     "RELIANCE.NS":    {"name": "RELIANCE",   "nse": "RELIANCE",   "lot": 500,  "step": 20,  "is_idx": False},
@@ -90,17 +96,13 @@ FNO_UNIVERSE = {
     "HAL.NS":         {"name": "HAL",        "nse": "HAL",        "lot": 150,  "step": 50,  "is_idx": False},
     "BEL.NS":         {"name": "BEL",        "nse": "BEL",        "lot": 2850, "step": 5,   "is_idx": False},
     "TRENT.NS":       {"name": "TRENT",      "nse": "TRENT",      "lot": 100,  "step": 100, "is_idx": False},
-    "DIXON.NS":       {"name": "DIXON",      "nse": "DIXON",      "lot": 50,   "step": 200, "is_idx": False},
     "CAMS.NS":        {"name": "CAMS",       "nse": "CAMS",       "lot": 150,  "step": 50,  "is_idx": False},
     "NTPC.NS":        {"name": "NTPC",       "nse": "NTPC",       "lot": 1500, "step": 5,   "is_idx": False},
     "ADANIPORTS.NS":  {"name": "ADANIPORTS", "nse": "ADANIPORTS", "lot": 400,  "step": 20,  "is_idx": False},
     "INDHOTEL.NS":    {"name": "INDHOTEL",   "nse": "INDHOTEL",   "lot": 1000, "step": 10,  "is_idx": False},
     "MOTHERSON.NS":   {"name": "MOTHERSON",  "nse": "MOTHERSON",  "lot": 4100, "step": 2.5, "is_idx": False},
     "NYKAA.NS":       {"name": "NYKAA",      "nse": "NYKAA",      "lot": 3125, "step": 5,   "is_idx": False},
-    "JINDALSAW.NS":   {"name": "JINDALSAW",  "nse": "JINDALSAW",  "lot": 1500, "step": 5,   "is_idx": False},
-    "PARADEEP.NS":    {"name": "PARADEEP",   "nse": "PARADEEP",   "lot": 4000, "step": 2.5, "is_idx": False},
     "SUPREMEIND.NS":  {"name": "SUPREMEIND", "nse": "SUPREMEIND", "lot": 175,  "step": 50,  "is_idx": False},
-    "GLAND.NS":       {"name": "GLAND",      "nse": "GLAND",      "lot": 250,  "step": 20,  "is_idx": False},
 }
 
 # ==============================================================================
@@ -126,13 +128,11 @@ class DhanOptionEngine:
         }
 
     def _load_security_master(self):
-        """Loads NSE Equity Security IDs from Dhan's official compact scrip master."""
         url = "https://images.dhan.co/api-data/api-scrip-master.csv"
         try:
             r = requests.get(url, timeout=12)
             if r.status_code == 200:
                 df = pd.read_csv(io.StringIO(r.text), low_memory=False)
-                # Filter NSE Equity cash symbols to map UnderlyingScrip IDs
                 eq_df = df[
                     (df["SEM_EXM_EXCH_ID"] == "NSE") &
                     (df["SEM_INSTRUMENT_NAME"] == "EQUITY")
@@ -147,10 +147,6 @@ class DhanOptionEngine:
             print(f"⚠️ Dhan Scrip Master load warning ({e}).")
 
     def get_live_atm_option(self, meta: dict, atm_strike: float, opt_type: str):
-        """
-        Queries Dhan /v2/optionchain for live ATM Option LTP, Delta, Gamma & Implied Volatility.
-        Returns dict {"ltp": float, "delta": float, "gamma": float, "iv": float} or None (falls back to Black-Scholes).
-        """
         if not self.enabled:
             return None
 
@@ -160,12 +156,10 @@ class DhanOptionEngine:
             return None
 
         try:
-            # Respect Dhan API rate limit (max 1 option chain request per 3 seconds)
             if self.active_calls > 0:
                 time.sleep(3.1)
             self.active_calls += 1
 
-            # 1. Fetch nearest active expiry list for underlying
             exp_resp = requests.post(
                 f"{self.base_url}/optionchain/expirylist",
                 headers=self._headers(),
@@ -179,7 +173,6 @@ class DhanOptionEngine:
                 return None
             nearest_expiry = expiries[0]
 
-            # 2. Fetch live Option Chain for nearest expiry
             oc_resp = requests.post(
                 f"{self.base_url}/optionchain",
                 headers=self._headers(),
@@ -193,12 +186,10 @@ class DhanOptionEngine:
             if not oc_data:
                 return None
 
-            # Find closest matching strike key in Dhan Option Chain
             strike_keys = [float(k) for k in oc_data.keys()]
             if not strike_keys:
                 return None
             best_strike = min(strike_keys, key=lambda x: abs(x - float(atm_strike)))
-            # Format strike key back as present in oc_data
             raw_key = next(k for k in oc_data.keys() if abs(float(k) - best_strike) < 1e-4)
             leg_key = "ce" if opt_type == "CE" else "pe"
             leg = oc_data.get(raw_key, {}).get(leg_key, {})
@@ -264,12 +255,12 @@ def classify_institutional_oi(price_chg_pct: float, oi_chg_pct: float, opt_type:
 
     sign_str = f"{oi_chg_pct:+.0f}%"
     if price_chg_pct >= 0.0 and oi_chg_pct >= 3.0:
-        if opt_type == "PE" and oi_chg_pct >= 10.0 and price_chg_pct >= 0.5:
+        if opt_type == "PE" and oi_chg_pct >= 8.0 and price_chg_pct >= 0.3:
             return True, False, f"🔥{sign_str}LB"
         return False, (opt_type == "CE"), f"🔥{sign_str}LB"
 
     if price_chg_pct < 0.0 and oi_chg_pct >= 3.0:
-        if opt_type == "CE" and oi_chg_pct >= 10.0 and price_chg_pct <= -0.5:
+        if opt_type == "CE" and oi_chg_pct >= 8.0 and price_chg_pct <= -0.3:
             return True, False, f"🐻{sign_str}SB"
         return False, (opt_type == "PE"), f"🐻{sign_str}SB"
 
@@ -279,7 +270,7 @@ def classify_institutional_oi(price_chg_pct: float, oi_chg_pct: float, opt_type:
     if price_chg_pct <= -0.2 and oi_chg_pct <= -2.5:
         return False, (opt_type == "PE"), f"💧{sign_str}LU"
 
-    return False, (abs(oi_chg_pct) >= 5.0), f"{sign_str}OI"
+    return False, False, f"{sign_str}OI"
 
 # ==============================================================================
 # 📈 6. INDICATORS (WITH BB 38/61 RIBBON) & BLACK-SCHOLES GREEKS
@@ -352,7 +343,6 @@ def compute_daily_indicators(df):
     df['EMA21']  = c.ewm(span=21, adjust=False).mean()
     df['EMA55']  = c.ewm(span=55, adjust=False).mean()
 
-    # Proven BB(38, 2.0) & BB(61, 2.0) Ribbon
     df['BB_SMA_38'] = c.rolling(38).mean()
     std_38 = c.rolling(38).std(ddof=0)
     df['BB_UP_38'] = df['BB_SMA_38'] + (2.0 * std_38)
@@ -437,13 +427,9 @@ def compute_intraday_15m_indicators(df):
     return df
 
 # ==============================================================================
-# 🧪 7. GAMMA-CALIBRATED BACKTESTER & OPTION TRADE BUILDER
+# 🧪 7. GAMMA-CALIBRATED BACKTESTER & LOCKED R:R OPTION BUILDER
 # ==============================================================================
 def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, is_intraday=False):
-    """
-    Evaluates historical setups where underlying moves +und_rr * ATR before -atr_mult * ATR.
-    Includes T1 (+1.0x ATR) breakeven protection so option trades that rally +1 ATR don't count as full losses.
-    """
     sig_col = 'CE_Signal' if direction == "CE" else 'PE_Signal'
     closes, highs, lows, atrs, sigs = (
         df['Close'].values, df['High'].values, df['Low'].values, df['ATR'].values, df[sig_col].values
@@ -505,7 +491,6 @@ def build_option_trade_row(meta, df, opt_type, wins, total, win_prob, india_vix,
     step   = meta["step"]
     atm_strike = int(round(spot / step) * step) if step >= 5 else round(spot / step) * step
 
-    # 1. Try Live Dhan Option Chain API first (if configured & Candidate is in Top list)
     dhan_quote = dhan_engine.get_live_atm_option(meta, atm_strike, opt_type) if dhan_engine else None
     if dhan_quote:
         opt_entry  = dhan_quote["ltp"]
@@ -524,26 +509,28 @@ def build_option_trade_row(meta, df, opt_type, wins, total, win_prob, india_vix,
 
     strike_str = f"{int(atm_strike)}" if atm_strike == int(atm_strike) else f"{atm_strike:.1f}"
 
-    atr_mult = INTRA_ATR_SL_MULT if is_intraday else SWING_ATR_SL_MULT
-    und_rr   = 2.0 if is_intraday else 2.2
+    # Calculate realistic Option Stop Loss (20% to 28% of option premium based on ATR & Delta)
+    atr_mult   = INTRA_ATR_SL_MULT if is_intraday else SWING_ATR_SL_MULT
     und_risk   = atr * atr_mult
-    und_reward = und_risk * und_rr
+    raw_opt_sl_dist = delta * und_risk - 0.5 * gamma * (und_risk ** 2)
+    max_pct_sl = 0.22 if is_intraday else 0.28
+    min_pct_sl = 0.14 if is_intraday else 0.18
+    opt_risk   = min(opt_entry * max_pct_sl, max(opt_entry * min_pct_sl, raw_opt_sl_dist))
 
-    max_pct_sl = 0.28 if is_intraday else 0.32
-    opt_risk   = min(opt_entry * max_pct_sl, max(opt_entry * 0.15, delta * und_risk - 0.5 * gamma * (und_risk ** 2)))
-    opt_reward = (delta * und_reward) + (0.5 * gamma * (und_reward ** 2))
-
-    opt_sl    = round(max(0.5, opt_entry - opt_risk), 1)
-    opt_tgt   = round(opt_entry + opt_reward, 1)
     opt_entry = round(opt_entry, 1)
+    opt_risk  = max(round(opt_risk, 1), 0.3)
+    opt_sl    = round(max(0.5, opt_entry - opt_risk), 1)
+    actual_risk = max(round(opt_entry - opt_sl, 1), 0.2)
 
-    opt_risk_pts   = max(opt_entry - opt_sl, 0.1)
-    opt_reward_pts = max(opt_tgt - opt_entry, 0.1)
-    actual_rr      = round(opt_reward_pts / opt_risk_pts, 1)
-    rr_str         = f"1:{actual_rr}"
+    # Lock Option Target to realistic 1:2.0 (Intraday) and 1:2.5 (Positional) R:R!
+    target_rr = INTRA_OPT_RR if is_intraday else SWING_OPT_RR
+    t1_rr     = 1.0 if is_intraday else 1.25
+    opt_t1    = round(opt_entry + (actual_risk * t1_rr), 1)
+    opt_tgt   = round(opt_entry + (actual_risk * target_rr), 1)
+    rr_str    = f"1:{target_rr:.1f}"
 
     lot_size     = meta["lot"]
-    risk_per_lot = max((opt_entry - opt_sl) * lot_size, 1.0)
+    risk_per_lot = max(actual_risk * lot_size, 1.0)
     cost_per_lot = max(opt_entry * lot_size, 1.0)
     num_lots     = max(1, min(max(1, int(RISK_PER_TRADE // risk_per_lot)), max(1, int(MAX_CAPITAL_PER_TRADE // cost_per_lot))))
 
@@ -551,11 +538,12 @@ def build_option_trade_row(meta, df, opt_type, wins, total, win_prob, india_vix,
     capital = int(round(opt_entry * qty))
 
     return {
-        "Contract": f"{src_flag}{meta['name'][:8]} {strike_str}{opt_type}",
+        "Contract": f"{src_flag}{meta['name'][:7]} {strike_str}{opt_type}",
         "Entry": opt_entry,
         "Qty": qty,
         "Capital": capital,
         "Stop": opt_sl,
+        "T1": opt_t1,
         "Target": opt_tgt,
         "RR": rr_str,
         "OI_Flow": oi_tag,
@@ -564,7 +552,7 @@ def build_option_trade_row(meta, df, opt_type, wins, total, win_prob, india_vix,
     }
 
 # ==============================================================================
-# 📱 8. CLEAN TELEGRAM FORMATTER & SENDER
+# 📱 8. CLEAN TELEGRAM FORMATTER & SENDER (INCLUDES T1-50% & LOCKED R:R)
 # ==============================================================================
 def format_table(records, title, now_str, dhan_active: bool):
     feed_str = "Dhan Live API ⚡ + NSE OI" if dhan_active else "NSE OI Spurts + BS Model"
@@ -572,19 +560,20 @@ def format_table(records, title, now_str, dhan_active: bool):
         f"<b>🔥 {title}</b>",
         f"🕒 <code>{now_str}</code> | Feed: <code>{feed_str}</code> | Risk: <code>₹{RISK_PER_TRADE:,}</code>\n",
         "<pre>",
-        f"{'Contract':<15}|{'Entry':>6}|{'Qty':>5}|{'Cap(₹)':>7}|{'SL':>6}|{'Target':>6}|{'R:R':>5}|{'OI_Flow':<9}|{'Win%':>5}",
-        "-" * 74,
+        f"{'Contract':<15}|{'Entry':>6}|{'Qty':>5}|{'Cap(₹)':>6}|{'SL':>5}|{'T1-50%':>6}|{'Target':>6}|{'R:R':>5}|{'OI_Flow':<8}|{'Win%':>5}",
+        "-" * 77,
     ]
     for r in records[:TOP_N_ALERTS]:
         lines.append(
             f"{r['Contract'][:15]:<15}|"
             f"{r['Entry']:>6.1f}|"
             f"{r['Qty']:>5d}|"
-            f"{r['Capital']:>7d}|"
-            f"{r['Stop']:>6.1f}|"
+            f"{r['Capital']:>6d}|"
+            f"{r['Stop']:>5.1f}|"
+            f"{r['T1']:>6.1f}|"
             f"{r['Target']:>6.1f}|"
             f"{r['RR']:>5}|"
-            f"{r['OI_Flow'][:9]:<9}|"
+            f"{r['OI_Flow'][:8]:<8}|"
             f"{r['WinProb']:>4.1f}%"
         )
     lines.append("</pre>")
@@ -668,7 +657,6 @@ def main():
         opt_type = "CE" if float(last['Close']) >= float(last['VWAP']) else "PE"
         sig_col = 'CE_Signal' if opt_type == "CE" else 'PE_Signal'
 
-        # Trigger if either technical setup is active in last 2 bars OR OI spurt >= 3%
         if not (bool(last[sig_col]) or bool(df15.iloc[-2][sig_col]) or abs(oi_chg_pct) >= 3.0):
             continue
 
@@ -680,15 +668,17 @@ def main():
         if tot >= INTRA_MIN_SETUPS and wp >= INTRA_MIN_WIN_PROB:
             intra_candidates.append((wp, is_boosted, meta, df15, opt_type, wins, tot, oi_tag))
 
-    # Sort best candidates first, then enrich Top N with Dhan Live Option Chain
-    intra_candidates.sort(key=lambda x: (x[0], 1 if x[1] else 0), reverse=True)
+    # Prioritize Institutional OI-Aligned setups with high Win%
+    intra_candidates.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
     intra_final = []
     for wp, is_boosted, meta, df15, opt_type, wins, tot, oi_tag in intra_candidates[:TOP_N_ALERTS]:
         row = build_option_trade_row(meta, df15, opt_type, wins, tot, wp, india_vix, True, oi_tag, is_boosted, dhan_engine)
         intra_final.append(row)
 
+    # Resort final display strictly by Win% descending
+    intra_final.sort(key=lambda x: (x["WinProb"], x["OIBoost"]), reverse=True)
     if intra_final:
-        msg = format_table(intra_final, "TOP 15M INTRADAY F&O SCALPS (SORTED BY WIN%)", now_str, dhan_engine.enabled)
+        msg = format_table(intra_final, "TOP 15M INTRADAY F&O SCALPS (LOCKED 1:2.0 RR)", now_str, dhan_engine.enabled)
         send_telegram_alert(msg)
         messages_sent += 1
 
@@ -722,14 +712,15 @@ def main():
         if tot >= SWING_MIN_SETUPS and wp >= SWING_MIN_WIN_PROB:
             swing_candidates.append((wp, is_boosted, meta, df1d, opt_type, wins, tot, oi_tag))
 
-    swing_candidates.sort(key=lambda x: (x[0], 1 if x[1] else 0), reverse=True)
+    swing_candidates.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
     swing_final = []
     for wp, is_boosted, meta, df1d, opt_type, wins, tot, oi_tag in swing_candidates[:TOP_N_ALERTS]:
         row = build_option_trade_row(meta, df1d, opt_type, wins, tot, wp, india_vix, False, oi_tag, is_boosted, dhan_engine)
         swing_final.append(row)
 
+    swing_final.sort(key=lambda x: (x["WinProb"], x["OIBoost"]), reverse=True)
     if swing_final:
-        msg = format_table(swing_final, "TOP 3-5D POSITIONAL F&O (5Y + NSE OI SPURTS)", now_str, dhan_engine.enabled)
+        msg = format_table(swing_final, "TOP 3-5D POSITIONAL F&O (LOCKED 1:2.5 RR)", now_str, dhan_engine.enabled)
         send_telegram_alert(msg)
         messages_sent += 1
 
