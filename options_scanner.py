@@ -315,16 +315,20 @@ def black_scholes_greeks(S, K, T, r, sigma, option_type="CE"):
     return max(float(price), 1.0), abs(float(delta)), float(gamma)
 
 def get_dte(is_intraday=False):
+    """
+    For Intraday: Targets weekly contracts (1-4 DTE).
+    For Positional Swings: Enforces a minimum 15-30 DTE window (Monthly contracts)
+    to eliminate toxic Gamma and Theta decay during 3-5 day swing holds.
+    """
     ist = pytz.timezone('Asia/Kolkata')
     today = datetime.now(ist).replace(tzinfo=None)
+    
     if is_intraday:
         return max((3 - today.weekday()) % 7, 1)
-    cal = calendar.monthcalendar(today.year, today.month)
-    thursdays = [week[calendar.THURSDAY] for week in cal if week[calendar.THURSDAY] != 0]
-    last_thursday = datetime(today.year, today.month, thursdays[-1])
-    dte = (last_thursday - today).days
-    return dte if dte >= 6 else dte + 28
-
+    
+    # For Positional Swings, target ~22 DTE (Monthly / Far Expiry)
+    return 22
+    
 def compute_daily_indicators(df):
     df = df.copy()
     c = df['Close']
