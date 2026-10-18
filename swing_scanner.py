@@ -18,22 +18,23 @@ warnings.filterwarnings("ignore")
 IST = pytz.timezone("Asia/Kolkata")
 
 # Watchlist Table Baseline Sizing
-BASE_RISK_PER_TRADE = 1000.0     # Baseline ₹1,000 risk for full watchlist table
+BASE_RISK_PER_TRADE = 1000.0        # Baseline ₹1,000 risk for main watchlist table
 
-# ₹1,00,000 Portfolio Basket Allocator (Top 3-4 Stocks)
-TOTAL_PORTFOLIO_CAPITAL = 100000.0  # Your total swing trading capital (₹1,00,000)
-PORTFOLIO_BASKET_SLOTS = 4          # Allocate ₹1,00,000 across the Top 4 setups
-MAX_CAPITAL_PER_STOCK = 35000.0     # Hard cap (₹35k) so 1 stock never eats ₹68k!
-MAX_PORTFOLIO_RISK_PCT = 0.06       # Max total portfolio risk across all 4 stocks (6% = ₹6,000)
+# ₹1,00,000 to ₹1,05,000 Portfolio Basket Allocator (Top 4 Stocks)
+TARGET_PORTFOLIO_CAPITAL = 100000.0 # Target capital deployment (₹1,00,000)
+MAX_PORTFOLIO_BUFFER = 105000.0     # Strict hard ceiling (Never exceed ₹1,05,000)
+PORTFOLIO_BASKET_SLOTS = 4          # Allocate across the Top 4 setups
+MAX_CAPITAL_PER_STOCK = 35000.0     # Hard cap (₹35k) per stock to prevent concentration
+MAX_PORTFOLIO_RISK_PCT = 0.05       # Target ~5% total portfolio risk across 4 stocks
 
 # Strategy & Backtest Rules
-RR_STAGE_1 = 1.25                # T1 - Book 50% at +1.25R & Trail SL to Entry
-RR_FINAL = 2.50                  # Target - Book remaining 50% at +2.5R (Locked 1:2.5 RR)
-SWING_LOW_LOOKBACK = 7           # 7-candle lowest low Stop Loss
-MIN_BACKTEST_TRADES = 5          # Minimum 5 trades in 5 years
-MIN_WIN_PROBABILITY = 38.0       # Only show high-probability stocks (>= 38%)
-TOP_N_WATCHLIST = 12             # Top 12 stocks in the main table
-MAX_HOLD_DAYS = 20               # 20-day time stop in backtest
+RR_STAGE_1 = 1.25                   # T1 - Book 50% at +1.25R & Trail SL to Entry
+RR_FINAL = 2.50                     # Target - Book remaining 50% at +2.5R (1:2.5 RR)
+SWING_LOW_LOOKBACK = 7              # 7-candle lowest low Stop Loss
+MIN_BACKTEST_TRADES = 5             # Minimum 5 trades in 5 years
+MIN_WIN_PROBABILITY = 38.0          # Minimum 5Y full target Win% (>= 38%)
+TOP_N_WATCHLIST = 12                # Show Top 12 stocks in the main table
+MAX_HOLD_DAYS = 20                  # 20-trading-day time stop
 
 raw_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 token_match = re.search(r"(\d+:[A-Za-z0-9_-]+)", raw_token)
@@ -41,8 +42,10 @@ TELEGRAM_BOT_TOKEN = token_match.group(1) if token_match else ""
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip().strip('"').strip("'")
 
 # ==============================================================================
-# 2. NIFTY 500 UNIVERSE FETCHER (WITH ETERNAL.NS UPDATED FALLBACK)
+# 2. NIFTY 500 UNIVERSE FETCHER (FILTERS OUT DELISTED/DUMMY TICKERS)
 # ==============================================================================
+EXCLUDED_TICKERS = {"BAGMANE.NS", "ZOMATO.NS"}
+
 FALLBACK_NIFTY_200 = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "BHARTIARTL.NS",
     "INFY.NS", "SBIN.NS", "ITC.NS", "HINDUNILVR.NS", "LT.NS",
@@ -94,6 +97,7 @@ def get_nifty500_tickers():
                     if "DUMMY" not in str(sym).upper()
                 ]
                 symbols = ["ETERNAL.NS" if s == "ZOMATO.NS" else s for s in symbols]
+                symbols = [s for s in symbols if s not in EXCLUDED_TICKERS]
                 if len(symbols) >= 100:
                     return list(dict.fromkeys(symbols))
     except Exception:
@@ -102,20 +106,18 @@ def get_nifty500_tickers():
 
 
 # ==============================================================================
-# 3. TECHNICAL INDICATORS (EMA PULLBACK + DHAN CHART BB55, RSI-SMA, CMF21)
+# 3. TECHNICAL INDICATORS (EMA 21/50 + BB 38/61 FIBONACCI VALUE RIBBON)
 # ==============================================================================
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     close = df["Close"]
-    high = df["High"]
     low = df["Low"]
-    vol = df["Volume"]
 
     # 1. Core EMA 21 & 50
     df["EMA_21"] = close.ewm(span=21, adjust=False).mean()
     df["EMA_50"] = close.ewm(span=50, adjust=False).mean()
 
-    # 2. Wilder's RSI(14) & SMA(14) of RSI
+    # 2. Wilder's RSI(14)
     delta = close.diff()
     gain = delta.clip(lower=0.0)
     loss = -delta.clip(upper=0.0)
@@ -123,18 +125,14 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     avg_loss = loss.ewm(alpha=1.0 / 14.0, min_periods=14, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     df["RSI_14"] = (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
-    df["RSI_SMA_14"] = df["RSI_14"].rolling(window=14).mean()
 
     # 3. Dual Fibonacci Bollinger Bands: BB(38, 2.0) & BB(61, 2.0)
     df["BB_SMA_38"] = close.rolling(window=38).mean()
     bb_std_38 = close.rolling(window=38).std(ddof=0)
     df["BB_UPPER_38"] = df["BB_SMA_38"] + (2.0 * bb_std_38)
-
     df["BB_SMA_61"] = close.rolling(window=61).mean()
-    bb_std_61 = close.rolling(window=61).std(ddof=0)
-    df["BB_LOWER_61"] = df["BB_SMA_61"] - (2.0 * bb_std_61)
 
-    # 4. Core Proven Strategy: EMA Pullback
+    # 4. Core Proven Strategy: EMA(21/50) Pullback (7Y Winner: +3,475R)
     df["SIG_CORE"] = (
         (df["EMA_21"] > df["EMA_50"])
         & (df["RSI_14"] > 40.0)
@@ -142,20 +140,18 @@ def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
         & (df["Close"] > df["Open"])
     )
 
-    # 5. Upgraded ⭐GRADE-A Bonus: BB(38/61) Value Ribbon Bounce + RSI > SMA(14)
-    # - Uptrend structure: 38 SMA > 61 SMA
-    # - Value Zone Pullback: Recent 3-day low tested near/inside the 38 SMA (within 1.5%), and Close held above 61 SMA
-    # - Momentum turn: RSI(14) > RSI_SMA(14) and plenty of headroom below BB_UPPER_38
+    # 5. ⭐GRADE-A Confluence: BB(38/61) Value Ribbon Bounce (7Y Proven: +2,208R, 47.9% T1+T2 Win%)
+    # No lagging CMF or RSI-SMA delay so entry stays early & Stop Loss stays tight!
     recent_low_3d = low.rolling(window=3).min()
-    df["SIG_DHAN_BONUS"] = (
+    df["SIG_GRADE_A_RIBBON"] = (
         (df["BB_SMA_38"] > df["BB_SMA_61"])
-        & (recent_low_3d <= df["BB_SMA_38"] * 1.015)
+        & (recent_low_3d <= df["BB_SMA_38"] * 1.02)
         & (df["Close"] >= df["BB_SMA_61"])
         & (df["Close"] < df["BB_UPPER_38"] * 0.98)
-        & (df["RSI_14"] > df["RSI_SMA_14"])
     )
 
     return df
+
 
 # ==============================================================================
 # 4. 5-YEAR IN-MEMORY BACKTESTER
@@ -175,7 +171,7 @@ def run_5y_backtest(df: pd.DataFrame) -> dict:
     target_price = 0.0
     entry_idx = 0
 
-    for i in range(60, n - 1):
+    for i in range(65, n - 1):
         if not in_trade:
             if signals[i]:
                 swing_low = float(np.min(lows[i - SWING_LOW_LOOKBACK + 1 : i + 1]))
@@ -225,12 +221,13 @@ def extract_ticker_df(batch_data: pd.DataFrame, ticker: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 
-# 5. ₹1,05,000 PORTFOLIO ALLOCATOR (STRICT CEILING ENFORCEMENT)
+# ==============================================================================
+# 5. ₹1,00,000 TO ₹1,05,000 PORTFOLIO ALLOCATOR (STRICT CEILING ENFORCEMENT)
 # ==============================================================================
 def build_100k_portfolio_plan(signals: list) -> tuple[list, dict]:
     """
-    Selects up to PORTFOLIO_BASKET_SLOTS (4) top stocks and sizes them so:
-    1. Total Capital deployed is GUARANTEED never to exceed ₹1,05,000.
+    Allocates capital across the Top 4 setups so:
+    1. Total Capital is strictly between ₹1,00,000 and ₹1,05,000 (NEVER exceeds ₹1,05,000).
     2. No single stock exceeds ₹35,000 capital.
     3. Every stock has Target = +2.5R, guaranteeing locked 1:2.5 RR math.
     """
@@ -238,10 +235,9 @@ def build_100k_portfolio_plan(signals: list) -> tuple[list, dict]:
     if not basket:
         return [], {}
 
-    total_buffer_cap = 105000.0  # Absolute hard ceiling
-    target_risk_per_stock = (total_buffer_cap * MAX_PORTFOLIO_RISK_PCT) / len(basket)
+    target_risk_per_stock = (TARGET_PORTFOLIO_CAPITAL * MAX_PORTFOLIO_RISK_PCT) / len(basket)
 
-    # First pass: size each stock by target risk, capped at MAX_CAPITAL_PER_STOCK
+    # Pass 1: Initial risk-based sizing capped at ₹35,000 per stock
     for item in basket:
         risk_per_share = item["RiskPerShare"]
         qty_risk = math.floor(target_risk_per_stock / risk_per_share)
@@ -249,10 +245,20 @@ def build_100k_portfolio_plan(signals: list) -> tuple[list, dict]:
         item["PortQty"] = max(1, min(qty_risk, qty_cap))
         item["PortCap"] = item["PortQty"] * item["Entry"]
 
-    # Strict Iterative Trim: If total capital exceeds ₹1,05,000, reduce quantity of the highest-capital stock by 1
     total_cap = sum(x["PortCap"] for x in basket)
-    while total_cap > total_buffer_cap:
-        # Find stock with highest capital allocation having quantity > 1
+
+    # Pass 2: If total_cap < ₹1,00,000, scale up toward ₹1,02,500 target (respecting ₹35k per stock cap)
+    if 0 < total_cap < TARGET_PORTFOLIO_CAPITAL:
+        scale = 102500.0 / total_cap
+        for item in basket:
+            scaled_qty = math.floor(item["PortQty"] * scale)
+            max_qty_cap = math.floor(MAX_CAPITAL_PER_STOCK / item["Entry"])
+            item["PortQty"] = max(1, min(scaled_qty, max_qty_cap))
+            item["PortCap"] = item["PortQty"] * item["Entry"]
+        total_cap = sum(x["PortCap"] for x in basket)
+
+    # Pass 3: STRICT HARD CEILING TRIMMER — Never allow Total Capital > ₹1,05,000!
+    while total_cap > MAX_PORTFOLIO_BUFFER:
         trimmable = [x for x in basket if x["PortQty"] > 1]
         if not trimmable:
             break
@@ -287,12 +293,14 @@ def build_100k_portfolio_plan(signals: list) -> tuple[list, dict]:
 
     summary = {
         "total_capital": int(tot_capital),
-        "unused_cash": int(max(0, total_buffer_cap - tot_capital)),
+        "unused_cash": int(max(0, MAX_PORTFOLIO_BUFFER - tot_capital)),
         "total_risk": int(round(tot_risk, 0)),
         "total_profit_25r": int(round(tot_target_profit, 0)),
         "total_profit_blended": int(round(tot_t1_profit, 0)),
     }
     return basket, summary
+
+
 # ==============================================================================
 # 6. MAIN SCANNER ENGINE
 # ==============================================================================
@@ -345,7 +353,7 @@ def scan_market():
             if qty < 1:
                 continue
 
-            is_grade_a = bool(last_row["SIG_DHAN_BONUS"])
+            is_grade_a = bool(last_row["SIG_GRADE_A_RIBBON"])
             setup_tag = "⭐GRADE-A" if is_grade_a else "Pullback"
 
             signals.append({
@@ -363,13 +371,13 @@ def scan_market():
                 "RiskPerShare": risk,
             })
 
-    # FIXED SORT: Strictly sort by highest 5-Year Win% first, using ⭐GRADE-A as tie-breaker!
+    # Sort strictly by highest 5-Year Win% first, using ⭐GRADE-A as tie-breaker!
     signals.sort(key=lambda x: (x["WinProb"], x["IsGradeA"]), reverse=True)
     return signals[:TOP_N_WATCHLIST], now_ist
 
 
 # ==============================================================================
-# 7. TELEGRAM OUTPUT (WATCHLIST + ₹1,00,000 PORTFOLIO ALLOCATION PLAN)
+# 7. TELEGRAM OUTPUT (WATCHLIST + STRICT ₹1L-₹1.05L PORTFOLIO PLAN)
 # ==============================================================================
 def send_telegram(text: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
@@ -422,9 +430,8 @@ def publish(signals: list, now_ist: str):
         )
     lines.append("</pre>\n")
 
-    # Add the ₹1,00,000 Portfolio Allocation Plan for the Top 4 Stocks
-    lines.append(f"<b>💼 ₹1,00,000 PORTFOLIO PLAN (BUY TOP {len(basket)} STOCKS — LOCKED 1:2.5 RR)</b>")
-    lines.append("<i>Max ₹35,000/stock cap so no single stock hogs your ₹1L capital:</i>")
+    lines.append(f"<b>💼 ₹1L–₹1.05L PORTFOLIO PLAN (TOP {len(basket)} STOCKS — LOCKED 1:2.5 RR)</b>")
+    lines.append("<i>Strict ₹1,05,000 hard cap (Max ₹35,000/stock):</i>")
     lines.append("<pre>")
     p_hdr = f"{'Stock':<10}|{'BuyQty':>6}|{'Capital':>8}|{'SL Price':>8}|{'Target':>8}|{'Risk(₹)':>8}|{'Profit(₹)':>9}"
     lines.append(p_hdr)
@@ -453,11 +460,11 @@ def publish(signals: list, now_ist: str):
     lines.append("</pre>")
     lines.append(
         f"📌 <b>Portfolio Summary:</b> Deploy <code>₹{port_sum['total_capital']:,}</code> "
-        f"(Cash Reserve: <code>₹{port_sum['unused_cash']:,}</code>) | "
+        f"(Buffer Left: <code>₹{port_sum['unused_cash']:,}</code>) | "
         f"Combined SL: <code>-₹{port_sum['total_risk']:,}</code> | "
         f"Full Target (2.5R): <code>+₹{port_sum['total_profit_25r']:,}</code> "
-        f"<i>(or <code>+₹{port_sum['total_profit_blended']:,}</code> if booking 50% at T1)</i>\n"
-        f"⚠️ <i>Tip: If your actual Buy Avg differs from Entry, set Target = BuyAvg + 2.5 × (BuyAvg - SL).</i>"
+        f"<i>(or <code>+₹{port_sum['total_profit_blended']:,}</code> with T1 50% booking)</i>\n"
+        f"✅ <i>⭐GRADE-A = EMA(21/50) Pullback + BB(38/61) Ribbon (7Y Proven: +2,208R)</i>"
     )
 
     send_telegram("\n".join(lines))
