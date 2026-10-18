@@ -31,7 +31,7 @@ DHAN_CLIENT_ID    = os.environ.get("DHAN_CLIENT_ID", "").strip().strip('"').stri
 DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN", "").strip().strip('"').strip("'")
 
 # ==============================================================================
-# ⚖️ 2. INSTITUTIONAL RISK MANAGEMENT & EXPECTANCY PARAMETERS
+# ⚖️ 2. STRICT INSTITUTIONAL EXPECTANCY PARAMETERS
 # ==============================================================================
 RISK_PER_TRADE        = 3000      # Max Rupee risk per option trade (₹3,000 strict cap)
 MAX_CAPITAL_PER_TRADE = 45000     # Max Option Premium outlay per trade (₹45,000 strict cap)
@@ -41,14 +41,14 @@ INTRA_OPT_RR          = 2.0       # Locked 1:2.0 Option Risk:Reward for Intraday
 INTRA_UND_RR          = 1.6       # Underlying ATR move required in backtest
 INTRA_ATR_SL_MULT     = 0.9       # 0.9x ATR stop loss
 INTRA_MAX_BARS        = 12        # 12 bars intraday window
-INTRA_MIN_SETUPS      = 8         # Minimum sample size (n >= 8) to reduce standard error
-INTRA_MIN_EXPECTANCY  = 0.05      # Minimum Net R-Expectancy (replaces coin-flip win%)
+INTRA_MIN_SETUPS      = 5         # Minimum sample size
+INTRA_MIN_EXPECTANCY  = 0.05      # Minimum Net R-Expectancy (Must be strictly positive!)
 
 SWING_OPT_RR          = 2.5       # Locked 1:2.5 Option Risk:Reward for Positional
 SWING_UND_RR          = 1.8       # Underlying ATR move required in backtest
 SWING_ATR_SL_MULT     = 1.0       # 1.0x Daily ATR stop loss
 SWING_MAX_DAYS        = 6         # 6 trading days max hold
-SWING_MIN_SETUPS      = 8         # Minimum sample size (n >= 8)
+SWING_MIN_SETUPS      = 5         # Minimum sample size
 SWING_MIN_EXPECTANCY  = 0.08      # Minimum Net R-Expectancy
 
 RISK_FREE_RATE        = 0.068
@@ -235,25 +235,38 @@ def fetch_nse_oi_spurts_map() -> dict:
     return oi_map
 
 def classify_institutional_oi(price_chg_pct: float, oi_chg_pct: float, opt_type: str):
+    """
+    Returns (is_blocked, is_boosted, tag_str, is_oi_aligned)
+    Mandatory Rule: For a trade to pass, OI flow MUST align with option direction.
+    """
     if abs(oi_chg_pct) < 0.5:
-        return False, False, "—"
+        return False, False, "—", False
+
     sign_str = f"{oi_chg_pct:+.0f}%"
     if price_chg_pct >= 0.0 and oi_chg_pct >= 3.0:
         if opt_type == "PE" and oi_chg_pct >= 8.0 and price_chg_pct >= 0.3:
-            return True, False, f"🔥{sign_str}LB"
-        return False, (opt_type == "CE"), f"🔥{sign_str}LB"
+            return True, False, f"🔥{sign_str}LB", False
+        is_aligned = (opt_type == "CE")
+        return False, is_aligned, f"🔥{sign_str}LB", is_aligned
+
     if price_chg_pct < 0.0 and oi_chg_pct >= 3.0:
         if opt_type == "CE" and oi_chg_pct >= 8.0 and price_chg_pct <= -0.3:
-            return True, False, f"🐻{sign_str}SB"
-        return False, (opt_type == "PE"), f"🐻{sign_str}SB"
+            return True, False, f"🐻{sign_str}SB", False
+        is_aligned = (opt_type == "PE")
+        return False, is_aligned, f"🐻{sign_str}SB", is_aligned
+
     if price_chg_pct >= 0.2 and oi_chg_pct <= -2.5:
-        return False, (opt_type == "CE"), f"⚡{sign_str}SC"
+        is_aligned = (opt_type == "CE")
+        return False, is_aligned, f"⚡{sign_str}SC", is_aligned
+
     if price_chg_pct <= -0.2 and oi_chg_pct <= -2.5:
-        return False, (opt_type == "PE"), f"💧{sign_str}LU"
-    return False, False, f"{sign_str}OI"
+        is_aligned = (opt_type == "PE")
+        return False, is_aligned, f"💧{sign_str}LU", is_aligned
+
+    return False, False, f"{sign_str}OI", False
 
 # ==============================================================================
-# 📈 6. TECHNICAL INDICATORS & GREEKS (USING COMPLETED CANDLES TO AVOID REPAINT)
+# 📈 6. TECHNICAL INDICATORS & GREEKS
 # ==============================================================================
 def extract_ticker_df(raw_data, ticker):
     if raw_data is None or raw_data.empty:
@@ -305,7 +318,7 @@ def get_dte(is_intraday=False):
     ist = pytz.timezone('Asia/Kolkata')
     today = datetime.now(ist).replace(tzinfo=None)
     if is_intraday:
-        return max((3 - today.weekday()) % 7, 1) # Professional weekly TUESDAY/THURSDAY boundary check
+        return max((3 - today.weekday()) % 7, 1)
     cal = calendar.monthcalendar(today.year, today.month)
     thursdays = [week[calendar.THURSDAY] for week in cal if week[calendar.THURSDAY] != 0]
     last_thursday = datetime(today.year, today.month, thursdays[-1])
@@ -338,7 +351,6 @@ def compute_intraday_15m_indicators(df, is_index=False):
         df.index = df.index.tz_convert('Asia/Kolkata').tz_localize(None)
     c = df['Close']
     if is_index:
-        # Index Fix (#8): Use EMA(9) vs EMA(21) crossover instead of zero-volume VWAP
         df['TREND_LINE'] = c.ewm(span=9, adjust=False).mean()
     else:
         tp = (df['High'] + df['Low'] + c) / 3.0
@@ -364,12 +376,9 @@ def compute_intraday_15m_indicators(df, is_index=False):
     return df
 
 # ==============================================================================
-# 🧪 7. TRUE EXPECTANCY BACKTESTER (REPLACES COIN-FLIP ARTIFACT)
+# 🧪 7. TRUE EXPECTANCY BACKTESTER
 # ==============================================================================
 def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, is_intraday=False):
-    """
-    Computes true Net R-Expectancy and sample size, accounting for transaction costs (-0.05R slippage).
-    """
     sig_col = 'CE_Signal' if direction == "CE" else 'PE_Signal'
     closes, highs, lows, atrs, sigs = df['Close'].values, df['High'].values, df['Low'].values, df['ATR'].values, df[sig_col].values
     dates = df.index.date if is_intraday else None
@@ -390,7 +399,7 @@ def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, i
         tgt   = entry + (risk * und_rr) if direction == "CE" else entry - (risk * und_rr)
         
         total_trades += 1
-        trade_r = -1.0  # Default to full loss unless T1 or Target reached
+        trade_r = -1.0
         t1_reached = False
         exit_bar = i + 1
         
@@ -402,13 +411,13 @@ def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, i
                 curr_sl = entry if t1_reached else sl
                 if lows[j] <= curr_sl:
                     if t1_reached:
-                        trade_r = 0.625  # 50% booked at +1.25R, remaining stopped at Entry
+                        trade_r = 0.625
                         wins += 1
                     else:
                         trade_r = -1.0
                     break
                 if highs[j] >= tgt:
-                    trade_r = 1.875  # 50% at +1.25R + 50% at +2.5R
+                    trade_r = 1.875
                     wins += 1
                     break
                 if highs[j] >= t1:
@@ -429,7 +438,6 @@ def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, i
                 if lows[j] <= t1:
                     t1_reached = True
         
-        # Subtract 0.05R transaction cost / slippage per trade
         net_r_sum += (trade_r - 0.05)
         i = max(i + 1, exit_bar)
 
@@ -438,7 +446,6 @@ def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, i
     return total_trades, expectancy, win_prob
 
 def build_option_trade_row(meta, df, opt_type, total_trades, expectancy, win_prob, india_vix, is_intraday, oi_tag, is_oi_boosted, dhan_engine: DhanOptionEngine):
-    # Fix Repainting (#5): Evaluate completed candle (df.iloc[-2]) during live hours
     latest = df.iloc[-2] if len(df) > 1 else df.iloc[-1]
     spot   = float(latest['Close'])
     atr    = float(latest['ATR'])
@@ -482,7 +489,6 @@ def build_option_trade_row(meta, df, opt_type, total_trades, expectancy, win_pro
     risk_per_lot = max(actual_risk * lot_size, 1.0)
     cost_per_lot = max(opt_entry * lot_size, 1.0)
 
-    # Patch A: Strict Risk-Cap Enforcement
     lots_by_risk = int(RISK_PER_TRADE // risk_per_lot)
     lots_by_cap  = int(MAX_CAPITAL_PER_TRADE // cost_per_lot)
     num_lots     = min(lots_by_risk, lots_by_cap)
@@ -509,7 +515,7 @@ def build_option_trade_row(meta, df, opt_type, total_trades, expectancy, win_pro
     }
 
 # ==============================================================================
-# 📱 8. PATCH B: HTML ESCAPING FORMATTER & TELEGRAM SENDER
+# 📱 8. HTML ESCAPING FORMATTER & TELEGRAM SENDER
 # ==============================================================================
 def format_combined_table(idx_records, stk_records, title, now_str, dhan_active: bool):
     feed_str = "Dhan Live API ⚡ + NSE OI" if dhan_active else "NSE OI Spurts + BS Model"
@@ -522,7 +528,7 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_active:
     ]
 
     if idx_records:
-        lines.append("<b>📌 MAJOR INDICES F&amp;O</b>")
+        lines.append("<b>📌 MAJOR INDICES F&amp;O (OI-ALIGNED)</b>")
         lines.append("<pre>")
         lines.append(col_hdr)
         lines.append(sep)
@@ -543,7 +549,7 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_active:
         lines.append("</pre>\n")
 
     if stk_records:
-        lines.append(f"<b>🚀 TOP {len(stk_records[:TOP_N_STOCKS])} STOCK OPTIONS (RANKED BY NET EXPECTANCY)</b>")
+        lines.append(f"<b>🚀 TOP {len(stk_records[:TOP_N_STOCKS])} STOCK OPTIONS (OI-ALIGNED)</b>")
         lines.append("<pre>")
         lines.append(col_hdr)
         lines.append(sep)
@@ -563,7 +569,7 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_active:
             lines.append(html.escape(row_str))
         lines.append("</pre>")
 
-    lines.append("💡 <i>ExpR = Net R-Expectancy net of -0.05R cost | 🔥LB = Long Build | ⚡SC = Short Cover</i>")
+    lines.append("💡 <i>ExpR = Net R-Expectancy | Mandate: Only OI-Aligned Trades Shown</i>")
     return "\n".join(lines)
 
 def send_telegram_alert(html_text):
@@ -618,22 +624,26 @@ def main():
         oi_chg_pct = oi_spurts_map.get(meta["nse"], 0.0)
 
         opt_type = "CE" if float(last['Close']) >= float(last['TREND_LINE']) else "PE"
-        is_blocked, is_boosted, oi_tag = classify_institutional_oi(price_chg_pct, oi_chg_pct, opt_type)
+        is_blocked, is_boosted, oi_tag, is_oi_aligned = classify_institutional_oi(price_chg_pct, oi_chg_pct, opt_type)
+        
+        # MANDATORY FILTER: Skip if institutional OI flow is conflicting or neutral!
+        if is_blocked or not is_oi_aligned:
+            continue
+
         tot, exp, wp = backtest_signals(df15, opt_type, INTRA_ATR_SL_MULT, INTRA_UND_RR, INTRA_MAX_BARS, True)
 
         if meta["is_idx"]:
-            if tot >= 5: intra_idx.append((exp, is_boosted, meta, df15, opt_type, tot, exp, wp, oi_tag))
+            if tot >= 5 and exp >= INTRA_MIN_EXPECTANCY:
+                intra_idx.append((exp, is_boosted, meta, df15, opt_type, tot, exp, wp, oi_tag))
         else:
-            if is_blocked: continue
-            if not (bool(last['CE_Signal' if opt_type=="CE" else 'PE_Signal']) or abs(oi_chg_pct) >= 3.0): continue
             if tot >= INTRA_MIN_SETUPS and exp >= INTRA_MIN_EXPECTANCY:
                 intra_stk.append((exp, is_boosted, meta, df15, opt_type, tot, exp, wp, oi_tag))
 
     intra_idx_rows = [r for r in (build_option_trade_row(m, d, o, t, exp, wp, india_vix, True, tag, b, dhan_engine) for exp, b, m, d, o, t, exp, wp, tag in intra_idx) if r]
-    intra_stk_rows = [r for r in (build_option_trade_row(m, d, o, t, exp, wp, india_vix, True, tag, b, dhan_engine) for exp, b, m, d, o, t, exp, wp, tag in sorted(intra_stk, key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)[:TOP_N_STOCKS]) if r]
+    intra_stk_rows = [r for r in (build_option_trade_row(m, d, o, t, exp, wp, india_vix, True, tag, b, dhan_engine) for exp, b, m, d, o, t, exp, wp, tag in sorted(intra_stk, key=lambda x: (x[0], 1 if x[1] else 0), reverse=True)[:TOP_N_STOCKS]) if r]
 
     if intra_idx_rows or intra_stk_rows:
-        msg = format_combined_table(intra_idx_rows, intra_stk_rows, "15M INTRADAY F&O SCALPS (LOCKED 1:2.0 RR)", now_str, dhan_engine.enabled)
+        msg = format_combined_table(intra_idx_rows, intra_stk_rows, "15M INTRADAY F&O SCALPS (OI-ALIGNED)", now_str, dhan_engine.enabled)
         send_telegram_alert(msg)
 
     # 2. Positional 3-5D Swings
@@ -651,22 +661,25 @@ def main():
         oi_chg_pct = oi_spurts_map.get(meta["nse"], 0.0)
 
         opt_type = "CE" if float(last['Close']) >= float(last['EMA21']) else "PE"
-        is_blocked, is_boosted, oi_tag = classify_institutional_oi(price_chg_pct, oi_chg_pct, opt_type)
+        is_blocked, is_boosted, oi_tag, is_oi_aligned = classify_institutional_oi(price_chg_pct, oi_chg_pct, opt_type)
+        
+        if is_blocked or not is_oi_aligned:
+            continue
+
         tot, exp, wp = backtest_signals(df1d, opt_type, SWING_ATR_SL_MULT, SWING_UND_RR, SWING_MAX_DAYS, False)
 
         if meta["is_idx"]:
-            if tot >= 5: swing_idx.append((exp, is_boosted, meta, df1d, opt_type, tot, exp, wp, oi_tag))
+            if tot >= 5 and exp >= SWING_MIN_EXPECTANCY:
+                swing_idx.append((exp, is_boosted, meta, df1d, opt_type, tot, exp, wp, oi_tag))
         else:
-            if is_blocked: continue
-            if not (bool(last['CE_Signal' if opt_type=="CE" else 'PE_Signal']) or abs(oi_chg_pct) >= 3.0): continue
             if tot >= SWING_MIN_SETUPS and exp >= SWING_MIN_EXPECTANCY:
                 swing_stk.append((exp, is_boosted, meta, df1d, opt_type, tot, exp, wp, oi_tag))
 
     swing_idx_rows = [r for r in (build_option_trade_row(m, d, o, t, exp, wp, india_vix, False, tag, b, dhan_engine) for exp, b, m, d, o, t, exp, wp, tag in swing_idx) if r]
-    swing_stk_rows = [r for r in (build_option_trade_row(m, d, o, t, exp, wp, india_vix, False, tag, b, dhan_engine) for exp, b, m, d, o, t, exp, wp, tag in sorted(swing_stk, key=lambda x: (1 if x[1] else 0, x[0], x[2]), reverse=True)[:TOP_N_STOCKS]) if r]
+    swing_stk_rows = [r for r in (build_option_trade_row(m, d, o, t, exp, wp, india_vix, False, tag, b, dhan_engine) for exp, b, m, d, o, t, exp, wp, tag in sorted(swing_stk, key=lambda x: (x[0], 1 if x[1] else 0), reverse=True)[:TOP_N_STOCKS]) if r]
 
     if swing_idx_rows or swing_stk_rows:
-        msg = format_combined_table(swing_idx_rows, swing_stk_rows, "3-5D POSITIONAL F&O (LOCKED 1:2.5 RR)", now_str, dhan_engine.enabled)
+        msg = format_combined_table(swing_idx_rows, swing_stk_rows, "3-5D POSITIONAL F&O (OI-ALIGNED)", now_str, dhan_engine.enabled)
         send_telegram_alert(msg)
 
 if __name__ == "__main__":
