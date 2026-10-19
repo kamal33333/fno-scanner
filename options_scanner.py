@@ -341,27 +341,24 @@ def classify_institutional_oi(price_chg_pct: float, oi_chg_pct: float, opt_type:
 # 📈 6. ZERO-REPAINTING DATA SLICER, INDICATORS & BLACK-SCHOLES GREEKS
 # ==============================================================================
 def get_closed_bar_slice(df: pd.DataFrame, is_intraday: bool) -> pd.DataFrame:
-    """
-    Eliminates Signal Repainting (#5):
-    During live Indian market hours (09:15 to 15:30 IST on weekdays), drops the last
-    in-progress candle (iloc[:-1]) so signals fire ONLY on 100% completed candles.
-    After market hours or on weekends, keeps df.iloc[-1] since the session is closed.
-    """
     if df.empty or len(df) < 30:
         return df
     ist = pytz.timezone("Asia/Kolkata")
     now_ist = datetime.now(ist)
-    in_market_hours = (
+    now_mins = now_ist.hour * 60 + now_ist.minute
+    # For 15m intraday: drop forming bar during 09:15-15:30.
+    # For 1D positional: only drop forming daily bar before 14:15 IST (after 2:15 PM, use today's candle!)
+    cutoff_mins = (15 * 60 + 30) if is_intraday else (14 * 60 + 15)
+    in_forming_window = (
         now_ist.weekday() < 5
-        and (9 * 60 + 15) <= (now_ist.hour * 60 + now_ist.minute) < (15 * 60 + 30)
+        and (9 * 60 + 15) <= now_mins < cutoff_mins
     )
-    if in_market_hours:
+    if in_forming_window:
         last_ts = df.index[-1]
         last_date = last_ts.date() if hasattr(last_ts, "date") else now_ist.date()
         if last_date == now_ist.date():
             return df.iloc[:-1].copy()
     return df.copy()
-
 
 def extract_ticker_df(raw_data, ticker):
     if raw_data is None or raw_data.empty:
@@ -639,8 +636,8 @@ def build_option_trade_row(
     atr_mult = INTRA_ATR_SL_MULT if is_intraday else SWING_ATR_SL_MULT
     und_risk = atr * atr_mult
     raw_opt_sl_dist = delta * und_risk - 0.5 * gamma * (und_risk ** 2)
-    max_pct_sl = 0.20 if is_intraday else 0.24
-    min_pct_sl = 0.12 if is_intraday else 0.15
+    max_pct_sl = 0.16 if meta["is_idx"] else (0.20 if is_intraday else 0.24)
+    min_pct_sl = 0.12 if (is_intraday or meta["is_idx"]) else 0.15
     opt_risk = min(opt_entry * max_pct_sl, max(opt_entry * min_pct_sl, raw_opt_sl_dist))
 
     opt_entry = round(opt_entry, 1)
@@ -658,8 +655,8 @@ def build_option_trade_row(
     risk_per_lot = max(actual_risk * lot_size, 1.0)
     cost_per_lot = max(opt_entry * lot_size, 1.0)
 
-    # Allow ₹4,500 max risk buffer for 1 lot of a 15+ DTE Major Index so Indices never disappear!
-    effective_max_risk = 4500 if (meta["is_idx"] and not is_intraday) else RISK_PER_TRADE
+    # Allow ₹5,500 max risk buffer for 1 lot of a 15+ DTE Major Index so Indices never disappear!
+    effective_max_risk = 5500 if (meta["is_idx"] and not is_intraday) else RISK_PER_TRADE
     lots_by_risk = int(effective_max_risk // risk_per_lot)
     lots_by_cap = int(MAX_CAPITAL_PER_TRADE // cost_per_lot)
     num_lots = min(lots_by_risk, lots_by_cap)
