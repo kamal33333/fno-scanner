@@ -303,34 +303,39 @@ def fetch_nse_oi_spurts_map() -> dict:
 
 def classify_institutional_oi(price_chg_pct: float, oi_chg_pct: float, opt_type: str):
     """
-    Classifies Institutional Open Interest Flow (ASCII-padded for perfect <pre> table alignment!):
-      - LB (Long Build-Up):   Price >= 0% & OI >= +2.5% (Boosts CE, Blocks PE if OI >= +6%)
-      - SC (Short Covering):  Price >= +0.2% & OI <= -2.0% (Boosts CE)
-      - SB (Short Build-Up):  Price <  0% & OI >= +2.5% (Boosts PE, Blocks CE if OI >= +6%)
-      - LU (Long Unwinding):  Price <= -0.2% & OI <= -2.0% (Boosts PE)
+    Strictly blocks any conflicting institutional flow:
+      - Never allows PE during Long Build-Up (LB) or Short Covering (SC)
+      - Never allows CE during Short Build-Up (SB) or Long Unwinding (LU)
     """
     if abs(oi_chg_pct) < 0.5:
         return False, False, "   --  "
 
     sign_str = f"{oi_chg_pct:+.0f}%"
     if price_chg_pct >= 0.0 and oi_chg_pct >= 2.5:
-        if opt_type == "PE" and oi_chg_pct >= 6.0 and price_chg_pct >= 0.3:
+        # Long Build-Up (Bullish only — strictly block PE!)
+        if opt_type == "PE":
             return True, False, f"LB{sign_str:>5}"
-        return False, (opt_type == "CE"), f"LB{sign_str:>5}"
+        return False, True, f"LB{sign_str:>5}"
 
     if price_chg_pct < 0.0 and oi_chg_pct >= 2.5:
-        if opt_type == "CE" and oi_chg_pct >= 6.0 and price_chg_pct <= -0.3:
+        # Short Build-Up (Bearish only — strictly block CE!)
+        if opt_type == "CE":
             return True, False, f"SB{sign_str:>5}"
-        return False, (opt_type == "PE"), f"SB{sign_str:>5}"
+        return False, True, f"SB{sign_str:>5}"
 
     if price_chg_pct >= 0.2 and oi_chg_pct <= -2.0:
-        return False, (opt_type == "CE"), f"SC{sign_str:>5}"
+        # Short Covering (Bullish only — block PE!)
+        if opt_type == "PE":
+            return True, False, f"SC{sign_str:>5}"
+        return False, True, f"SC{sign_str:>5}"
 
     if price_chg_pct <= -0.2 and oi_chg_pct <= -2.0:
-        return False, (opt_type == "PE"), f"LU{sign_str:>5}"
+        # Long Unwinding (Bearish only — block CE!)
+        if opt_type == "CE":
+            return True, False, f"LU{sign_str:>5}"
+        return False, True, f"LU{sign_str:>5}"
 
     return False, False, f"OI{sign_str:>5}"
-
 
 # ==============================================================================
 # 📈 6. ZERO-REPAINTING DATA SLICER, INDICATORS & BLACK-SCHOLES GREEKS
@@ -648,13 +653,14 @@ def build_option_trade_row(
     opt_t1 = round(opt_entry + (actual_risk * t1_rr), 1)
     opt_tgt = round(opt_entry + (actual_risk * target_rr), 1)
 
-    # Sync live lot size from Dhan Master if available
-    lot_size = dhan_engine.lot_map.get(meta["nse"], meta["lot"]) if dhan_engine else meta["lot"]
+    # Use verified 2026 NSE lot size from FNO_UNIVERSE
+    lot_size = meta["lot"]
     risk_per_lot = max(actual_risk * lot_size, 1.0)
     cost_per_lot = max(opt_entry * lot_size, 1.0)
 
-    # PATCH A: STRICT RISK-CAP & CAPITAL-CAP ENFORCEMENT (Never force 1 lot if it breaches ₹3,000 risk!)
-    lots_by_risk = int(RISK_PER_TRADE // risk_per_lot)
+    # Allow ₹4,500 max risk buffer for 1 lot of a 15+ DTE Major Index so Indices never disappear!
+    effective_max_risk = 4500 if (meta["is_idx"] and not is_intraday) else RISK_PER_TRADE
+    lots_by_risk = int(effective_max_risk // risk_per_lot)
     lots_by_cap = int(MAX_CAPITAL_PER_TRADE // cost_per_lot)
     num_lots = min(lots_by_risk, lots_by_cap)
 
@@ -678,8 +684,6 @@ def build_option_trade_row(
         "WinProb": round(win_pct, 1),
         "OIBoost": 1 if is_oi_boosted else 0,
     }
-
-
 # ==============================================================================
 # 📱 9. PATCH B: PERFECTLY ALIGNED ASCII/HTML TABLE FORMATTER
 # ==============================================================================
