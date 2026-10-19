@@ -1,0 +1,41 @@
+name: NSE F&O Options Buying Scanner (15m & Swing)
+
+on:
+  schedule:
+    # Runs every 15 minutes from 03:00 UTC to 10:59 UTC (Mon-Fri)
+    # Python script internally filters strictly for 09:15 AM - 03:35 PM IST
+    - cron: '*/15 3-10 * * 1-5'
+  workflow_dispatch: # Adds a manual "Run workflow" button on GitHub
+
+jobs:
+  scan-and-notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout Repository Code
+        uses: actions/checkout@v4
+
+      - name: Set Up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run F&O Options Scanner & Send Telegram Alert
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
+          DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
+        run: python options_scanner.py
+
+
+- uses: actions/cache@v4
+     with:
+       path: scanner_state.json
+       key: scanner-state-${{ github.run_id }}
+       restore-keys: scanner-state-
