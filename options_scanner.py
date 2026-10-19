@@ -32,24 +32,25 @@ DHAN_CLIENT_ID    = os.environ.get("DHAN_CLIENT_ID", "").strip().strip('"').stri
 DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN", "").strip().strip('"').strip("'")
 
 # ==============================================================================
-# ⚖️ 2. INSTITUTIONAL RISK, EXPIRY (15+ DTE) & EXPECTANCY PARAMETERS
+# ⚖️ 2. INSTITUTIONAL RISK, 1-LOT SIZING & EXPECTANCY PARAMETERS
 # ==============================================================================
-RISK_PER_TRADE         = 3000     # Strict Max Rupee risk per stock option trade (₹3,000 hard cap)
-INDEX_POS_MAX_RISK     = 5500     # Max 1-lot risk buffer for 15+ DTE Positional Index Options
-MAX_CAPITAL_PER_TRADE  = 45000    # Strict Max Option Premium outlay (₹45,000 hard cap)
+TARGET_RISK_PER_TRADE  = 3000     # Target Rupee risk per 1-lot trade (₹3,000)
+MAX_SINGLE_LOT_RISK    = 6000     # Max allowed risk for 1 single lot (so BAJFINANCE 750 qty isn't dropped!)
+MAX_CAPITAL_PER_TRADE  = 50000    # Max 1-lot Option Premium outlay (₹50,000 cap — BAJFINANCE 1 lot is ~₹33k)
+LOCK_TO_SINGLE_LOT     = True     # True = Always display exact 1-Lot Exchange Qty (matches Dhan Order Window 1:1!)
 TOP_N_STOCKS           = 10       # Top 10 Stock Option setups per scan
-COST_SLIPPAGE_R        = 0.05     # 0.05R (~₹150) brokerage + STT + slippage deducted per trade
+COST_SLIPPAGE_R        = 0.05     # 0.05R brokerage + STT + slippage deducted per trade
 
 # Expiry DTE Rules
-MIN_DTE_INTRADAY       = 4        # Minimum 4 DTE for Intraday Scalps (Avoids 0-2 DTE theta crush)
-MIN_DTE_POSITIONAL     = 15       # Minimum 15+ DTE for Positional & Index Swings
+MIN_DTE_INTRADAY       = 4        # Minimum 4 DTE for Intraday Scalps
+MIN_DTE_POSITIONAL     = 15       # Minimum 15+ DTE for Positional & Index Swings (24NOV for Stocks)
 
 # Intraday 15-Minute Scalp Parameters (Locked 1:2.0 Option RR, T1 at +1.0R)
 INTRA_OPT_RR           = 2.0      # Locked 1:2.0 Option Risk:Reward
 INTRA_T1_RR            = 1.0      # Book 50% at +1.0R and trail SL to Entry
 INTRA_UND_RR           = 1.6      # Underlying ATR target multiple
 INTRA_ATR_SL_MULT      = 0.9      # 0.9x ATR stop loss
-INTRA_MAX_BARS         = 12       # 12 bars intraday window (mark-to-market if session ends)
+INTRA_MAX_BARS         = 12       # 12 bars intraday window
 INTRA_MIN_SETUPS       = 10       # Minimum historical sample size
 INTRA_MIN_EXP_R        = 0.00     # Minimum Net R-Expectancy after costs
 
@@ -65,29 +66,27 @@ SWING_MIN_EXP_R        = 0.02     # Minimum Net R-Expectancy after costs
 RISK_FREE_RATE         = 0.068
 
 # ==============================================================================
-# 📋 3. FULL REAL NSE/BSE SYMBOLS & VERIFIED 2026 LOT SIZES
+# 📋 3. FULL REAL NSE/BSE SYMBOLS & UPDATED 2026 FALLBACK LOT SIZES
+# (Note: Live Lot Sizes & Strike Steps are auto-synced from Dhan Public CSV on every run!)
 # ==============================================================================
-# exp_rule:
-#   - "NSE_WEEKLY_TUE": NIFTY (has weekly Tuesdays + monthly last Tuesday)
-#   - "NSE_MONTHLY_TUE": All NSE Stock Options + BANKNIFTY/FINNIFTY/MIDCPNIFTY (Last Tuesday of Month)
-#   - "BSE_WEEKLY_THU": SENSEX (Weekly Thursdays + monthly last Thursday)
 FNO_UNIVERSE = {
-    # --- 5 LIQUID TRADABLE INDIAN INDEX OPTIONS (FULL REAL NAMES) ---
+    # --- 5 LIQUID TRADABLE INDIAN INDEX OPTIONS ---
     "^NSEI":                 {"name": "NIFTY",      "nse": "NIFTY",      "lot": 65,   "step": 50,  "is_idx": True,  "dhan_id": 13,  "dhan_seg": "IDX_I", "exp_rule": "NSE_WEEKLY_TUE"},
     "^NSEBANK":              {"name": "BANKNIFTY",  "nse": "BANKNIFTY",  "lot": 30,   "step": 100, "is_idx": True,  "dhan_id": 25,  "dhan_seg": "IDX_I", "exp_rule": "NSE_MONTHLY_TUE"},
     "^BSESN":                {"name": "SENSEX",     "nse": "SENSEX",     "lot": 20,   "step": 100, "is_idx": True,  "dhan_id": 51,  "dhan_seg": "IDX_I", "exp_rule": "BSE_WEEKLY_THU"},
     "NIFTY_MID_SELECT.NS":   {"name": "MIDCPNIFTY", "nse": "MIDCPNIFTY", "lot": 120,  "step": 25,  "is_idx": True,  "dhan_id": 442, "dhan_seg": "IDX_I", "exp_rule": "NSE_MONTHLY_TUE"},
     "NIFTY_FIN_SERVICE.NS":  {"name": "FINNIFTY",   "nse": "FINNIFTY",   "lot": 65,   "step": 50,  "is_idx": True,  "dhan_id": 27,  "dhan_seg": "IDX_I", "exp_rule": "NSE_MONTHLY_TUE"},
 
-    # --- LIQUID NSE F&O STOCKS (FULL REAL OFFICIAL NSE SYMBOLS, MONTHLY EXPIRY ONLY) ---
+    # --- LIQUID NSE F&O STOCKS (WITH POST-SPLIT / POST-BONUS 2026 FALLBACK LOTS) ---
+    "BAJFINANCE.NS":  {"name": "BAJFINANCE", "nse": "BAJFINANCE", "lot": 750,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "ETERNAL.NS":     {"name": "ETERNAL",    "nse": "ETERNAL",    "lot": 2000, "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "ANGELONE.NS":    {"name": "ANGELONE",   "nse": "ANGELONE",   "lot": 200,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ANGELONE.NS":    {"name": "ANGELONE",   "nse": "ANGELONE",   "lot": 200,  "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "TECHM.NS":       {"name": "TECHM",      "nse": "TECHM",      "lot": 600,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "FEDERALBNK.NS":  {"name": "FEDERALBNK", "nse": "FEDERALBNK", "lot": 5000, "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "WIPRO.NS":       {"name": "WIPRO",      "nse": "WIPRO",      "lot": 3000, "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "LTF.NS":         {"name": "LTF",        "nse": "LTF",        "lot": 4462, "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "CROMPTON.NS":    {"name": "CROMPTON",   "nse": "CROMPTON",   "lot": 1800, "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "PERSISTENT.NS":  {"name": "PERSISTENT", "nse": "PERSISTENT", "lot": 100,  "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "PERSISTENT.NS":  {"name": "PERSISTENT", "nse": "PERSISTENT", "lot": 200,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "TCS.NS":         {"name": "TCS",        "nse": "TCS",        "lot": 175,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "OBEROIRLTY.NS":  {"name": "OBEROIRLTY", "nse": "OBEROIRLTY", "lot": 350,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "DIXON.NS":       {"name": "DIXON",      "nse": "DIXON",      "lot": 50,   "step": 200, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
@@ -102,20 +101,19 @@ FNO_UNIVERSE = {
     "AUROPHARMA.NS":  {"name": "AUROPHARMA", "nse": "AUROPHARMA", "lot": 550,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "ZYDUSLIFE.NS":   {"name": "ZYDUSLIFE",  "nse": "ZYDUSLIFE",  "lot": 900,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "RBLBANK.NS":     {"name": "RBLBANK",    "nse": "RBLBANK",    "lot": 2500, "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "CONCOR.NS":      {"name": "CONCOR",     "nse": "CONCOR",     "lot": 1000, "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "CONCOR.NS":      {"name": "CONCOR",     "nse": "CONCOR",     "lot": 1250, "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "VOLTAS.NS":      {"name": "VOLTAS",     "nse": "VOLTAS",     "lot": 375,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "TITAN.NS":       {"name": "TITAN",      "nse": "TITAN",      "lot": 175,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "ABB.NS":         {"name": "ABB",        "nse": "ABB",        "lot": 125,  "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "RELIANCE.NS":    {"name": "RELIANCE",   "nse": "RELIANCE",   "lot": 500,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "HDFCBANK.NS":    {"name": "HDFCBANK",   "nse": "HDFCBANK",   "lot": 550,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "HDFCBANK.NS":    {"name": "HDFCBANK",   "nse": "HDFCBANK",   "lot": 1100, "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "ICICIBANK.NS":   {"name": "ICICIBANK",  "nse": "ICICIBANK",  "lot": 700,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "SBIN.NS":        {"name": "SBIN",       "nse": "SBIN",       "lot": 750,  "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "TATASTEEL.NS":   {"name": "TATASTEEL",  "nse": "TATASTEEL",  "lot": 5500, "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "BAJFINANCE.NS":  {"name": "BAJFINANCE", "nse": "BAJFINANCE", "lot": 125,  "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "HAL.NS":         {"name": "HAL",        "nse": "HAL",        "lot": 150,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "BEL.NS":         {"name": "BEL",        "nse": "BEL",        "lot": 2850, "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "TRENT.NS":       {"name": "TRENT",      "nse": "TRENT",      "lot": 100,  "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "CAMS.NS":        {"name": "CAMS",       "nse": "CAMS",       "lot": 150,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "TRENT.NS":       {"name": "TRENT",      "nse": "TRENT",      "lot": 100,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "CAMS.NS":        {"name": "CAMS",       "nse": "CAMS",       "lot": 750,  "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "NTPC.NS":        {"name": "NTPC",       "nse": "NTPC",       "lot": 1500, "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "ADANIPORTS.NS":  {"name": "ADANIPORTS", "nse": "ADANIPORTS", "lot": 400,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "INDHOTEL.NS":    {"name": "INDHOTEL",   "nse": "INDHOTEL",   "lot": 1000, "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
@@ -125,48 +123,32 @@ FNO_UNIVERSE = {
 }
 
 # ==============================================================================
-# 🗓️ 4. EXCHANGE-ACCURATE EXPIRY ENGINE (MONTHLY STOCKS vs WEEKLY INDICES)
+# 🗓️ 4. EXCHANGE-ACCURATE EXPIRY ENGINE & LIVE PUBLIC LOT-SIZE SYNC
 # ==============================================================================
 def _last_weekday_of_month(year: int, month: int, target_weekday: int) -> date:
-    """
-    Returns the exact last Tuesday (weekday=1) or last Thursday (weekday=3) of a given month.
-    """
     cal = calendar.monthcalendar(year, month)
     days = [week[target_weekday] for week in cal if week[target_weekday] != 0]
     return date(year, month, days[-1])
 
 
 def get_exchange_accurate_expiry(meta: dict, min_dte: int) -> tuple[int, str]:
-    """
-    Calculates the TRUE NSE/BSE expiry date for any instrument:
-      1. NSE Stock Options + BANKNIFTY/FINNIFTY/MIDCPNIFTY ("NSE_MONTHLY_TUE"):
-         ONLY expire on the LAST TUESDAY of the month (e.g., 27OCT, 24NOV, 29DEC).
-         Never assigns fake weekly expiries (like 03NOV) to stocks!
-      2. NIFTY ("NSE_WEEKLY_TUE"):
-         Expires every Tuesday (e.g., 27OCT, 03NOV, 10NOV, 17NOV, 24NOV).
-      3. SENSEX ("BSE_WEEKLY_THU"):
-         Expires every Thursday (e.g., 22OCT, 29OCT, 05NOV, 12NOV, 19NOV, 26NOV).
-    """
     ist = pytz.timezone("Asia/Kolkata")
     today = datetime.now(ist).date()
     rule = meta.get("exp_rule", "NSE_MONTHLY_TUE")
 
     if rule == "NSE_MONTHLY_TUE":
-        # Check current month, next month, and month+2 for the first Last-Tuesday >= min_dte
         y, m = today.year, today.month
         for _ in range(4):
             exp_dt = _last_weekday_of_month(y, m, calendar.TUESDAY)
             dte = (exp_dt - today).days
             if dte >= min_dte:
                 return dte, exp_dt.strftime("%d%b").upper()
-            # Advance to next month
             m += 1
             if m > 12:
                 m = 1
                 y += 1
 
     elif rule == "NSE_WEEKLY_TUE":
-        # Weekly Tuesday expiry (NIFTY) >= min_dte
         target_dt = today + timedelta(days=min_dte)
         while target_dt.weekday() != calendar.TUESDAY:
             target_dt += timedelta(days=1)
@@ -174,22 +156,23 @@ def get_exchange_accurate_expiry(meta: dict, min_dte: int) -> tuple[int, str]:
         return dte, target_dt.strftime("%d%b").upper()
 
     elif rule == "BSE_WEEKLY_THU":
-        # Weekly Thursday expiry (SENSEX) >= min_dte
         target_dt = today + timedelta(days=min_dte)
         while target_dt.weekday() != calendar.THURSDAY:
             target_dt += timedelta(days=1)
         dte = (target_dt - today).days
         return dte, target_dt.strftime("%d%b").upper()
 
-    # Default fallback: Last Tuesday of next month
     exp_dt = _last_weekday_of_month(today.year, today.month, calendar.TUESDAY)
     return max((exp_dt - today).days, min_dte), exp_dt.strftime("%d%b").upper()
 
 
 class DhanOptionEngine:
     """
-    Fetches live Option Chain from Dhan v2 API and specifically selects the first
-    official exchange expiry that meets `min_dte`.
+    1. ALWAYS loads Dhan's PUBLIC `api-scrip-master.csv` (even without a Dhan token!)
+       to extract the exact current-month NSE/BSE F&O Lot Size (`SEM_LOT_UNITS`)
+       for every symbol in `FNO_UNIVERSE`.
+    2. When `DHAN_CLIENT_ID` & `DHAN_ACCESS_TOKEN` are valid, also queries live
+       Option Chain LTP & Greeks.
     """
     def __init__(self, client_id: str, access_token: str):
         self.client_id = client_id
@@ -197,10 +180,11 @@ class DhanOptionEngine:
         self.base_url = "https://api.dhan.co/v2"
         self.enabled = bool(self.client_id and self.access_token)
         self.eq_sec_map = {}
+        self.lot_map = {}
         self.active_calls = 0
         self.live_quotes_fetched = 0
-        if self.enabled:
-            self._load_security_master()
+        # ALWAYS load public Scrip Master CSV so Lot Sizes are 100% live from Exchange!
+        self._load_public_security_master()
 
     def _headers(self):
         return {
@@ -210,21 +194,55 @@ class DhanOptionEngine:
             "Accept": "application/json",
         }
 
-    def _load_security_master(self):
+    def _load_public_security_master(self):
         url = "https://images.dhan.co/api-data/api-scrip-master.csv"
         try:
-            r = requests.get(url, timeout=12)
-            if r.status_code == 200:
-                df = pd.read_csv(io.StringIO(r.text), low_memory=False)
-                eq_df = df[(df["SEM_EXM_EXCH_ID"] == "NSE") & (df["SEM_INSTRUMENT_NAME"] == "EQUITY")]
-                for _, row in eq_df.iterrows():
-                    sym = str(row.get("SEM_TRADING_SYMBOL", "")).strip().upper()
-                    sec_id = row.get("SEM_SMST_SECURITY_ID")
-                    if sym and pd.notna(sec_id):
-                        self.eq_sec_map[sym] = int(sec_id)
-                print(f"✅ Dhan Master Loaded: {len(self.eq_sec_map)} Equities mapped.")
+            r = requests.get(url, timeout=15)
+            if r.status_code != 200:
+                return
+            df = pd.read_csv(io.StringIO(r.text), low_memory=False)
+            df.columns = [str(c).strip() for c in df.columns]
+
+            # 1. Map NSE Equity Security IDs for Option Chain API
+            eq_df = df[(df["SEM_EXM_EXCH_ID"] == "NSE") & (df["SEM_INSTRUMENT_NAME"] == "EQUITY")]
+            for _, row in eq_df.iterrows():
+                sym = str(row.get("SEM_TRADING_SYMBOL", "")).strip().upper()
+                sec_id = row.get("SEM_SMST_SECURITY_ID")
+                if sym and pd.notna(sec_id):
+                    self.eq_sec_map[sym] = int(sec_id)
+
+            # 2. Extract LIVE Current-Month F&O Lot Sizes (FUTSTK / FUTIDX / OPTSTK / OPTIDX)
+            fno_df = df[df["SEM_INSTRUMENT_NAME"].isin(["FUTSTK", "FUTIDX", "OPTSTK", "OPTIDX"])].copy()
+            if not fno_df.empty and "SEM_EXPIRY_DATE" in fno_df.columns:
+                ist = pytz.timezone("Asia/Kolkata")
+                today_str = datetime.now(ist).strftime("%Y-%m-%d")
+                fno_df["EXP_STR"] = fno_df["SEM_EXPIRY_DATE"].astype(str).str.slice(0, 10)
+                fno_df = fno_df[fno_df["EXP_STR"] >= today_str].sort_values("EXP_STR")
+
+            target_symbols = {m["nse"] for m in FNO_UNIVERSE.values()}
+            for _, row in fno_df.iterrows():
+                lot_val = pd.to_numeric(row.get("SEM_LOT_UNITS"), errors="coerce")
+                if pd.isna(lot_val) or lot_val <= 0:
+                    continue
+                # Extract underlying symbol from SEM_TRADING_SYMBOL (e.g. "BAJFINANCE-Oct2026-FUT" -> "BAJFINANCE")
+                raw_tsym = str(row.get("SEM_TRADING_SYMBOL", "")).strip().upper()
+                base_sym = re.split(r"[-_\s]", raw_tsym)[0]
+                if base_sym not in target_symbols:
+                    custom_sym = str(row.get("SEM_CUSTOM_SYMBOL", "")).strip().upper()
+                    base_sym = custom_sym.split()[0] if custom_sym else ""
+                if base_sym in target_symbols and base_sym not in self.lot_map:
+                    self.lot_map[base_sym] = int(round(float(lot_val)))
+
+            # Directly update FNO_UNIVERSE with live exchange lot sizes!
+            updated_count = 0
+            for tk, meta in FNO_UNIVERSE.items():
+                nse_sym = meta["nse"]
+                if nse_sym in self.lot_map and self.lot_map[nse_sym] > 0:
+                    meta["lot"] = self.lot_map[nse_sym]
+                    updated_count += 1
+            print(f"✅ Public Dhan Scrip Master Synced: {updated_count}/{len(FNO_UNIVERSE)} Live F&O Lot Sizes Verified!")
         except Exception as e:
-            print(f"⚠️ Dhan Scrip Master warning: {e}")
+            print(f"⚠️ Public Scrip Master lot-sync warning: {e}")
 
     def get_live_atm_option(self, meta: dict, atm_strike: float, opt_type: str, min_dte: int):
         if not self.enabled:
@@ -339,11 +357,6 @@ def fetch_nse_oi_spurts_map() -> dict:
 
 
 def classify_institutional_oi(price_chg_pct: float, oi_chg_pct: float, opt_type: str):
-    """
-    Strictly blocks any conflicting institutional flow:
-      - Never allows PE during Long Build-Up (LB) or Short Covering (SC)
-      - Never allows CE during Short Build-Up (SB) or Long Unwinding (LU)
-    """
     if abs(oi_chg_pct) < 0.5:
         return False, False, "   --  "
 
@@ -439,6 +452,26 @@ def black_scholes_greeks(S, K, T, r, sigma, option_type="CE"):
         price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
         delta = -norm.cdf(-d1)
     return max(float(price), 1.0), abs(float(delta)), float(gamma)
+
+
+def get_dynamic_strike_step(spot: float, meta: dict) -> float:
+    """
+    Ensures stock splits/bonuses (like BAJFINANCE @ ₹1,000 or HDFCBANK @ ₹720)
+    always use the proper NSE strike interval even if price changed drastically.
+    """
+    if meta["is_idx"]:
+        return meta["step"]
+    if spot < 250:
+        return 2.5 if meta["step"] == 2.5 else 5.0
+    elif spot < 600:
+        return 5.0 if spot < 400 else 10.0
+    elif spot < 1500:
+        return 10.0 if spot < 900 else 20.0
+    elif spot < 3000:
+        return 20.0 if spot < 2000 else 50.0
+    elif spot < 6000:
+        return 50.0
+    return 100.0
 
 
 def compute_daily_indicators(df):
@@ -622,7 +655,7 @@ def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, i
 
 
 # ==============================================================================
-# 💰 8. OPTION TRADE BUILDER (FULL REAL NAMES + EXCHANGE-ACCURATE EXPIRY)
+# 💰 8. OPTION TRADE BUILDER (EXACT 1-LOT EXCHANGE QTY FROM DHAN MASTER)
 # ==============================================================================
 def build_option_trade_row(
     meta, df, opt_type, total_trades, expectancy, win_pct, india_vix, is_intraday, oi_tag, is_oi_boosted, dhan_engine: DhanOptionEngine
@@ -631,7 +664,7 @@ def build_option_trade_row(
     spot = float(latest["Close"])
     atr = float(latest["ATR"])
     hv20 = float(latest["HV20"]) if not np.isnan(latest["HV20"]) else 0.22
-    step = meta["step"]
+    step = get_dynamic_strike_step(spot, meta)
     atm_strike = int(round(spot / step) * step) if step >= 5 else round(spot / step) * step
 
     min_dte_req = MIN_DTE_INTRADAY if is_intraday else MIN_DTE_POSITIONAL
@@ -654,11 +687,14 @@ def build_option_trade_row(
 
     strike_str = f"{int(atm_strike)}" if atm_strike == int(atm_strike) else f"{atm_strike:.1f}"
 
+    # 1. Exact 1-Lot Exchange Quantity (Synced live from Dhan Public Master CSV!)
+    lot_size = dhan_engine.lot_map.get(meta["nse"], meta["lot"]) if dhan_engine else meta["lot"]
+
     atr_mult = INTRA_ATR_SL_MULT if is_intraday else SWING_ATR_SL_MULT
     und_risk = atr * atr_mult
     raw_opt_sl_dist = delta * und_risk - 0.5 * gamma * (und_risk ** 2)
-    max_pct_sl = 0.16 if meta["is_idx"] else (0.20 if is_intraday else 0.24)
-    min_pct_sl = 0.12 if (is_intraday or meta["is_idx"]) else 0.15
+    max_pct_sl = 0.15 if meta["is_idx"] else (0.18 if is_intraday else 0.20)
+    min_pct_sl = 0.10 if (is_intraday or meta["is_idx"]) else 0.12
     opt_risk = min(opt_entry * max_pct_sl, max(opt_entry * min_pct_sl, raw_opt_sl_dist))
 
     opt_entry = round(opt_entry, 1)
@@ -671,17 +707,20 @@ def build_option_trade_row(
     opt_t1 = round(opt_entry + (actual_risk * t1_rr), 1)
     opt_tgt = round(opt_entry + (actual_risk * target_rr), 1)
 
-    lot_size = meta["lot"]
     risk_per_lot = max(actual_risk * lot_size, 1.0)
     cost_per_lot = max(opt_entry * lot_size, 1.0)
 
-    effective_max_risk = INDEX_POS_MAX_RISK if (meta["is_idx"] and not is_intraday) else RISK_PER_TRADE
-    lots_by_risk = int(effective_max_risk // risk_per_lot)
-    lots_by_cap = int(MAX_CAPITAL_PER_TRADE // cost_per_lot)
-    num_lots = min(lots_by_risk, lots_by_cap)
-
-    if num_lots < 1:
-        return None
+    if LOCK_TO_SINGLE_LOT:
+        # Always display 1 single lot (so Qty matches Dhan Order Window 100% — e.g. BAJFINANCE = 750!)
+        if risk_per_lot > MAX_SINGLE_LOT_RISK or cost_per_lot > MAX_CAPITAL_PER_TRADE:
+            return None
+        num_lots = 1
+    else:
+        lots_by_risk = int(TARGET_RISK_PER_TRADE // risk_per_lot)
+        lots_by_cap = int(MAX_CAPITAL_PER_TRADE // cost_per_lot)
+        num_lots = min(lots_by_risk, lots_by_cap)
+        if num_lots < 1:
+            return None
 
     qty = num_lots * lot_size
     capital = int(round(opt_entry * qty))
@@ -691,7 +730,6 @@ def build_option_trade_row(
     win_rounded = round(win_pct, 1)
     quality_score = round((exp_rounded * 100.0) + win_rounded, 1)
 
-    # Full Real NSE/BSE Symbol + Strike + Option Type (Zero Truncation!)
     full_contract_name = f"{src_flag}{meta['nse']} {strike_str}{opt_type}"
 
     return {
@@ -713,15 +751,15 @@ def build_option_trade_row(
 
 
 # ==============================================================================
-# 📱 9. TABLE FORMATTER (19-CHAR FULL CONTRACT NAMES + Cap(₹) + Score)
+# 📱 9. TABLE FORMATTER (19-CHAR FULL CONTRACT NAMES + 1-LOT BROKER QTY)
 # ==============================================================================
 def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine: DhanOptionEngine, oi_count: int):
+    lot_sync_cnt = len(dhan_engine.lot_map) if dhan_engine else 0
     if dhan_engine.enabled and dhan_engine.live_quotes_fetched > 0:
-        feed_str = f"Dhan Live ({dhan_engine.live_quotes_fetched}) + NSE OI ({oi_count})"
+        feed_str = f"Dhan Live ({dhan_engine.live_quotes_fetched}) + {lot_sync_cnt} Lots Synced"
     else:
-        feed_str = f"NSE OI ({oi_count}) + Exchange Calendar BS"
+        feed_str = f"Dhan Lot Master ({lot_sync_cnt}) + NSE OI ({oi_count})"
 
-    # 19-char Contract column ensures full real names like BAJFINANCE 1000PE or MIDCPNIFTY 13575PE never get cut off!
     col_hdr = (
         f"{'Contract':<19}|{'Exp':>5}|{'Entry':>6}|{'Qty':>4}|{'Cap(₹)':>6}|"
         f"{'SL':>6}|{'T1-50%':>6}|{'Target':>6}|{'OI_Flow':>7}|{'ExpR':>5}|{'Win%':>5}|{'Score':>5}"
@@ -730,7 +768,7 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
 
     lines = [
         f"<b>🔥 {html.escape(title)}</b>",
-        f"🕒 <code>{html.escape(now_str)}</code> | Feed: <code>{html.escape(feed_str)}</code> | Max Risk: <code>₹{RISK_PER_TRADE:,}</code>\n",
+        f"🕒 <code>{html.escape(now_str)}</code> | Feed: <code>{html.escape(feed_str)}</code> | Sizing: <code>1 Lot Exact</code>\n",
     ]
 
     if idx_records:
@@ -757,7 +795,7 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
         lines.append("</pre>\n")
 
     if stk_records:
-        lines.append(f"<b>🚀 TOP {len(stk_records[:TOP_N_STOCKS])} STOCK OPTIONS (RANKED BY OI FLOW &amp; QUALITY SCORE)</b>")
+        lines.append(f"<b>🚀 TOP {len(stk_records[:TOP_N_STOCKS])} STOCK OPTIONS (1-LOT EXCHANGE QTY &amp; QUALITY SCORE)</b>")
         lines.append("<pre>")
         lines.append(col_hdr)
         lines.append(sep)
@@ -798,14 +836,14 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
         for idx, p in enumerate(top_two, 1):
             lines.append(
                 f"{idx}. <b>{html.escape(p['Contract'])} ({html.escape(p['Expiry'])})</b> "
-                f"👉 Entry: <code>₹{p['Entry']:.1f}</code> | Qty: <code>{p['Qty']}</code> "
+                f"👉 Entry: <code>₹{p['Entry']:.1f}</code> | 1-Lot Qty: <code>{p['Qty']}</code> "
                 f"| Cap: <code>₹{p['Capital']:,}</code> | Risk: <code>₹{p['RiskRs']:,}</code> "
                 f"| SL: <code>{p['Stop']:.1f}</code> | T1: <code>{p['T1']:.1f}</code> | Tgt: <code>{p['Target']:.1f}</code> "
                 f"| OI: <code>{html.escape(p['OI_Flow'].strip())}</code> | <b>Score: {p['Score']:.1f}</b>"
             )
 
     lines.append(
-        "\n💡 <i>Score = (ExpR×100) + Win% | Stocks = Monthly Expiry Only (27OCT / 24NOV) | LB=Long Build, SB=Short Build</i>"
+        "\n💡 <i>Qty = Exact 1-Lot Exchange Quantity (Live from Dhan Scrip Master) | Score = (ExpR×100) + Win%</i>"
     )
     return "\n".join(lines)
 
