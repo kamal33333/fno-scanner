@@ -34,7 +34,8 @@ DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN", "").strip().strip('"').s
 # ==============================================================================
 # ⚖️ 2. INSTITUTIONAL RISK, EXPIRY (15+ DTE) & EXPECTANCY PARAMETERS
 # ==============================================================================
-RISK_PER_TRADE         = 3000     # Strict Max Rupee risk per trade (₹3,000 hard cap)
+RISK_PER_TRADE         = 3000     # Strict Max Rupee risk per stock option trade (₹3,000 hard cap)
+INDEX_POS_MAX_RISK     = 5500     # Max 1-lot risk buffer for 15+ DTE Positional Index Options
 MAX_CAPITAL_PER_TRADE  = 45000    # Strict Max Option Premium outlay (₹45,000 hard cap)
 TOP_N_STOCKS           = 10       # Top 10 Stock Option setups per scan
 COST_SLIPPAGE_R        = 0.05     # 0.05R (~₹150) brokerage + STT + slippage deducted per trade
@@ -130,7 +131,6 @@ def get_target_expiry_and_dte(min_dte: int = 15) -> tuple[int, str]:
     ist = pytz.timezone("Asia/Kolkata")
     today = datetime.now(ist).date()
     target_date = today + timedelta(days=min_dte)
-    # Advance to next Tuesday (weekday 1) or Thursday (weekday 3)
     while target_date.weekday() not in (1, 3):
         target_date += timedelta(days=1)
     dte = max((target_date - today).days, min_dte)
@@ -142,7 +142,6 @@ class DhanOptionEngine:
     """
     Fetches live Option Chain from Dhan v2 API and specifically selects the first
     expiry that meets `min_dte` (e.g., >= 15 days out for Positional & Far Index options).
-    Also syncs live lot sizes from Dhan's Scrip Master CSV.
     """
     def __init__(self, client_id: str, access_token: str):
         self.client_id = client_id
@@ -150,7 +149,6 @@ class DhanOptionEngine:
         self.base_url = "https://api.dhan.co/v2"
         self.enabled = bool(self.client_id and self.access_token)
         self.eq_sec_map = {}
-        self.lot_map = {}
         self.active_calls = 0
         self.live_quotes_fetched = 0
         if self.enabled:
@@ -176,15 +174,7 @@ class DhanOptionEngine:
                     sec_id = row.get("SEM_SMST_SECURITY_ID")
                     if sym and pd.notna(sec_id):
                         self.eq_sec_map[sym] = int(sec_id)
-
-                # Extract live F&O lot sizes (SEM_LOT_UNITS)
-                fno_df = df[df["SEM_INSTRUMENT_NAME"].isin(["FUTSTK", "FUTIDX"])]
-                for _, row in fno_df.iterrows():
-                    sym = str(row.get("SEM_CUSTOM_SYMBOL", "")).split()[0].strip().upper()
-                    lot = pd.to_numeric(row.get("SEM_LOT_UNITS"), errors="coerce")
-                    if sym and pd.notna(lot) and lot > 0:
-                        self.lot_map[sym] = int(lot)
-                print(f"✅ Dhan Master Loaded: {len(self.eq_sec_map)} Equities | {len(self.lot_map)} Live Lot Sizes.")
+                print(f"✅ Dhan Master Loaded: {len(self.eq_sec_map)} Equities mapped.")
         except Exception as e:
             print(f"⚠️ Dhan Scrip Master warning: {e}")
 
@@ -213,7 +203,6 @@ class DhanOptionEngine:
             if not expiries:
                 return None
 
-            # Select the first expiry that is at least `min_dte` days away (e.g. >= 15 days / Nov 3+)
             ist = pytz.timezone("Asia/Kolkata")
             today = datetime.now(ist).date()
             chosen_expiry = expiries[-1]
@@ -269,7 +258,7 @@ class DhanOptionEngine:
 
 
 # ==============================================================================
-# 🕸️ 5. LIVE NSE OI SPURTS SCRAPER & INSTITUTIONAL CLASSIFIER
+# 🕸️ 5. LIVE NSE OI SPURTS SCRAPER & STRICT INSTITUTIONAL CLASSIFIER
 # ==============================================================================
 def fetch_nse_oi_spurts_map() -> dict:
     base_url = "https://www.nseindia.com"
@@ -312,42 +301,41 @@ def classify_institutional_oi(price_chg_pct: float, oi_chg_pct: float, opt_type:
 
     sign_str = f"{oi_chg_pct:+.0f}%"
     if price_chg_pct >= 0.0 and oi_chg_pct >= 2.5:
-        # Long Build-Up (Bullish only — strictly block PE!)
         if opt_type == "PE":
             return True, False, f"LB{sign_str:>5}"
         return False, True, f"LB{sign_str:>5}"
 
     if price_chg_pct < 0.0 and oi_chg_pct >= 2.5:
-        # Short Build-Up (Bearish only — strictly block CE!)
         if opt_type == "CE":
             return True, False, f"SB{sign_str:>5}"
         return False, True, f"SB{sign_str:>5}"
 
     if price_chg_pct >= 0.2 and oi_chg_pct <= -2.0:
-        # Short Covering (Bullish only — block PE!)
         if opt_type == "PE":
             return True, False, f"SC{sign_str:>5}"
         return False, True, f"SC{sign_str:>5}"
 
     if price_chg_pct <= -0.2 and oi_chg_pct <= -2.0:
-        # Long Unwinding (Bearish only — block CE!)
         if opt_type == "CE":
             return True, False, f"LU{sign_str:>5}"
         return False, True, f"LU{sign_str:>5}"
 
     return False, False, f"OI{sign_str:>5}"
 
+
 # ==============================================================================
 # 📈 6. ZERO-REPAINTING DATA SLICER, INDICATORS & BLACK-SCHOLES GREEKS
 # ==============================================================================
 def get_closed_bar_slice(df: pd.DataFrame, is_intraday: bool) -> pd.DataFrame:
+    """
+    For 15m intraday: drops forming bar during 09:15-15:30 IST.
+    For 1D positional: only drops forming daily bar before 14:15 IST (after 2:15 PM, uses today's candle).
+    """
     if df.empty or len(df) < 30:
         return df
     ist = pytz.timezone("Asia/Kolkata")
     now_ist = datetime.now(ist)
     now_mins = now_ist.hour * 60 + now_ist.minute
-    # For 15m intraday: drop forming bar during 09:15-15:30.
-    # For 1D positional: only drop forming daily bar before 14:15 IST (after 2:15 PM, use today's candle!)
     cutoff_mins = (15 * 60 + 30) if is_intraday else (14 * 60 + 15)
     in_forming_window = (
         now_ist.weekday() < 5
@@ -359,6 +347,7 @@ def get_closed_bar_slice(df: pd.DataFrame, is_intraday: bool) -> pd.DataFrame:
         if last_date == now_ist.date():
             return df.iloc[:-1].copy()
     return df.copy()
+
 
 def extract_ticker_df(raw_data, ticker):
     if raw_data is None or raw_data.empty:
@@ -414,7 +403,6 @@ def compute_daily_indicators(df):
     df["EMA21"] = c.ewm(span=21, adjust=False).mean()
     df["EMA55"] = c.ewm(span=55, adjust=False).mean()
 
-    # Proven Dual Fibonacci Bollinger Ribbon BB(38, 2.0) & BB(61, 2.0)
     df["BB_SMA_38"] = c.rolling(38).mean()
     std_38 = c.rolling(38).std(ddof=0)
     df["BB_UP_38"] = df["BB_SMA_38"] + (2.0 * std_38)
@@ -457,7 +445,6 @@ def compute_intraday_15m_indicators(df, is_index=False):
     df["EMA21"] = c.ewm(span=21, adjust=False).mean()
 
     if is_index or (df["Volume"].sum() == 0):
-        # Index Fix (#8): Use EMA21 institutional anchor when Yahoo Index Volume is 0
         df["TREND_ANCHOR"] = df["EMA21"]
     else:
         tp = (df["High"] + df["Low"] + c) / 3.0
@@ -500,15 +487,9 @@ def compute_intraday_15m_indicators(df, is_index=False):
 
 
 # ==============================================================================
-# 🧪 7. TRUE MARK-TO-MARKET EXPECTANCY BACKTESTER (FIXES CRITIQUE #1 & #2)
+# 🧪 7. TRUE MARK-TO-MARKET EXPECTANCY BACKTESTER
 # ==============================================================================
 def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, is_intraday=False):
-    """
-    Fixes Critique #1 & #2:
-    - Models exact 2-Stage Exit: 50% booked at T1 (+1.0R intra / +1.25R swing) + SL trailed to Entry.
-    - Scores Timeouts & Session-End Exits at Mark-to-Market R (instead of fake -1.0R loss!).
-    - Deducts COST_SLIPPAGE_R (-0.05R) on every trade.
-    """
     sig_col = "CE_Signal" if direction == "CE" else "PE_Signal"
     closes, highs, lows, atrs, sigs = (
         df["Close"].values,
@@ -547,7 +528,6 @@ def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, i
         for j in range(i + 1, min(i + 1 + max_bars, n)):
             exit_bar = j
             if is_intraday and dates[j] != dates[i]:
-                # Session boundary reached: Mark-to-Market at previous bar's close
                 prev_close = closes[j - 1]
                 mtm_r = ((prev_close - entry) / risk) if direction == "CE" else ((entry - prev_close) / risk)
                 mtm_r = float(np.clip(mtm_r, -1.0, full_r_Lock))
@@ -581,7 +561,6 @@ def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, i
                     t1_reached = True
 
         if not outcome_resolved:
-            # Time-stop reached at exit_bar: Mark-to-Market R at close
             end_close = closes[exit_bar]
             mtm_r = ((end_close - entry) / risk) if direction == "CE" else ((entry - end_close) / risk)
             mtm_r = float(np.clip(mtm_r, -1.0, full_r_Lock))
@@ -599,7 +578,7 @@ def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, i
 
 
 # ==============================================================================
-# 💰 8. OPTION TRADE BUILDER (15+ DTE FAR EXPIRY + PATCH A STRICT RISK CAP)
+# 💰 8. OPTION TRADE BUILDER (WITH CAPITAL + QUALITY SCORE CALCULATION)
 # ==============================================================================
 def build_option_trade_row(
     meta, df, opt_type, total_trades, expectancy, win_pct, india_vix, is_intraday, oi_tag, is_oi_boosted, dhan_engine: DhanOptionEngine
@@ -611,7 +590,6 @@ def build_option_trade_row(
     step = meta["step"]
     atm_strike = int(round(spot / step) * step) if step >= 5 else round(spot / step) * step
 
-    # Enforce 15+ DTE (e.g., Nov 3 onwards) for Positional Swings & Index Positional!
     min_dte_req = MIN_DTE_INTRADAY if is_intraday else MIN_DTE_POSITIONAL
 
     dhan_quote = dhan_engine.get_live_atm_option(meta, atm_strike, opt_type, min_dte=min_dte_req) if dhan_engine else None
@@ -632,7 +610,6 @@ def build_option_trade_row(
 
     strike_str = f"{int(atm_strike)}" if atm_strike == int(atm_strike) else f"{atm_strike:.1f}"
 
-    # 15+ DTE options have lower Theta/Gamma noise, allowing cleaner 16%-24% premium stops
     atr_mult = INTRA_ATR_SL_MULT if is_intraday else SWING_ATR_SL_MULT
     und_risk = atr * atr_mult
     raw_opt_sl_dist = delta * und_risk - 0.5 * gamma * (und_risk ** 2)
@@ -655,8 +632,7 @@ def build_option_trade_row(
     risk_per_lot = max(actual_risk * lot_size, 1.0)
     cost_per_lot = max(opt_entry * lot_size, 1.0)
 
-    # Allow ₹5,500 max risk buffer for 1 lot of a 15+ DTE Major Index so Indices never disappear!
-    effective_max_risk = 5500 if (meta["is_idx"] and not is_intraday) else RISK_PER_TRADE
+    effective_max_risk = INDEX_POS_MAX_RISK if (meta["is_idx"] and not is_intraday) else RISK_PER_TRADE
     lots_by_risk = int(effective_max_risk // risk_per_lot)
     lots_by_cap = int(MAX_CAPITAL_PER_TRADE // cost_per_lot)
     num_lots = min(lots_by_risk, lots_by_cap)
@@ -666,6 +642,12 @@ def build_option_trade_row(
 
     qty = num_lots * lot_size
     capital = int(round(opt_entry * qty))
+    total_rupee_risk = int(round(actual_risk * qty))
+
+    # Institutional Quality Score = (ExpR * 100) + Win%
+    exp_rounded = round(expectancy, 2)
+    win_rounded = round(win_pct, 1)
+    quality_score = round((exp_rounded * 100.0) + win_rounded, 1)
 
     return {
         "Contract": f"{src_flag}{meta['name'][:7]} {strike_str}{opt_type}",
@@ -673,16 +655,22 @@ def build_option_trade_row(
         "Entry": opt_entry,
         "Qty": qty,
         "Capital": capital,
+        "RiskRs": total_rupee_risk,
         "Stop": opt_sl,
         "T1": opt_t1,
         "Target": opt_tgt,
         "OI_Flow": oi_tag,
-        "Expectancy": round(expectancy, 2),
-        "WinProb": round(win_pct, 1),
+        "Expectancy": exp_rounded,
+        "WinProb": win_rounded,
+        "Score": quality_score,
         "OIBoost": 1 if is_oi_boosted else 0,
+        "OptType": opt_type,
+        "IsIdx": meta["is_idx"],
     }
+
+
 # ==============================================================================
-# 📱 9. PATCH B: PERFECTLY ALIGNED ASCII/HTML TABLE FORMATTER
+# 📱 9. TABLE FORMATTER (WITH Cap(₹), Score & AUTO TOP-2 TRIAGE PICKS)
 # ==============================================================================
 def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine: DhanOptionEngine, oi_count: int):
     if dhan_engine.enabled and dhan_engine.live_quotes_fetched > 0:
@@ -690,8 +678,11 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
     else:
         feed_str = f"NSE OI ({oi_count}) + BS Model (15+ DTE)"
 
-    # Pure ASCII inside <pre> so columns never shift on mobile or desktop Telegram!
-    col_hdr = f"{'Contract':<15}|{'Exp':>5}|{'Entry':>6}|{'Qty':>5}|{'SL':>6}|{'T1-50%':>6}|{'Target':>6}|{'OI_Flow':>7}|{'ExpR':>5}|{'Win%':>5}"
+    # Includes both Cap(₹) and Score columns in pure fixed-width ASCII
+    col_hdr = (
+        f"{'Contract':<14}|{'Exp':>5}|{'Entry':>6}|{'Qty':>4}|{'Cap(₹)':>6}|"
+        f"{'SL':>6}|{'T1-50%':>6}|{'Target':>6}|{'OI_Flow':>7}|{'ExpR':>5}|{'Win%':>5}|{'Score':>5}"
+    )
     sep = "-" * len(col_hdr)
 
     lines = [
@@ -700,49 +691,79 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
     ]
 
     if idx_records:
-        lines.append("<b>📌 MAJOR INDICES F&amp;O (NIFTY / BANKNIFTY / SENSEX / MIDCP / FIN)</b>")
+        lines.append("<b>📌 MAJOR INDICES F&amp;O (SORTED BY QUALITY SCORE)</b>")
         lines.append("<pre>")
         lines.append(col_hdr)
         lines.append(sep)
         for r in idx_records:
             row_str = (
-                f"{r['Contract'][:15]:<15}|"
+                f"{r['Contract'][:14]:<14}|"
                 f"{r['Expiry'][:5]:>5}|"
                 f"{r['Entry']:>6.1f}|"
-                f"{r['Qty']:>5d}|"
+                f"{r['Qty']:>4d}|"
+                f"{r['Capital']:>6d}|"
                 f"{r['Stop']:>6.1f}|"
                 f"{r['T1']:>6.1f}|"
                 f"{r['Target']:>6.1f}|"
                 f"{r['OI_Flow'][:7]:>7}|"
                 f"{r['Expectancy']:>+5.2f}|"
-                f"{r['WinProb']:>4.1f}%"
+                f"{r['WinProb']:>4.1f}%|"
+                f"{r['Score']:>5.1f}"
             )
             lines.append(html.escape(row_str))
         lines.append("</pre>\n")
 
     if stk_records:
-        lines.append(f"<b>🚀 TOP {len(stk_records[:TOP_N_STOCKS])} STOCK OPTIONS (RANKED BY OI FLOW &amp; NET ExpR)</b>")
+        lines.append(f"<b>🚀 TOP {len(stk_records[:TOP_N_STOCKS])} STOCK OPTIONS (RANKED BY OI FLOW &amp; QUALITY SCORE)</b>")
         lines.append("<pre>")
         lines.append(col_hdr)
         lines.append(sep)
         for r in stk_records[:TOP_N_STOCKS]:
             row_str = (
-                f"{r['Contract'][:15]:<15}|"
+                f"{r['Contract'][:14]:<14}|"
                 f"{r['Expiry'][:5]:>5}|"
                 f"{r['Entry']:>6.1f}|"
-                f"{r['Qty']:>5d}|"
+                f"{r['Qty']:>4d}|"
+                f"{r['Capital']:>6d}|"
                 f"{r['Stop']:>6.1f}|"
                 f"{r['T1']:>6.1f}|"
                 f"{r['Target']:>6.1f}|"
                 f"{r['OI_Flow'][:7]:>7}|"
                 f"{r['Expectancy']:>+5.2f}|"
-                f"{r['WinProb']:>4.1f}%"
+                f"{r['WinProb']:>4.1f}%|"
+                f"{r['Score']:>5.1f}"
             )
             lines.append(html.escape(row_str))
         lines.append("</pre>")
 
+    # ------------------------------------------------------------------
+    # 🏆 AUTO 3-STEP TRIAGE: HIGHLIGHT TOP 2 BEST TRADES AUTOMATICALLY
+    # ------------------------------------------------------------------
+    all_cands = list(idx_records) + list(stk_records[:TOP_N_STOCKS])
+    # Filter by Step 1 (ExpR >= 0.08 & Win% >= 48%) and Step 2 (Active OI Boost preferred)
+    prime_picks = [
+        r for r in all_cands
+        if r["Expectancy"] >= 0.08 and r["WinProb"] >= 48.0 and r["OIBoost"] == 1
+    ]
+    if not prime_picks:
+        prime_picks = [r for r in all_cands if r["Expectancy"] >= 0.05 and r["WinProb"] >= 47.0]
+
+    prime_picks.sort(key=lambda x: (x["OIBoost"], x["Score"]), reverse=True)
+    top_two = prime_picks[:2]
+
+    if top_two:
+        lines.append("\n<b>🏆 TOP HIGH-CONVICTION TRADES (AUTO 3-STEP TRIAGE):</b>")
+        for idx, p in enumerate(top_two, 1):
+            lines.append(
+                f"{idx}. <b>{html.escape(p['Contract'])} ({html.escape(p['Expiry'])})</b> "
+                f"👉 Entry: <code>₹{p['Entry']:.1f}</code> | Qty: <code>{p['Qty']}</code> "
+                f"| Cap: <code>₹{p['Capital']:,}</code> | Risk: <code>₹{p['RiskRs']:,}</code> "
+                f"| SL: <code>{p['Stop']:.1f}</code> | T1: <code>{p['T1']:.1f}</code> | Tgt: <code>{p['Target']:.1f}</code> "
+                f"| OI: <code>{html.escape(p['OI_Flow'].strip())}</code> | <b>Score: {p['Score']:.1f}</b>"
+            )
+
     lines.append(
-        "💡 <i>* = Dhan Live Chain | Exp = Expiry (15+ DTE for Positional) | LB=Long Build, SB=Short Build, SC=Short Cover</i>"
+        "\n💡 <i>Score = (ExpR×100) + Win% | Cap(₹) = Entry×Qty | LB=Long Build, SB=Short Build, SC=Short Cover</i>"
     )
     return "\n".join(lines)
 
@@ -827,16 +848,18 @@ def main():
             continue
 
         tot, exp_r, wp = backtest_signals(df15, opt_type, INTRA_ATR_SL_MULT, INTRA_UND_RR, INTRA_MAX_BARS, True)
+        q_score = (round(exp_r, 2) * 100.0) + round(wp, 1)
 
         if meta["is_idx"]:
             if tot >= 5:
-                intra_idx.append((exp_r, is_boosted, meta, df15, opt_type, tot, exp_r, wp, oi_tag))
+                intra_idx.append((q_score, is_boosted, meta, df15, opt_type, tot, exp_r, wp, oi_tag))
         else:
             if not (bool(last[sig_col]) or bool(prev[sig_col]) or is_boosted):
                 continue
             if tot >= INTRA_MIN_SETUPS and exp_r >= INTRA_MIN_EXP_R:
-                intra_stk.append((exp_r, is_boosted, meta, df15, opt_type, tot, exp_r, wp, oi_tag))
+                intra_stk.append((q_score, is_boosted, meta, df15, opt_type, tot, exp_r, wp, oi_tag))
 
+    # Sort primarily by OI Alignment + Quality Score
     intra_idx.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
     intra_stk.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
 
@@ -886,16 +909,18 @@ def main():
             continue
 
         tot, exp_r, wp = backtest_signals(df1d, opt_type, SWING_ATR_SL_MULT, SWING_UND_RR, SWING_MAX_DAYS, False)
+        q_score = (round(exp_r, 2) * 100.0) + round(wp, 1)
 
         if meta["is_idx"]:
             if tot >= 5:
-                swing_idx.append((exp_r, is_boosted, meta, df1d, opt_type, tot, exp_r, wp, oi_tag))
+                swing_idx.append((q_score, is_boosted, meta, df1d, opt_type, tot, exp_r, wp, oi_tag))
         else:
             if not (bool(last[sig_col]) or is_boosted):
                 continue
             if tot >= SWING_MIN_SETUPS and exp_r >= SWING_MIN_EXP_R:
-                swing_stk.append((exp_r, is_boosted, meta, df1d, opt_type, tot, exp_r, wp, oi_tag))
+                swing_stk.append((q_score, is_boosted, meta, df1d, opt_type, tot, exp_r, wp, oi_tag))
 
+    # Sort primarily by OI Alignment + Quality Score
     swing_idx.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
     swing_stk.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
 
