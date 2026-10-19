@@ -1,475 +1,847 @@
 import os
 import re
-import io
-import math
-import requests
+import sys
+import time
+import html
 import warnings
-import numpy as np
-import pandas as pd
-import yfinance as yf
 from datetime import datetime
-import pytz
 
 warnings.filterwarnings("ignore")
 
-# ==============================================================================
-# 1. PORTFOLIO & RISK MANAGEMENT CONFIGURATION
-# ==============================================================================
-IST = pytz.timezone("Asia/Kolkata")
-
-# Watchlist Table Baseline Sizing
-BASE_RISK_PER_TRADE = 1000.0        # Baseline ₹1,000 risk for main watchlist table
-
-# ₹1,00,000 to ₹1,05,000 Portfolio Basket Allocator (Top 4 Stocks)
-TARGET_PORTFOLIO_CAPITAL = 100000.0 # Target capital deployment (₹1,00,000)
-MAX_PORTFOLIO_BUFFER = 105000.0     # Strict hard ceiling (Never exceed ₹1,05,000)
-PORTFOLIO_BASKET_SLOTS = 4          # Allocate across the Top 4 setups
-MAX_CAPITAL_PER_STOCK = 35000.0     # Hard cap (₹35k) per stock to prevent concentration
-MAX_PORTFOLIO_RISK_PCT = 0.05       # Target ~5% total portfolio risk across 4 stocks
-
-# Strategy & Backtest Rules
-RR_STAGE_1 = 1.25                   # T1 - Book 50% at +1.25R & Trail SL to Entry
-RR_FINAL = 2.50                     # Target - Book remaining 50% at +2.5R (1:2.5 RR)
-SWING_LOW_LOOKBACK = 7              # 7-candle lowest low Stop Loss
-MIN_BACKTEST_TRADES = 5             # Minimum 5 trades in 5 years
-MIN_WIN_PROBABILITY = 38.0          # Minimum 5Y full target Win% (>= 38%)
-TOP_N_WATCHLIST = 12                # Show Top 12 stocks in the main table
-MAX_HOLD_DAYS = 20                  # 20-trading-day time stop
-
-raw_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-token_match = re.search(r"(\d+:[A-Za-z0-9_-]+)", raw_token)
-TELEGRAM_BOT_TOKEN = token_match.group(1) if token_match else ""
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "").strip().strip('"').strip("'")
+import pytz
+import requests
+import yfinance as yf
+import pandas as pd
+import numpy as np
 
 # ==============================================================================
-# 2. NIFTY 500 UNIVERSE FETCHER (FILTERS OUT DELISTED/DUMMY TICKERS)
+# 🔐 1. CREDENTIALS & ENVIRONMENT VARIABLES (AUTO-SANITIZED)
 # ==============================================================================
-EXCLUDED_TICKERS = {"BAGMANE.NS", "ZOMATO.NS"}
+RAW_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+RAW_CHATID = os.environ.get("TELEGRAM_CHAT_ID", "").strip().strip('"').strip("'")
+EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "manual")
 
-FALLBACK_NIFTY_200 = [
-    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "BHARTIARTL.NS",
-    "INFY.NS", "SBIN.NS", "ITC.NS", "HINDUNILVR.NS", "LT.NS",
-    "BAJFINANCE.NS", "HCLTECH.NS", "MARUTI.NS", "SUNPHARMA.NS", "ADANIENT.NS",
-    "KOTAKBANK.NS", "TITAN.NS", "ONGC.NS", "TATAMOTORS.NS", "NTPC.NS",
-    "AXISBANK.NS", "DMART.NS", "ADANIPORTS.NS", "ULTRACEMCO.NS", "ASIANPAINT.NS",
-    "COALINDIA.NS", "BAJAJFINSV.NS", "BAJAJ-AUTO.NS", "POWERGRID.NS", "NESTLEIND.NS",
-    "M&M.NS", "IOC.NS", "TATASTEEL.NS", "JSWSTEEL.NS", "GRASIM.NS",
-    "LTIM.NS", "TECHM.NS", "WIPRO.NS", "SBILIFE.NS", "HDFCLIFE.NS",
-    "DRREDDY.NS", "CIPLA.NS", "BRITANNIA.NS", "INDUSINDBK.NS", "EICHERMOT.NS",
-    "DIVISLAB.NS", "HINDALCO.NS", "BPCL.NS", "TATACONSUM.NS", "HEROMOTOCO.NS",
-    "APOLLOHOSP.NS", "ETERNAL.NS", "BEL.NS", "HAL.NS", "TRENT.NS",
-    "SIEMENS.NS", "DLF.NS", "PIDILITIND.NS", "INDIGO.NS", "BANKBARODA.NS",
-    "PNB.NS", "GAIL.NS", "CHOLAFIN.NS", "AMBUJACEM.NS", "ABB.NS",
-    "TVSMOTOR.NS", "VEDL.NS", "HAVELLS.NS", "GODREJCP.NS", "SHRIRAMFIN.NS",
-    "DABUR.NS", "ICICIPRULI.NS", "SHREECEM.NS", "MARICO.NS", "CANBK.NS",
-    "REC.NS", "PFC.NS", "IRFC.NS", "BHEL.NS", "CGPOWER.NS",
-    "POLYCAB.NS", "CUMMINSIND.NS", "PERSISTENT.NS", "COFORGE.NS", "DIXON.NS",
-    "MCX.NS", "ANGELONE.NS", "BSE.NS", "CDSL.NS", "KALYANKJIL.NS",
-    "LUPIN.NS", "AUROPHARMA.NS", "TORNTPHARM.NS", "ALKEM.NS", "MAXHEALTH.NS",
-    "FORTIS.NS", "SYNGENE.NS", "LAURUSLABS.NS", "GRANULES.NS", "NATCOPHARM.NS",
-    "ASHOKLEY.NS", "BHARATFORG.NS", "MOTHERSON.NS", "SONACOMS.NS", "EXIDEIND.NS",
-    "APOLLOTYRE.NS", "MRF.NS", "BALKRISIND.NS", "CEATLTD.NS", "VOLTAS.NS",
-    "BLUESTARCO.NS", "CROMPTON.NS", "VGUARD.NS", "PAGEIND.NS", "ABFRL.NS",
-    "JUBLFOOD.NS", "DEVYANI.NS", "VBL.NS", "RADICO.NS", "UNITDSPR.NS",
-    "INDIANB.NS", "UNIONBANK.NS", "IDFCFIRSTB.NS", "FEDERALBNK.NS", "AUBANK.NS",
-    "KARURVYSYA.NS", "MUTHOOTFIN.NS", "MANAPPURAM.NS", "LICHSGFIN.NS", "M&MFIN.NS",
-    "POONAWALLA.NS", "SUNDARMFIN.NS", "ABCAPITAL.NS", "LTF.NS", "HUDCO.NS",
-    "IREDA.NS", "TATAPOWER.NS", "JSWENERGY.NS", "NHPC.NS", "SJVN.NS",
-    "TORNTPOWER.NS", "IGL.NS", "MGL.NS", "PETRONET.NS", "DEEPAKNTR.NS",
-    "SRF.NS", "PIIND.NS", "UPL.NS", "COROMANDEL.NS", "TATACHEM.NS",
-    "OBEROIRLTY.NS", "GODREJPROP.NS", "PRESTIGE.NS", "BRIGADE.NS", "PHOENIXLTD.NS",
-    "ASTRAL.NS", "SUPREMEIND.NS", "KEI.NS", "CONCOR.NS", "DELHIVERY.NS",
-    "IRCTC.NS", "GMRINFRA.NS", "RVNL.NS", "IRCON.NS", "NBCC.NS",
-    "KPITTECH.NS", "TATAELXSI.NS", "LTTS.NS", "CYIENT.NS", "MPHASIS.NS"
+token_match = re.search(r"(\d+:[A-Za-z0-9_-]+)", RAW_TOKEN)
+TELEGRAM_BOT_TOKEN = token_match.group(1) if token_match else RAW_TOKEN.lstrip("bot").strip('"').strip("'")
+TELEGRAM_CHAT_ID   = RAW_CHATID
+
+# ==============================================================================
+# ⚖️ 2. INSTITUTIONAL RISK, SIZING & EXPECTANCY PARAMETERS
+# ==============================================================================
+RISK_PER_TRADE         = 1000     # Strict Max Rupee risk per cash/intraday trade (₹1,000 hard cap)
+MAX_CAPITAL_PER_TRADE  = 35000    # Strict Max Capital outlay per trade (₹35,000 hard cap)
+TOP_N_STOCKS           = 10       # Top 10 Stock setups per scan
+COST_SLIPPAGE_R        = 0.05     # 0.05R brokerage + STT + slippage deducted on every backtest trade
+
+# Intraday 15-Minute Scalp Parameters (Locked 1:2.0 R:R | T1 at +1.0R)
+INTRA_RR               = 2.0      # Locked 1:2.0 Risk:Reward for Intraday
+INTRA_T1_RR            = 1.0      # Book 50% at +1.0R and trail SL to Entry
+INTRA_ATR_SL_MULT      = 1.0      # 1.0x 15m ATR Stop Loss
+INTRA_MAX_BARS         = 12       # 12 bars hold window (Mark-to-Market at session close)
+INTRA_MIN_SETUPS       = 10       # Minimum 60-day historical sample size
+INTRA_MIN_EXP_R        = 0.00     # Minimum Net R-Expectancy after -0.05R costs
+
+# Positional 3-5 Day Cash Swing Parameters (Locked 1:2.5 R:R | T1 at +1.25R | Long-Only Delivery)
+SWING_RR               = 2.5      # Locked 1:2.5 Risk:Reward for Positional Cash Swings
+SWING_T1_RR            = 1.25     # Book 50% at +1.25R (GTT Leg 1) and trail SL to Entry
+SWING_ATR_SL_MULT      = 1.2      # 1.2x Daily ATR Stop Loss
+SWING_MAX_DAYS         = 8        # 8 trading days hold window (Mark-to-Market at day 8)
+SWING_MIN_SETUPS       = 10       # Minimum 5-year historical sample size
+SWING_MIN_EXP_R        = 0.05     # Minimum Net R-Expectancy after -0.05R costs
+
+# ==============================================================================
+# 📋 3. MAJOR INDICES + LIQUID NSE F&O & CASH SWING UNIVERSE (FULL REAL SYMBOLS)
+# ==============================================================================
+INDEX_UNIVERSE = {
+    "^NSEI":                "NIFTY",
+    "^NSEBANK":             "BANKNIFTY",
+    "^BSESN":               "SENSEX",
+    "NIFTY_MID_SELECT.NS":  "MIDCPNIFTY",
+    "NIFTY_FIN_SERVICE.NS": "FINNIFTY",
+    "^CNXIT":               "NIFTYIT",
+}
+
+STOCK_UNIVERSE = [
+    # Liquid F&O & Large/Mid-Cap Momentum Leaders
+    "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "ICICIBANK.NS", "INFY.NS",
+    "SBIN.NS", "BHARTIARTL.NS", "LT.NS", "AXISBANK.NS", "KOTAKBANK.NS",
+    "BAJFINANCE.NS", "MARUTI.NS", "M&M.NS", "TITAN.NS", "TATASTEEL.NS",
+    "SUNPHARMA.NS", "NTPC.NS", "HAL.NS", "BEL.NS", "TRENT.NS",
+    "ADANIPORTS.NS", "DLF.NS", "WIPRO.NS", "TECHM.NS", "PERSISTENT.NS",
+    "DIXON.NS", "OBEROIRLTY.NS", "FEDERALBNK.NS", "VOLTAS.NS", "CONCOR.NS",
+    "ZYDUSLIFE.NS", "AUROPHARMA.NS", "CROMPTON.NS", "ANGELONE.NS", "ETERNAL.NS",
+    "LTF.NS", "RBLBANK.NS", "ABB.NS", "CAMS.NS", "INDHOTEL.NS",
+    "MOTHERSON.NS", "NYKAA.NS", "SUPREMEIND.NS", "POLYCAB.NS", "COFORGE.NS",
+    # High-Beta Cash Swing & Midcap Leaders
+    "CHAMBLFERT.NS", "COROMANDEL.NS", "DEEPAKNTR.NS", "NAVINFLUOR.NS", "ATUL.NS",
+    "REDINGTON.NS", "CASTROLIND.NS", "CESC.NS", "KARURVYSYA.NS", "CITYUNIONBK.NS",
+    "IDFCFIRSTB.NS", "MANAPPURAM.NS", "MUTHOOTFIN.NS", "CHOLAFIN.NS", "LICHSGFIN.NS",
+    "CANBK.NS", "PNB.NS", "BANKBARODA.NS", "UNIONBANK.NS", "INDIANB.NS",
+    "BEML.NS", "MAZDOCK.NS", "COCHINSHIP.NS", "BDL.NS", "DATA_PATTERNS.NS",
+    "KPITTECH.NS", "TATAELXSI.NS", "CYIENT.NS", "ZENSARTECH.NS", "BSOFT.NS",
+    "SONACOMS.NS", "ENDURANCE.NS", "EXIDEIND.NS", "AMARAJABAT.NS", "APOLLOTYRE.NS",
+    "CEATLTD.NS", "JKTYRE.NS", "BALKRISIND.NS", "ASHOKLEY.NS", "ESCORTS.NS",
+    "KEI.NS", "HAVELLS.NS", "BLUESTARCO.NS", "WHIRLPOOL.NS", "CUMMINSIND.NS",
+    "THERMAX.NS", "BHEL.NS", "CGPOWER.NS", "SIEMENS.NS", "APARINDS.NS",
+    "NATIONALUM.NS", "HINDALCO.NS", "VEDL.NS", "NMDC.NS", "JINDALSTEL.NS",
+    "SAIL.NS", "JINDALSAW.NS", "WELCORP.NS", "APLAPOLLO.NS", "RATNAMANI.NS",
+    "GNFC.NS", "GSFC.NS", "RCF.NS", "FACT.NS", "PARADEEP.NS",
+    "RADICO.NS", "UBL.NS", "UNITDSPR.NS", "ITC.NS", "TATACONSUM.NS",
+    "VARUNBEV.NS", "JUBLFOOD.NS", "DEVYANI.NS", "CHALET.NS", "EIHOTEL.NS",
+    "LEMON_TREE.NS", "IRCTC.NS", "RVNL.NS", "IRCON.NS", "IRFC.NS",
+    "REC.NS", "PFC.NS", "IREDA.NS", "SJVN.NS", "NHPC.NS",
+    "TATAPOWER.NS", "JSWENERGY.NS", "TORNTPOWER.NS", "IGL.NS", "MGL.NS",
+    "PETRONET.NS", "GAIL.NS", "ONGC.NS", "OIL.NS", "IOC.NS",
+    "BPCL.NS", "HPCL.NS", "CHENNPETRO.NS", "MRPL.NS", "NATCOPHARM.NS",
+    "LAURUSLABS.NS", "GRANULES.NS", "GLENMARK.NS", "BIOCON.NS", "LUPIN.NS",
+    "ALKEM.NS", "TORNTPHARM.NS", "IPCALAB.NS", "AJANTPHARM.NS", "JBCHEPHARM.NS",
+    "APOLLOHOSP.NS", "MAXHEALTH.NS", "FORTIS.NS", "NARAYANA.NS", "ASTERDM.NS",
+    "METROPOLIS.NS", "LALPATHLAB.NS", "SYNGENE.NS", "DIVISLAB.NS", "CIPLA.NS",
+    "DRREDDY.NS", "PRESTIGE.NS", "BRIGADE.NS", "SOBHA.NS", "GODREJPROP.NS",
+    "PHOENIXLTD.NS", "MAHLIFE.NS", "NCC.NS", "KNRCON.NS", "PNCINFRA.NS",
 ]
 
-def get_nifty500_tickers():
-    url = "https://nsearchives.nseindia.com/content/indices/ind_nifty500list.csv"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+# Clean duplicates while preserving order
+STOCK_UNIVERSE = list(dict.fromkeys(STOCK_UNIVERSE))
+
+# ==============================================================================
+# 🕸️ 4. LIVE NSE OI SPURTS SCRAPER & HYBRID FLOW CLASSIFIER (OI + VOLUME SURGE)
+# ==============================================================================
+def fetch_nse_oi_spurts_map() -> dict:
+    base_url = "https://www.nseindia.com"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/market-data/oi-spurts",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+    oi_map = {}
     try:
-        resp = requests.get(url, headers=headers, timeout=15)
+        session = requests.Session()
+        session.headers.update(headers)
+        session.get(base_url, timeout=8)
+        time.sleep(0.3)
+        session.get(f"{base_url}/market-data/oi-spurts", timeout=8)
+        resp = session.get(f"{base_url}/api/live-analysis-oi-spurts-underlyings", timeout=10)
         if resp.status_code == 200:
-            df = pd.read_csv(io.StringIO(resp.text))
-            if "Symbol" in df.columns:
-                symbols = [
-                    f"{str(sym).strip()}.NS"
-                    for sym in df["Symbol"].dropna().unique()
-                    if "DUMMY" not in str(sym).upper()
-                ]
-                symbols = ["ETERNAL.NS" if s == "ZOMATO.NS" else s for s in symbols]
-                symbols = [s for s in symbols if s not in EXCLUDED_TICKERS]
-                if len(symbols) >= 100:
-                    return list(dict.fromkeys(symbols))
-    except Exception:
-        pass
-    return list(dict.fromkeys(FALLBACK_NIFTY_200))
+            data = resp.json().get("data", [])
+            for item in data:
+                sym = str(item.get("symbol", "")).strip().upper()
+                oi_pct = pd.to_numeric(item.get("avgInOI", 0.0), errors="coerce")
+                if sym and not np.isnan(oi_pct):
+                    oi_map[sym] = float(oi_pct)
+            print(f"✅ Scraped live NSE OI Spurts for {len(oi_map)} F&O underlyings.")
+    except Exception as e:
+        print(f"⚠️ NSE OI Spurts warning: {e}")
+    return oi_map
+
+
+def classify_hybrid_flow(price_chg_pct: float, oi_chg_pct: float, rvol: float, side: str):
+    """
+    Combines NSE Derivative OI Flow (for F&O stocks/indices) with Cash Relative Volume Surge (for Non-F&O stocks).
+    Strictly blocks conflicting institutional derivative positioning:
+      - Never allows BUY during Short Build-Up (SB) or Long Unwinding (LU).
+      - Never allows SHORT during Long Build-Up (LB) or Short Covering (SC).
+    Returns: (is_blocked: bool, is_boosted: bool, flow_tag: str [7 chars])
+    """
+    if abs(oi_chg_pct) >= 0.5:
+        sign_str = f"{oi_chg_pct:+.0f}%"
+        if price_chg_pct >= 0.0 and oi_chg_pct >= 2.5:
+            # Long Build-Up (Bullish only — block SHORT!)
+            if side == "SHORT":
+                return True, False, f"LB{sign_str:>5}"
+            return False, True, f"LB{sign_str:>5}"
+
+        if price_chg_pct < 0.0 and oi_chg_pct >= 2.5:
+            # Short Build-Up (Bearish only — block BUY!)
+            if side == "BUY":
+                return True, False, f"SB{sign_str:>5}"
+            return False, True, f"SB{sign_str:>5}"
+
+        if price_chg_pct >= 0.2 and oi_chg_pct <= -2.0:
+            # Short Covering (Bullish only — block SHORT!)
+            if side == "SHORT":
+                return True, False, f"SC{sign_str:>5}"
+            return False, True, f"SC{sign_str:>5}"
+
+        if price_chg_pct <= -0.2 and oi_chg_pct <= -2.0:
+            # Long Unwinding (Bearish only — block BUY!)
+            if side == "BUY":
+                return True, False, f"LU{sign_str:>5}"
+            return False, True, f"LU{sign_str:>5}"
+
+        return False, False, f"OI{sign_str:>5}"
+
+    # Fallback for pure Cash Equities (Non-F&O): Evaluate Relative Volume Surge (RVOL)
+    if rvol >= 1.5:
+        if (side == "BUY" and price_chg_pct > 0) or (side == "SHORT" and price_chg_pct < 0):
+            return False, True, f"VL{rvol:>4.1f}x"
+        return False, False, f"VL{rvol:>4.1f}x"
+
+    return False, False, "   --  "
 
 
 # ==============================================================================
-# 3. TECHNICAL INDICATORS (EMA 21/50 + BB 38/61 FIBONACCI VALUE RIBBON)
+# 📈 5. ZERO-REPAINTING DATA SLICER & TECHNICAL INDICATORS (BB 38/61 RIBBON)
 # ==============================================================================
-def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
-    close = df["Close"]
-    low = df["Low"]
-
-    # 1. Core EMA 21 & 50
-    df["EMA_21"] = close.ewm(span=21, adjust=False).mean()
-    df["EMA_50"] = close.ewm(span=50, adjust=False).mean()
-
-    # 2. Wilder's RSI(14)
-    delta = close.diff()
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-    avg_gain = gain.ewm(alpha=1.0 / 14.0, min_periods=14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1.0 / 14.0, min_periods=14, adjust=False).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    df["RSI_14"] = (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
-
-    # 3. Dual Fibonacci Bollinger Bands: BB(38, 2.0) & BB(61, 2.0)
-    df["BB_SMA_38"] = close.rolling(window=38).mean()
-    bb_std_38 = close.rolling(window=38).std(ddof=0)
-    df["BB_UPPER_38"] = df["BB_SMA_38"] + (2.0 * bb_std_38)
-    df["BB_SMA_61"] = close.rolling(window=61).mean()
-
-    # 4. Core Proven Strategy: EMA(21/50) Pullback (7Y Winner: +3,475R)
-    df["SIG_CORE"] = (
-        (df["EMA_21"] > df["EMA_50"])
-        & (df["RSI_14"] > 40.0)
-        & (df["RSI_14"] < 60.0)
-        & (df["Close"] > df["Open"])
+def get_closed_bar_slice(df: pd.DataFrame, is_intraday: bool) -> pd.DataFrame:
+    """
+    Eliminates Signal Repainting:
+    - For 15m Intraday: drops forming bar during 09:15-15:30 IST.
+    - For 1D Positional Swing: drops forming daily bar before 14:15 IST; after 2:15 PM uses today's candle.
+    """
+    if df.empty or len(df) < 30:
+        return df
+    ist = pytz.timezone("Asia/Kolkata")
+    now_ist = datetime.now(ist)
+    now_mins = now_ist.hour * 60 + now_ist.minute
+    cutoff_mins = (15 * 60 + 30) if is_intraday else (14 * 60 + 15)
+    in_forming_window = (
+        now_ist.weekday() < 5
+        and (9 * 60 + 15) <= now_mins < cutoff_mins
     )
-
-    # 5. ⭐GRADE-A Confluence: BB(38/61) Value Ribbon Bounce (7Y Proven: +2,208R, 47.9% T1+T2 Win%)
-    # No lagging CMF or RSI-SMA delay so entry stays early & Stop Loss stays tight!
-    recent_low_3d = low.rolling(window=3).min()
-    df["SIG_GRADE_A_RIBBON"] = (
-        (df["BB_SMA_38"] > df["BB_SMA_61"])
-        & (recent_low_3d <= df["BB_SMA_38"] * 1.02)
-        & (df["Close"] >= df["BB_SMA_61"])
-        & (df["Close"] < df["BB_UPPER_38"] * 0.98)
-    )
-
-    return df
+    if in_forming_window:
+        last_ts = df.index[-1]
+        last_date = last_ts.date() if hasattr(last_ts, "date") else now_ist.date()
+        if last_date == now_ist.date():
+            return df.iloc[:-1].copy()
+    return df.copy()
 
 
-# ==============================================================================
-# 4. 5-YEAR IN-MEMORY BACKTESTER
-# ==============================================================================
-def run_5y_backtest(df: pd.DataFrame) -> dict:
-    closes = df["Close"].values
-    highs = df["High"].values
-    lows = df["Low"].values
-    signals = df["SIG_CORE"].values
-    n = len(df)
-
-    wins = 0
-    total_trades = 0
-    in_trade = False
-    entry_price = 0.0
-    stop_loss = 0.0
-    target_price = 0.0
-    entry_idx = 0
-
-    for i in range(65, n - 1):
-        if not in_trade:
-            if signals[i]:
-                swing_low = float(np.min(lows[i - SWING_LOW_LOOKBACK + 1 : i + 1]))
-                curr_close = float(closes[i])
-                risk = curr_close - swing_low
-                if risk <= (curr_close * 0.003) or risk > (curr_close * 0.12):
-                    continue
-                in_trade = True
-                entry_price = curr_close
-                stop_loss = swing_low
-                target_price = entry_price + (RR_FINAL * risk)
-                entry_idx = i
-        else:
-            if lows[i] <= stop_loss:
-                total_trades += 1
-                in_trade = False
-            elif highs[i] >= target_price:
-                wins += 1
-                total_trades += 1
-                in_trade = False
-            elif (i - entry_idx) >= MAX_HOLD_DAYS:
-                if closes[i] >= (entry_price + (entry_price - stop_loss)):
-                    wins += 1
-                total_trades += 1
-                in_trade = False
-
-    win_prob = (wins / total_trades * 100.0) if total_trades > 0 else 0.0
-    return {"trades": total_trades, "win_prob": round(win_prob, 1)}
-
-
-def extract_ticker_df(batch_data: pd.DataFrame, ticker: str) -> pd.DataFrame:
+def extract_ticker_df(raw_data, ticker):
+    if raw_data is None or raw_data.empty:
+        return pd.DataFrame()
     try:
-        if isinstance(batch_data.columns, pd.MultiIndex):
-            if ticker in batch_data.columns.get_level_values(0):
-                sub = batch_data[ticker].copy()
-            elif ticker in batch_data.columns.get_level_values(1):
-                sub = batch_data.xs(ticker, axis=1, level=1).copy()
+        if isinstance(raw_data.columns, pd.MultiIndex):
+            lvl0 = raw_data.columns.get_level_values(0)
+            lvl1 = raw_data.columns.get_level_values(1)
+            if ticker in lvl0:
+                df = raw_data[ticker].copy()
+            elif ticker in lvl1:
+                df = raw_data.xs(ticker, axis=1, level=1).copy()
             else:
                 return pd.DataFrame()
         else:
-            sub = batch_data.copy()
-        required = ["Open", "High", "Low", "Close", "Volume"]
-        if not all(col in sub.columns for col in required):
-            return pd.DataFrame()
-        return sub[required].dropna(subset=["Open", "High", "Low", "Close"])
+            df = raw_data.copy()
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        for col in ["Open", "Close", "High", "Low"]:
+            if col not in df.columns:
+                return pd.DataFrame()
+            if isinstance(df[col], pd.DataFrame):
+                df[col] = df[col].iloc[:, 0]
+        if "Volume" not in df.columns:
+            df["Volume"] = 0
+        else:
+            if isinstance(df["Volume"], pd.DataFrame):
+                df["Volume"] = df["Volume"].iloc[:, 0]
+            df["Volume"] = df["Volume"].fillna(0)
+        return df.dropna(subset=["Open", "Close", "High", "Low"]).copy()
     except Exception:
         return pd.DataFrame()
 
 
+def compute_daily_swing_indicators(df: pd.DataFrame, is_index: bool = False) -> pd.DataFrame:
+    df = df.copy()
+    c = df["Close"]
+    df["EMA21"] = c.ewm(span=21, adjust=False).mean()
+    df["EMA55"] = c.ewm(span=55, adjust=False).mean()
+
+    # Proven Dual Fibonacci Bollinger Ribbon BB(38, 2.0) & BB(61, 2.0)
+    df["BB_SMA_38"] = c.rolling(38).mean()
+    std_38 = c.rolling(38).std(ddof=0)
+    df["BB_UP_38"] = df["BB_SMA_38"] + (2.0 * std_38)
+    df["BB_LO_38"] = df["BB_SMA_38"] - (2.0 * std_38)
+
+    df["BB_SMA_61"] = c.rolling(61).mean()
+    std_61 = c.rolling(61).std(ddof=0)
+    df["BB_UP_61"] = df["BB_SMA_61"] + (2.0 * std_61)
+    df["BB_LO_61"] = df["BB_SMA_61"] - (2.0 * std_61)
+
+    delta = c.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    df["RSI"] = (100 - (100 / (1 + (gain / loss.replace(0, np.nan))))).fillna(50.0)
+
+    tr = pd.concat(
+        [df["High"] - df["Low"], (df["High"] - c.shift()).abs(), (df["Low"] - c.shift()).abs()],
+        axis=1,
+    ).max(axis=1)
+    df["ATR"] = tr.rolling(14).mean()
+
+    vol_sma20 = df["Volume"].rolling(20).mean().replace(0, np.nan)
+    df["RVOL"] = (df["Volume"] / vol_sma20).fillna(1.0)
+
+    # Bullish Cash Swing Signal (Trend-aligned + Room to upper BB38 band + Healthy RSI)
+    df["BUY_Signal"] = (
+        (c >= df["EMA21"] * 0.995)
+        & (df["EMA21"] >= df["EMA55"] * 0.99)
+        & (c < df["BB_UP_38"])
+        & (df["RSI"] >= 44)
+        & (df["RSI"] <= 70)
+    )
+    # Bearish Regime Signal (Used for Index Regime tracking)
+    df["SHORT_Signal"] = (
+        (c <= df["EMA21"] * 1.005)
+        & (c > df["BB_LO_38"])
+        & (df["RSI"] >= 30)
+        & (df["RSI"] <= 56)
+    )
+    return df
+
+
+def compute_intraday_15m_indicators(df: pd.DataFrame, is_index: bool = False) -> pd.DataFrame:
+    df = df.copy()
+    if df.index.tz is not None:
+        df.index = df.index.tz_convert("Asia/Kolkata").tz_localize(None)
+    c = df["Close"]
+    df["EMA9"] = c.ewm(span=9, adjust=False).mean()
+    df["EMA21"] = c.ewm(span=21, adjust=False).mean()
+
+    if is_index or (df["Volume"].sum() == 0):
+        # Index Fix (#8): Use EMA21 when Yahoo Index Volume is 0
+        df["TREND_ANCHOR"] = df["EMA21"]
+    else:
+        tp = (df["High"] + df["Low"] + c) / 3.0
+        vol_clean = df["Volume"].replace(0, 1)
+        dates = pd.Series(df.index.date, index=df.index)
+        df["TREND_ANCHOR"] = (tp * vol_clean).groupby(dates).cumsum() / vol_clean.groupby(dates).cumsum()
+
+    df["BB_SMA_38"] = c.rolling(38).mean()
+    std_38 = c.rolling(38).std(ddof=0)
+    df["BB_UP_38"] = df["BB_SMA_38"] + (2.0 * std_38)
+    df["BB_LO_38"] = df["BB_SMA_38"] - (2.0 * std_38)
+
+    delta = c.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+    df["RSI"] = (100 - (100 / (1 + (gain / loss.replace(0, np.nan))))).fillna(50.0)
+
+    tr = pd.concat(
+        [df["High"] - df["Low"], (df["High"] - c.shift()).abs(), (df["Low"] - c.shift()).abs()],
+        axis=1,
+    ).max(axis=1)
+    df["ATR"] = tr.rolling(14).mean()
+
+    vol_sma20 = df["Volume"].rolling(20).mean().replace(0, np.nan)
+    df["RVOL"] = (df["Volume"] / vol_sma20).fillna(1.0)
+
+    df["BUY_Signal"] = (
+        (c >= df["TREND_ANCHOR"])
+        & (df["EMA9"] >= df["EMA21"] * 0.998)
+        & (c < df["BB_UP_38"])
+        & (df["RSI"] >= 46)
+        & (df["RSI"] <= 74)
+    )
+    df["SHORT_Signal"] = (
+        (c <= df["TREND_ANCHOR"])
+        & (df["EMA9"] <= df["EMA21"] * 1.002)
+        & (c > df["BB_LO_38"])
+        & (df["RSI"] >= 26)
+        & (df["RSI"] <= 54)
+    )
+    return df
+
+
 # ==============================================================================
-# 5. ₹1,00,000 TO ₹1,05,000 PORTFOLIO ALLOCATOR (STRICT CEILING ENFORCEMENT)
+# 🧪 6. TRUE MARK-TO-MARKET EXPECTANCY BACKTESTER (NO COIN-FLIP ARTIFACT)
 # ==============================================================================
-def build_100k_portfolio_plan(signals: list) -> tuple[list, dict]:
+def backtest_cash_signals(
+    df: pd.DataFrame, side: str = "BUY", atr_mult: float = 1.2, rr_target: float = 2.5, max_bars: int = 8, is_intraday: bool = False
+):
     """
-    Allocates capital across the Top 4 setups so:
-    1. Total Capital is strictly between ₹1,00,000 and ₹1,05,000 (NEVER exceeds ₹1,05,000).
-    2. No single stock exceeds ₹35,000 capital.
-    3. Every stock has Target = +2.5R, guaranteeing locked 1:2.5 RR math.
+    Models exact 2-Stage Partial Exit:
+      - 50% booked at T1 (+1.0R Intraday / +1.25R Positional Swing) + SL trailed to Entry.
+      - 50% held for Final Target (+2.0R Intraday / +2.5R Positional Swing).
+      - Timeouts & Session-End Exits evaluated at Mark-to-Market R at exit bar.
+      - Deducts COST_SLIPPAGE_R (-0.05R) per trade.
     """
-    basket = [s.copy() for s in signals[:PORTFOLIO_BASKET_SLOTS]]
-    if not basket:
-        return [], {}
+    sig_col = "BUY_Signal" if side == "BUY" else "SHORT_Signal"
+    closes, highs, lows, atrs, sigs = (
+        df["Close"].values,
+        df["High"].values,
+        df["Low"].values,
+        df["ATR"].values,
+        df[sig_col].values,
+    )
+    dates = df.index.date if is_intraday else None
 
-    target_risk_per_stock = (TARGET_PORTFOLIO_CAPITAL * MAX_PORTFOLIO_RISK_PCT) / len(basket)
+    t1_r_lock = INTRA_T1_RR if is_intraday else SWING_T1_RR
+    full_r_lock = rr_target
 
-    # Pass 1: Initial risk-based sizing capped at ₹35,000 per stock
-    for item in basket:
-        risk_per_share = item["RiskPerShare"]
-        qty_risk = math.floor(target_risk_per_stock / risk_per_share)
-        qty_cap = math.floor(MAX_CAPITAL_PER_STOCK / item["Entry"])
-        item["PortQty"] = max(1, min(qty_risk, qty_cap))
-        item["PortCap"] = item["PortQty"] * item["Entry"]
+    total_trades = 0
+    net_r_sum = 0.0
+    profitable_trades = 0
+    n = len(df)
+    i = 65
 
-    total_cap = sum(x["PortCap"] for x in basket)
-
-    # Pass 2: If total_cap < ₹1,00,000, scale up toward ₹1,02,500 target (respecting ₹35k per stock cap)
-    if 0 < total_cap < TARGET_PORTFOLIO_CAPITAL:
-        scale = 102500.0 / total_cap
-        for item in basket:
-            scaled_qty = math.floor(item["PortQty"] * scale)
-            max_qty_cap = math.floor(MAX_CAPITAL_PER_STOCK / item["Entry"])
-            item["PortQty"] = max(1, min(scaled_qty, max_qty_cap))
-            item["PortCap"] = item["PortQty"] * item["Entry"]
-        total_cap = sum(x["PortCap"] for x in basket)
-
-    # Pass 3: STRICT HARD CEILING TRIMMER — Never allow Total Capital > ₹1,05,000!
-    while total_cap > MAX_PORTFOLIO_BUFFER:
-        trimmable = [x for x in basket if x["PortQty"] > 1]
-        if not trimmable:
-            break
-        highest_stock = max(trimmable, key=lambda x: x["PortCap"])
-        highest_stock["PortQty"] -= 1
-        highest_stock["PortCap"] = highest_stock["PortQty"] * highest_stock["Entry"]
-        total_cap = sum(x["PortCap"] for x in basket)
-
-    # Finalize exact Rupee numbers
-    tot_capital = 0
-    tot_risk = 0.0
-    tot_t1_profit = 0.0
-    tot_target_profit = 0.0
-
-    for item in basket:
-        q = item["PortQty"]
-        rps = item["RiskPerShare"]
-        cap = round(q * item["Entry"], 0)
-        sl_rupees = round(q * rps, 0)
-        target_profit_rupees = round(q * (RR_FINAL * rps), 0)
-        t1_blended_rupees = round(q * (1.875 * rps), 0)
-
-        item["PortCap"] = int(cap)
-        item["PortRisk"] = int(sl_rupees)
-        item["PortProfit25R"] = int(target_profit_rupees)
-        item["PortProfitBlended"] = int(t1_blended_rupees)
-
-        tot_capital += int(cap)
-        tot_risk += sl_rupees
-        tot_t1_profit += t1_blended_rupees
-        tot_target_profit += target_profit_rupees
-
-    summary = {
-        "total_capital": int(tot_capital),
-        "unused_cash": int(max(0, MAX_PORTFOLIO_BUFFER - tot_capital)),
-        "total_risk": int(round(tot_risk, 0)),
-        "total_profit_25r": int(round(tot_target_profit, 0)),
-        "total_profit_blended": int(round(tot_t1_profit, 0)),
-    }
-    return basket, summary
-
-
-# ==============================================================================
-# 6. MAIN SCANNER ENGINE
-# ==============================================================================
-def scan_market():
-    now_ist = datetime.now(IST).strftime("%d-%b-%Y %I:%M %p IST")
-    tickers = get_nifty500_tickers()
-    chunk_size = 100
-    signals = []
-
-    for idx in range(0, len(tickers), chunk_size):
-        chunk = tickers[idx : idx + chunk_size]
-        try:
-            batch_data = yf.download(
-                tickers=chunk,
-                period="5y",
-                interval="1d",
-                auto_adjust=True,
-                group_by="ticker",
-                threads=True,
-                progress=False,
-            )
-        except Exception:
+    while i < n - max_bars - 1:
+        if not sigs[i] or np.isnan(atrs[i]) or atrs[i] <= 0:
+            i += 1
+            continue
+        entry = closes[i]
+        risk = atrs[i] * atr_mult
+        if risk <= 0:
+            i += 1
             continue
 
-        for ticker in chunk:
-            df = extract_ticker_df(batch_data, ticker)
-            if df.empty or len(df) < 100:
-                continue
+        sl = (entry - risk) if side == "BUY" else (entry + risk)
+        t1 = (entry + risk * t1_r_lock) if side == "BUY" else (entry - risk * t1_r_lock)
+        tgt = (entry + risk * full_r_lock) if side == "BUY" else (entry - risk * full_r_lock)
 
-            df = compute_indicators(df)
-            last_row = df.iloc[-1]
+        total_trades += 1
+        t1_reached = False
+        outcome_resolved = False
+        trade_r = 0.0
+        exit_bar = i + 1
 
-            if not bool(last_row["SIG_CORE"]):
-                continue
+        for j in range(i + 1, min(i + 1 + max_bars, n)):
+            exit_bar = j
+            if is_intraday and dates[j] != dates[i]:
+                prev_close = closes[j - 1]
+                mtm_r = ((prev_close - entry) / risk) if side == "BUY" else ((entry - prev_close) / risk)
+                mtm_r = float(np.clip(mtm_r, -1.0, full_r_lock))
+                trade_r = (0.5 * t1_r_lock + 0.5 * max(0.0, mtm_r)) if t1_reached else mtm_r
+                outcome_resolved = True
+                break
 
-            bt = run_5y_backtest(df)
-            if bt["trades"] < MIN_BACKTEST_TRADES or bt["win_prob"] < MIN_WIN_PROBABILITY:
-                continue
+            if side == "BUY":
+                curr_sl = entry if t1_reached else sl
+                if lows[j] <= curr_sl:
+                    trade_r = (0.5 * t1_r_lock) if t1_reached else -1.0
+                    outcome_resolved = True
+                    break
+                if highs[j] >= tgt:
+                    trade_r = 0.5 * t1_r_lock + 0.5 * full_r_lock
+                    outcome_resolved = True
+                    break
+                if highs[j] >= t1:
+                    t1_reached = True
+            else:
+                curr_sl = entry if t1_reached else sl
+                if highs[j] >= curr_sl:
+                    trade_r = (0.5 * t1_r_lock) if t1_reached else -1.0
+                    outcome_resolved = True
+                    break
+                if lows[j] <= tgt:
+                    trade_r = 0.5 * t1_r_lock + 0.5 * full_r_lock
+                    outcome_resolved = True
+                    break
+                if lows[j] <= t1:
+                    t1_reached = True
 
-            entry_price = float(last_row["Close"])
-            swing_low = float(df["Low"].tail(SWING_LOW_LOOKBACK).min())
-            risk = entry_price - swing_low
-            if risk <= (entry_price * 0.003) or risk > (entry_price * 0.12):
-                continue
+        if not outcome_resolved:
+            end_close = closes[exit_bar]
+            mtm_r = ((end_close - entry) / risk) if side == "BUY" else ((entry - end_close) / risk)
+            mtm_r = float(np.clip(mtm_r, -1.0, full_r_lock))
+            trade_r = (0.5 * t1_r_lock + 0.5 * max(0.0, mtm_r)) if t1_reached else mtm_r
 
-            qty = min(
-                math.floor(BASE_RISK_PER_TRADE / risk),
-                math.floor(MAX_CAPITAL_PER_STOCK / entry_price),
-            )
-            if qty < 1:
-                continue
+        net_r = trade_r - COST_SLIPPAGE_R
+        net_r_sum += net_r
+        if net_r > 0:
+            profitable_trades += 1
+        i = max(i + 1, exit_bar)
 
-            is_grade_a = bool(last_row["SIG_GRADE_A_RIBBON"])
-            setup_tag = "⭐GRADE-A" if is_grade_a else "Pullback"
-
-            signals.append({
-                "Stock": ticker.replace(".NS", ""),
-                "Entry": round(entry_price, 1),
-                "Qty": int(qty),
-                "Capital": int(round(qty * entry_price, 0)),
-                "SL": round(swing_low, 1),
-                "T1": round(entry_price + (RR_STAGE_1 * risk), 1),
-                "Target": round(entry_price + (RR_FINAL * risk), 1),
-                "RR": "1:2.5",
-                "Setup": setup_tag,
-                "WinProb": bt["win_prob"],
-                "IsGradeA": 1 if is_grade_a else 0,
-                "RiskPerShare": risk,
-            })
-
-    # Sort strictly by highest 5-Year Win% first, using ⭐GRADE-A as tie-breaker!
-    signals.sort(key=lambda x: (x["WinProb"], x["IsGradeA"]), reverse=True)
-    return signals[:TOP_N_WATCHLIST], now_ist
+    expectancy = (net_r_sum / total_trades) if total_trades > 0 else -1.0
+    win_pct = (profitable_trades / total_trades * 100.0) if total_trades > 0 else 0.0
+    return total_trades, expectancy, win_pct
 
 
 # ==============================================================================
-# 7. TELEGRAM OUTPUT (WATCHLIST + STRICT ₹1L-₹1.05L PORTFOLIO PLAN)
+# 💰 7. TRADE ROW BUILDERS (PATCH A STRICT RISK CAP + QUALITY SCORE)
 # ==============================================================================
-def send_telegram(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(text)
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    requests.post(
-        url,
-        json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": text,
-            "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        },
-        timeout=15,
+def build_index_regime_row(sym: str, df: pd.DataFrame, side: str, is_intraday: bool, flow_tag: str, exp_r: float, win_pct: float):
+    latest = df.iloc[-1]
+    spot = round(float(latest["Close"]), 1)
+    atr = float(latest["ATR"])
+    atr_mult = INTRA_ATR_SL_MULT if is_intraday else SWING_ATR_SL_MULT
+    t1_rr = INTRA_T1_RR if is_intraday else SWING_T1_RR
+    full_rr = INTRA_RR if is_intraday else SWING_RR
+
+    risk_pts = max(round(atr * atr_mult, 1), 1.0)
+    if side == "BUY":
+        sl = round(spot - risk_pts, 1)
+        t1 = round(spot + risk_pts * t1_rr, 1)
+        tgt = round(spot + risk_pts * full_rr, 1)
+        regime = "BULL"
+    else:
+        sl = round(spot + risk_pts, 1)
+        t1 = round(spot - risk_pts * t1_rr, 1)
+        tgt = round(spot - risk_pts * full_rr, 1)
+        regime = "BEAR"
+
+    exp_rounded = round(exp_r, 2)
+    win_rounded = round(win_pct, 1)
+    score = round((exp_rounded * 100.0) + win_rounded, 1)
+
+    return {
+        "Index": sym,
+        "Bias": regime,
+        "Spot": spot,
+        "SL": sl,
+        "T1": t1,
+        "Target": tgt,
+        "Flow": flow_tag,
+        "ExpR": exp_rounded,
+        "WinProb": win_rounded,
+        "Score": score,
+    }
+
+
+def build_stock_trade_row(
+    sym: str, df: pd.DataFrame, side: str, is_intraday: bool, flow_tag: str, is_boosted: bool, exp_r: float, win_pct: float
+):
+    latest = df.iloc[-1]
+    entry = round(float(latest["Close"]), 1)
+    atr = float(latest["ATR"])
+    if entry <= 10.0 or np.isnan(atr) or atr <= 0:
+        return None
+
+    atr_mult = INTRA_ATR_SL_MULT if is_intraday else SWING_ATR_SL_MULT
+    t1_rr = INTRA_T1_RR if is_intraday else SWING_T1_RR
+    full_rr = INTRA_RR if is_intraday else SWING_RR
+
+    # Clamp stop distance between 1.0% and 5.5% of stock price for clean position sizing
+    raw_risk = atr * atr_mult
+    min_risk = entry * (0.008 if is_intraday else 0.015)
+    max_risk = entry * (0.030 if is_intraday else 0.055)
+    risk_per_share = max(round(min(max_risk, max(min_risk, raw_risk)), 1), 0.2)
+
+    if side == "BUY":
+        sl = round(entry - risk_per_share, 1)
+        actual_risk = max(round(entry - sl, 1), 0.2)
+        t1 = round(entry + actual_risk * t1_rr, 1)
+        tgt = round(entry + actual_risk * full_rr, 1)
+    else:
+        sl = round(entry + risk_per_share, 1)
+        actual_risk = max(round(sl - entry, 1), 0.2)
+        t1 = round(entry - actual_risk * t1_rr, 1)
+        tgt = round(entry - actual_risk * full_rr, 1)
+
+    # PATCH A: STRICT RISK-CAP (₹1,000) & CAPITAL-CAP (₹35,000) ENFORCEMENT
+    qty_by_risk = int(RISK_PER_TRADE // actual_risk)
+    qty_by_cap = int(MAX_CAPITAL_PER_TRADE // entry)
+    qty = min(qty_by_risk, qty_by_cap)
+
+    if qty < 1:
+        return None
+
+    capital = int(round(entry * qty))
+    total_rupee_risk = int(round(actual_risk * qty))
+
+    exp_rounded = round(exp_r, 2)
+    win_rounded = round(win_pct, 1)
+    score = round((exp_rounded * 100.0) + win_rounded, 1)
+
+    return {
+        "Symbol": sym,
+        "Side": side,
+        "Entry": entry,
+        "Qty": qty,
+        "Capital": capital,
+        "RiskRs": total_rupee_risk,
+        "Stop": sl,
+        "T1": t1,
+        "Target": tgt,
+        "Flow": flow_tag,
+        "Expectancy": exp_rounded,
+        "WinProb": win_rounded,
+        "Score": score,
+        "FlowBoost": 1 if is_boosted else 0,
+    }
+
+
+# ==============================================================================
+# 📱 8. PATCH B: HTML-ESCAPED TABLE FORMATTER + AUTO TOP-2 TRIAGE BOX
+# ==============================================================================
+def format_swing_report(idx_rows, stk_rows, title, now_str, oi_count: int, is_intraday: bool):
+    feed_str = f"NSE OI ({oi_count}) + Cash RVOL"
+    rr_str = "1:2.0" if is_intraday else "1:2.5"
+
+    idx_hdr = (
+        f"{'Index':<11}|{'Bias':<4}|{'Spot':>7}|{'SL':>7}|{'T1-50%':>7}|"
+        f"{'Target':>7}|{'OI_Flow':>7}|{'ExpR':>5}|{'Win%':>5}|{'Score':>5}"
     )
+    idx_sep = "-" * len(idx_hdr)
 
-
-def publish(signals: list, now_ist: str):
-    if not signals:
-        send_telegram(
-            f"<b>🎯 TOP NIFTY 500 SWING SETUPS</b>\n"
-            f"🕒 <code>{now_ist}</code>\n\n"
-            f"No high-probability setups (&gt;= {MIN_WIN_PROBABILITY}%) found today."
-        )
-        return
-
-    basket, port_sum = build_100k_portfolio_plan(signals)
+    stk_hdr = (
+        f"{'Symbol':<11}|{'Side':<5}|{'Entry':>6}|{'Qty':>4}|{'Cap(₹)':>6}|"
+        f"{'SL':>6}|{'T1-50%':>6}|{'Target':>6}|{'Flow':>7}|{'ExpR':>5}|{'Win%':>5}|{'Score':>5}"
+    )
+    stk_sep = "-" * len(stk_hdr)
 
     lines = [
-        f"<b>🎯 TOP {len(signals)} NIFTY 500 SWING SETUPS (SORTED BY 5Y WIN%)</b>",
-        f"🕒 <code>{now_ist}</code> | Base Table Risk: <code>₹1,000/trade</code>\n",
-        "<pre>",
-        f"{'Stock':<10}|{'Entry':>7}|{'Qty':>4}|{'Capital':>7}|{'SL':>7}|{'T1-50%':>7}|{'Target':>7}|{'R:R':>5}|{'Setups':<9}|{'Win%':>5}",
-        "-" * 77,
+        f"<b>🔥 {html.escape(title)}</b>",
+        f"🕒 <code>{html.escape(now_str)}</code> | Feed: <code>{html.escape(feed_str)}</code> | Max Risk: <code>₹{RISK_PER_TRADE:,}</code> | R:R: <code>{rr_str}</code>\n",
     ]
 
-    for s in signals:
-        lines.append(
-            f"{s['Stock'][:10]:<10}|"
-            f"{s['Entry']:>7.1f}|"
-            f"{s['Qty']:>4d}|"
-            f"{s['Capital']:>7d}|"
-            f"{s['SL']:>7.1f}|"
-            f"{s['T1']:>7.1f}|"
-            f"{s['Target']:>7.1f}|"
-            f"{s['RR']:>5}|"
-            f"{s['Setup']:<9}|"
-            f"{s['WinProb']:>4.1f}%"
-        )
-    lines.append("</pre>\n")
+    if idx_rows:
+        lines.append("<b>📌 MAJOR INDICES MACRO REGIME (SORTED BY QUALITY SCORE)</b>")
+        lines.append("<pre>")
+        lines.append(idx_hdr)
+        lines.append(idx_sep)
+        for r in idx_rows:
+            row_str = (
+                f"{r['Index']:<11}|"
+                f"{r['Bias']:<4}|"
+                f"{r['Spot']:>7.1f}|"
+                f"{r['SL']:>7.1f}|"
+                f"{r['T1']:>7.1f}|"
+                f"{r['Target']:>7.1f}|"
+                f"{r['Flow'][:7]:>7}|"
+                f"{r['ExpR']:>+5.2f}|"
+                f"{r['WinProb']:>4.1f}%|"
+                f"{r['Score']:>5.1f}"
+            )
+            lines.append(html.escape(row_str))
+        lines.append("</pre>\n")
 
-    lines.append(f"<b>💼 ₹1L–₹1.05L PORTFOLIO PLAN (TOP {len(basket)} STOCKS — LOCKED 1:2.5 RR)</b>")
-    lines.append("<i>Strict ₹1,05,000 hard cap (Max ₹35,000/stock):</i>")
-    lines.append("<pre>")
-    p_hdr = f"{'Stock':<10}|{'BuyQty':>6}|{'Capital':>8}|{'SL Price':>8}|{'Target':>8}|{'Risk(₹)':>8}|{'Profit(₹)':>9}"
-    lines.append(p_hdr)
-    lines.append("-" * len(p_hdr))
+    if stk_rows:
+        mode_lbl = "INTRADAY STOCK SCALPS" if is_intraday else "3-5D CASH SWING SETUPS (KOTAK NEO GTT READY)"
+        lines.append(f"<b>🚀 TOP {len(stk_rows[:TOP_N_STOCKS])} {mode_lbl}</b>")
+        lines.append("<pre>")
+        lines.append(stk_hdr)
+        lines.append(stk_sep)
+        for r in stk_rows[:TOP_N_STOCKS]:
+            row_str = (
+                f"{r['Symbol']:<11}|"
+                f"{r['Side']:<5}|"
+                f"{r['Entry']:>6.1f}|"
+                f"{r['Qty']:>4d}|"
+                f"{r['Capital']:>6d}|"
+                f"{r['Stop']:>6.1f}|"
+                f"{r['T1']:>6.1f}|"
+                f"{r['Target']:>6.1f}|"
+                f"{r['Flow'][:7]:>7}|"
+                f"{r['Expectancy']:>+5.2f}|"
+                f"{r['WinProb']:>4.1f}%|"
+                f"{r['Score']:>5.1f}"
+            )
+            lines.append(html.escape(row_str))
+        lines.append("</pre>")
 
-    for b in basket:
-        lines.append(
-            f"{b['Stock'][:10]:<10}|"
-            f"{b['PortQty']:>6d}|"
-            f"{b['PortCap']:>8d}|"
-            f"{b['SL']:>8.1f}|"
-            f"{b['Target']:>8.1f}|"
-            f"{-b['PortRisk']:>8d}|"
-            f"{'+' + str(b['PortProfit25R']):>9}"
-        )
-    lines.append("-" * len(p_hdr))
+    # ------------------------------------------------------------------
+    # 🏆 AUTO 3-STEP TRIAGE: HIGHLIGHT TOP 2 BEST TRADES AUTOMATICALLY
+    # ------------------------------------------------------------------
+    cands = list(stk_rows[:TOP_N_STOCKS])
+    prime_picks = [
+        r for r in cands
+        if r["Expectancy"] >= 0.08 and r["WinProb"] >= 48.0 and r["FlowBoost"] == 1
+    ]
+    if not prime_picks:
+        prime_picks = [r for r in cands if r["Expectancy"] >= 0.05 and r["WinProb"] >= 47.0]
+
+    prime_picks.sort(key=lambda x: (x["FlowBoost"], x["Score"]), reverse=True)
+    top_two = prime_picks[:2]
+
+    if top_two:
+        lines.append("\n<b>🏆 TOP HIGH-CONVICTION TRADES (AUTO 3-STEP TRIAGE):</b>")
+        for idx, p in enumerate(top_two, 1):
+            lines.append(
+                f"{idx}. <b>{html.escape(p['Symbol'])} ({p['Side']})</b> "
+                f"👉 Entry: <code>₹{p['Entry']:.1f}</code> | Qty: <code>{p['Qty']}</code> "
+                f"| Cap: <code>₹{p['Capital']:,}</code> | Risk: <code>₹{p['RiskRs']:,}</code> "
+                f"| SL: <code>{p['Stop']:.1f}</code> | T1-50%: <code>{p['T1']:.1f}</code> | Tgt: <code>{p['Target']:.1f}</code> "
+                f"| Flow: <code>{html.escape(p['Flow'].strip())}</code> | <b>Score: {p['Score']:.1f}</b>"
+            )
+
     lines.append(
-        f"{'TOTAL':<10}|"
-        f"{'Top ' + str(len(basket)):>6}|"
-        f"{port_sum['total_capital']:>8d}|"
-        f"{'1:2.5 RR':>8}|"
-        f"{'Locked':>8}|"
-        f"{-port_sum['total_risk']:>8d}|"
-        f"{'+' + str(port_sum['total_profit_25r']):>9}"
+        "\n💡 <i>Score = (ExpR×100) + Win% | Flow: LB/SB/SC/LU = NSE OI Spurts, VL = Cash Volume Surge</i>"
     )
-    lines.append("</pre>")
-    lines.append(
-        f"📌 <b>Portfolio Summary:</b> Deploy <code>₹{port_sum['total_capital']:,}</code> "
-        f"(Buffer Left: <code>₹{port_sum['unused_cash']:,}</code>) | "
-        f"Combined SL: <code>-₹{port_sum['total_risk']:,}</code> | "
-        f"Full Target (2.5R): <code>+₹{port_sum['total_profit_25r']:,}</code> "
-        f"<i>(or <code>+₹{port_sum['total_profit_blended']:,}</code> with T1 50% booking)</i>\n"
-        f"✅ <i>⭐GRADE-A = EMA(21/50) Pullback + BB(38/61) Ribbon (7Y Proven: +2,208R)</i>"
-    )
+    return "\n".join(lines)
 
-    send_telegram("\n".join(lines))
+
+def send_telegram_alert(html_text: str):
+    if not TELEGRAM_BOT_TOKEN or ":" not in TELEGRAM_BOT_TOKEN:
+        print(html_text)
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": html_text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+    }
+    r = requests.post(url, json=payload, timeout=15)
+    if r.status_code == 200:
+        print("✅ Telegram notification delivered successfully!")
+    else:
+        print(f"❌ Telegram API Error ({r.status_code}): {r.text}")
+
+
+# ==============================================================================
+# 🚀 9. MAIN EXECUTION ENGINE
+# ==============================================================================
+def main():
+    ist = pytz.timezone("Asia/Kolkata")
+    now_ist = datetime.now(ist)
+    now_str = now_ist.strftime("%d-%b %I:%M %p IST")
+    current_minutes = now_ist.hour * 60 + now_ist.minute
+
+    if EVENT_NAME == "schedule":
+        if now_ist.weekday() >= 5 or current_minutes < (9 * 60 + 15) or current_minutes > (15 * 60 + 45):
+            print(f"⏸️ Outside Indian Market Hours ({now_str}). Exiting.")
+            return
+
+    oi_spurts_map = fetch_nse_oi_spurts_map()
+    all_tickers = list(INDEX_UNIVERSE.keys()) + STOCK_UNIVERSE
+    messages_sent = 0
+
+    # ------------------------------------------------------------------
+    # 1. INTRADAY 15-MINUTE SCALPS (BUY & SHORT | CLOSED CANDLES | 1:2.0 RR)
+    # ------------------------------------------------------------------
+    raw_15m = yf.download(all_tickers, period="60d", interval="15m", group_by="ticker", progress=False)
+    intra_idx_cands, intra_stk_cands = [], []
+
+    # 1A. Evaluate Major Indices on 15m
+    for tk, idx_name in INDEX_UNIVERSE.items():
+        df15_raw = extract_ticker_df(raw_15m, tk)
+        df15 = get_closed_bar_slice(df15_raw, is_intraday=True)
+        if len(df15) < 80:
+            continue
+        df15 = compute_intraday_15m_indicators(df15, is_index=True)
+        last = df15.iloc[-1]
+
+        today_bars = df15[df15.index.date == last.name.date()]
+        day_open = float(today_bars["Open"].iloc[0]) if not today_bars.empty else float(last["Open"])
+        price_chg_pct = ((float(last["Close"]) - day_open) / day_open) * 100.0
+        oi_chg_pct = oi_spurts_map.get(idx_name, 0.0)
+        rvol = float(last.get("RVOL", 1.0))
+
+        side = "BUY" if float(last["Close"]) >= float(last["TREND_ANCHOR"]) else "SHORT"
+        is_blocked, is_boosted, flow_tag = classify_hybrid_flow(price_chg_pct, oi_chg_pct, rvol, side)
+        tot, exp_r, wp = backtest_cash_signals(df15, side, INTRA_ATR_SL_MULT, INTRA_RR, INTRA_MAX_BARS, True)
+        if tot >= 5:
+            row = build_index_regime_row(idx_name, df15, side, True, flow_tag, exp_r, wp)
+            intra_idx_cands.append((1 if is_boosted else 0, row["Score"], row))
+
+    # 1B. Evaluate Stocks on 15m
+    for tk in STOCK_UNIVERSE:
+        sym = tk.replace(".NS", "")
+        df15_raw = extract_ticker_df(raw_15m, tk)
+        df15 = get_closed_bar_slice(df15_raw, is_intraday=True)
+        if len(df15) < 80:
+            continue
+        df15 = compute_intraday_15m_indicators(df15, is_index=False)
+        last = df15.iloc[-1]
+        prev = df15.iloc[-2]
+
+        today_bars = df15[df15.index.date == last.name.date()]
+        day_open = float(today_bars["Open"].iloc[0]) if not today_bars.empty else float(last["Open"])
+        price_chg_pct = ((float(last["Close"]) - day_open) / day_open) * 100.0
+        oi_chg_pct = oi_spurts_map.get(sym, 0.0)
+        rvol = float(last.get("RVOL", 1.0))
+
+        side = "BUY" if float(last["Close"]) >= float(last["TREND_ANCHOR"]) else "SHORT"
+        sig_col = "BUY_Signal" if side == "BUY" else "SHORT_Signal"
+        is_blocked, is_boosted, flow_tag = classify_hybrid_flow(price_chg_pct, oi_chg_pct, rvol, side)
+
+        if is_blocked:
+            continue
+        if not (bool(last[sig_col]) or bool(prev[sig_col]) or is_boosted):
+            continue
+
+        tot, exp_r, wp = backtest_cash_signals(df15, side, INTRA_ATR_SL_MULT, INTRA_RR, INTRA_MAX_BARS, True)
+        if tot >= INTRA_MIN_SETUPS and exp_r >= INTRA_MIN_EXP_R:
+            row = build_stock_trade_row(sym, df15, side, True, flow_tag, is_boosted, exp_r, wp)
+            if row:
+                intra_stk_cands.append((row["FlowBoost"], row["Score"], row))
+
+    intra_idx_cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    intra_stk_cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    intra_idx_rows = [x[2] for x in intra_idx_cands]
+    intra_stk_rows = [x[2] for x in intra_stk_cands[:TOP_N_STOCKS]]
+
+    if intra_idx_rows or intra_stk_rows:
+        msg = format_swing_report(
+            intra_idx_rows, intra_stk_rows, "15M INTRADAY STOCK SCALPS (LOCKED 1:2.0 RR)", now_str, len(oi_spurts_map), is_intraday=True
+        )
+        send_telegram_alert(msg)
+        messages_sent += 1
+
+    # ------------------------------------------------------------------
+    # 2. POSITIONAL 3-5D CASH SWINGS (LONG-ONLY DELIVERY | LOCKED 1:2.5 RR)
+    # ------------------------------------------------------------------
+    raw_1d = yf.download(all_tickers, period="5y", interval="1d", group_by="ticker", progress=False)
+    swing_idx_cands, swing_stk_cands = [], []
+
+    # 2A. Evaluate Major Indices on 1D
+    for tk, idx_name in INDEX_UNIVERSE.items():
+        df1d_raw = extract_ticker_df(raw_1d, tk)
+        df1d = get_closed_bar_slice(df1d_raw, is_intraday=False)
+        if len(df1d) < 200:
+            continue
+        df1d = compute_daily_swing_indicators(df1d, is_index=True)
+        last = df1d.iloc[-1]
+        prev = df1d.iloc[-2]
+
+        price_chg_pct = ((float(last["Close"]) - float(prev["Close"])) / float(prev["Close"])) * 100.0
+        oi_chg_pct = oi_spurts_map.get(idx_name, 0.0)
+        rvol = float(last.get("RVOL", 1.0))
+
+        side = "BUY" if float(last["Close"]) >= float(last["EMA21"]) else "SHORT"
+        is_blocked, is_boosted, flow_tag = classify_hybrid_flow(price_chg_pct, oi_chg_pct, rvol, side)
+        tot, exp_r, wp = backtest_cash_signals(df1d, side, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False)
+        if tot >= 5:
+            row = build_index_regime_row(idx_name, df1d, side, False, flow_tag, exp_r, wp)
+            swing_idx_cands.append((1 if is_boosted else 0, row["Score"], row))
+
+    # 2B. Evaluate Cash Stocks on 1D (Long-Only Delivery for Kotak Neo GTT)
+    for tk in STOCK_UNIVERSE:
+        sym = tk.replace(".NS", "")
+        df1d_raw = extract_ticker_df(raw_1d, tk)
+        df1d = get_closed_bar_slice(df1d_raw, is_intraday=False)
+        if len(df1d) < 200:
+            continue
+        df1d = compute_daily_swing_indicators(df1d, is_index=False)
+        last = df1d.iloc[-1]
+        prev = df1d.iloc[-2]
+
+        # Positional Cash Swings are Long-Only (BUY)
+        if float(last["Close"]) < float(last["EMA21"]):
+            continue
+
+        price_chg_pct = ((float(last["Close"]) - float(prev["Close"])) / float(prev["Close"])) * 100.0
+        oi_chg_pct = oi_spurts_map.get(sym, 0.0)
+        rvol = float(last.get("RVOL", 1.0))
+
+        side = "BUY"
+        is_blocked, is_boosted, flow_tag = classify_hybrid_flow(price_chg_pct, oi_chg_pct, rvol, side)
+
+        if is_blocked:
+            continue
+        if not (bool(last["BUY_Signal"]) or bool(prev["BUY_Signal"]) or is_boosted):
+            continue
+
+        tot, exp_r, wp = backtest_cash_signals(df1d, side, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False)
+        if tot >= SWING_MIN_SETUPS and exp_r >= SWING_MIN_EXP_R:
+            row = build_stock_trade_row(sym, df1d, side, False, flow_tag, is_boosted, exp_r, wp)
+            if row:
+                swing_stk_cands.append((row["FlowBoost"], row["Score"], row))
+
+    swing_idx_cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    swing_stk_cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
+
+    swing_idx_rows = [x[2] for x in swing_idx_cands]
+    swing_stk_rows = [x[2] for x in swing_stk_cands[:TOP_N_STOCKS]]
+
+    if swing_idx_rows or swing_stk_rows:
+        msg = format_swing_report(
+            swing_idx_rows, swing_stk_rows, "3-5D POSITIONAL CASH SWINGS (LOCKED 1:2.5 RR)", now_str, len(oi_spurts_map), is_intraday=False
+        )
+        send_telegram_alert(msg)
+        messages_sent += 1
+
+    if messages_sent == 0:
+        fallback_msg = (
+            f"<b>ℹ️ SWING SCANNER ({html.escape(now_str)})</b>\n"
+            f"Scanner ran cleanly (Scraped {len(oi_spurts_map)} NSE OI records), "
+            f"but no setups passed the strict risk &amp; positive ExpR filters."
+        )
+        send_telegram_alert(fallback_msg)
 
 
 if __name__ == "__main__":
-    top_signals, ts = scan_market()
-    publish(top_signals, ts)
+    main()
