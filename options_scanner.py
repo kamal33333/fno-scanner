@@ -40,9 +40,9 @@ MAX_CAPITAL_PER_TRADE  = 45000    # Strict Max Option Premium outlay (₹45,000 
 TOP_N_STOCKS           = 10       # Top 10 Stock Option setups per scan
 COST_SLIPPAGE_R        = 0.05     # 0.05R (~₹150) brokerage + STT + slippage deducted per trade
 
-# Expiry DTE Rules (Solves Gamma/Theta Trap!)
+# Expiry DTE Rules
 MIN_DTE_INTRADAY       = 4        # Minimum 4 DTE for Intraday Scalps (Avoids 0-2 DTE theta crush)
-MIN_DTE_POSITIONAL     = 15       # Minimum 15+ DTE (e.g., Nov 3 onwards) for Positional & Index Swings!
+MIN_DTE_POSITIONAL     = 15       # Minimum 15+ DTE for Positional & Index Swings
 
 # Intraday 15-Minute Scalp Parameters (Locked 1:2.0 Option RR, T1 at +1.0R)
 INTRA_OPT_RR           = 2.0      # Locked 1:2.0 Option Risk:Reward
@@ -65,83 +65,131 @@ SWING_MIN_EXP_R        = 0.02     # Minimum Net R-Expectancy after costs
 RISK_FREE_RATE         = 0.068
 
 # ==============================================================================
-# 📋 3. TRADABLE INDEX OPTIONS + LIQUID NSE F&O STOCKS (2026 LOT SIZES)
+# 📋 3. FULL REAL NSE/BSE SYMBOLS & VERIFIED 2026 LOT SIZES
 # ==============================================================================
+# exp_rule:
+#   - "NSE_WEEKLY_TUE": NIFTY (has weekly Tuesdays + monthly last Tuesday)
+#   - "NSE_MONTHLY_TUE": All NSE Stock Options + BANKNIFTY/FINNIFTY/MIDCPNIFTY (Last Tuesday of Month)
+#   - "BSE_WEEKLY_THU": SENSEX (Weekly Thursdays + monthly last Thursday)
 FNO_UNIVERSE = {
-    # --- 5 LIQUID TRADABLE INDIAN INDEX OPTIONS ---
-    "^NSEI":                 {"name": "NIFTY",     "nse": "NIFTY",      "lot": 65,   "step": 50,  "is_idx": True,  "dhan_id": 13,  "dhan_seg": "IDX_I"},
-    "^NSEBANK":              {"name": "BANKNIF",   "nse": "BANKNIFTY",  "lot": 30,   "step": 100, "is_idx": True,  "dhan_id": 25,  "dhan_seg": "IDX_I"},
-    "^BSESN":                {"name": "SENSEX",    "nse": "SENSEX",     "lot": 20,   "step": 100, "is_idx": True,  "dhan_id": 51,  "dhan_seg": "IDX_I"},
-    "NIFTY_MID_SELECT.NS":   {"name": "MIDCPNI",   "nse": "MIDCPNIFTY", "lot": 120,  "step": 25,  "is_idx": True,  "dhan_id": 442, "dhan_seg": "IDX_I"},
-    "NIFTY_FIN_SERVICE.NS":  {"name": "FINNIFT",   "nse": "FINNIFTY",   "lot": 65,   "step": 50,  "is_idx": True,  "dhan_id": 27,  "dhan_seg": "IDX_I"},
+    # --- 5 LIQUID TRADABLE INDIAN INDEX OPTIONS (FULL REAL NAMES) ---
+    "^NSEI":                 {"name": "NIFTY",      "nse": "NIFTY",      "lot": 65,   "step": 50,  "is_idx": True,  "dhan_id": 13,  "dhan_seg": "IDX_I", "exp_rule": "NSE_WEEKLY_TUE"},
+    "^NSEBANK":              {"name": "BANKNIFTY",  "nse": "BANKNIFTY",  "lot": 30,   "step": 100, "is_idx": True,  "dhan_id": 25,  "dhan_seg": "IDX_I", "exp_rule": "NSE_MONTHLY_TUE"},
+    "^BSESN":                {"name": "SENSEX",     "nse": "SENSEX",     "lot": 20,   "step": 100, "is_idx": True,  "dhan_id": 51,  "dhan_seg": "IDX_I", "exp_rule": "BSE_WEEKLY_THU"},
+    "NIFTY_MID_SELECT.NS":   {"name": "MIDCPNIFTY", "nse": "MIDCPNIFTY", "lot": 120,  "step": 25,  "is_idx": True,  "dhan_id": 442, "dhan_seg": "IDX_I", "exp_rule": "NSE_MONTHLY_TUE"},
+    "NIFTY_FIN_SERVICE.NS":  {"name": "FINNIFTY",   "nse": "FINNIFTY",   "lot": 65,   "step": 50,  "is_idx": True,  "dhan_id": 27,  "dhan_seg": "IDX_I", "exp_rule": "NSE_MONTHLY_TUE"},
 
-    # --- LIQUID NSE F&O STOCKS ---
-    "ETERNAL.NS":     {"name": "ETERNAL",  "nse": "ETERNAL",    "lot": 2000, "step": 5,   "is_idx": False},
-    "ANGELONE.NS":    {"name": "ANGELON",  "nse": "ANGELONE",   "lot": 200,  "step": 50,  "is_idx": False},
-    "TECHM.NS":       {"name": "TECHM",    "nse": "TECHM",      "lot": 600,  "step": 20,  "is_idx": False},
-    "FEDERALBNK.NS":  {"name": "FEDERAL",  "nse": "FEDERALBNK", "lot": 5000, "step": 2.5, "is_idx": False},
-    "WIPRO.NS":       {"name": "WIPRO",    "nse": "WIPRO",      "lot": 3000, "step": 2.5, "is_idx": False},
-    "LTF.NS":         {"name": "LTF",      "nse": "LTF",        "lot": 4462, "step": 2.5, "is_idx": False},
-    "CROMPTON.NS":    {"name": "CROMPTO",  "nse": "CROMPTON",   "lot": 1800, "step": 5,   "is_idx": False},
-    "PERSISTENT.NS":  {"name": "PERSIST",  "nse": "PERSISTENT", "lot": 100,  "step": 100, "is_idx": False},
-    "TCS.NS":         {"name": "TCS",      "nse": "TCS",        "lot": 175,  "step": 50,  "is_idx": False},
-    "OBEROIRLTY.NS":  {"name": "OBEROIR",  "nse": "OBEROIRLTY", "lot": 350,  "step": 20,  "is_idx": False},
-    "DIXON.NS":       {"name": "DIXON",    "nse": "DIXON",      "lot": 50,   "step": 200, "is_idx": False},
-    "DLF.NS":         {"name": "DLF",      "nse": "DLF",        "lot": 825,  "step": 10,  "is_idx": False},
-    "BHARTIARTL.NS":  {"name": "BHARTIA",  "nse": "BHARTIARTL", "lot": 475,  "step": 20,  "is_idx": False},
-    "AXISBANK.NS":    {"name": "AXISBNK",  "nse": "AXISBANK",   "lot": 625,  "step": 20,  "is_idx": False},
-    "KOTAKBANK.NS":   {"name": "KOTAKBK",  "nse": "KOTAKBANK",  "lot": 400,  "step": 20,  "is_idx": False},
-    "MARUTI.NS":      {"name": "MARUTI",   "nse": "MARUTI",     "lot": 50,   "step": 100, "is_idx": False},
-    "M&M.NS":         {"name": "M&M",      "nse": "M&M",        "lot": 175,  "step": 50,  "is_idx": False},
-    "LT.NS":          {"name": "LT",       "nse": "LT",         "lot": 150,  "step": 50,  "is_idx": False},
-    "INFY.NS":        {"name": "INFY",     "nse": "INFY",       "lot": 400,  "step": 20,  "is_idx": False},
-    "AUROPHARMA.NS":  {"name": "AUROPHA",  "nse": "AUROPHARMA", "lot": 550,  "step": 20,  "is_idx": False},
-    "ZYDUSLIFE.NS":   {"name": "ZYDUSLI",  "nse": "ZYDUSLIFE",  "lot": 900,  "step": 20,  "is_idx": False},
-    "RBLBANK.NS":     {"name": "RBLBANK",  "nse": "RBLBANK",    "lot": 2500, "step": 5,   "is_idx": False},
-    "CONCOR.NS":      {"name": "CONCOR",   "nse": "CONCOR",     "lot": 1000, "step": 10,  "is_idx": False},
-    "VOLTAS.NS":      {"name": "VOLTAS",   "nse": "VOLTAS",     "lot": 375,  "step": 20,  "is_idx": False},
-    "TITAN.NS":       {"name": "TITAN",    "nse": "TITAN",      "lot": 175,  "step": 50,  "is_idx": False},
-    "ABB.NS":         {"name": "ABB",      "nse": "ABB",        "lot": 125,  "step": 100, "is_idx": False},
-    "RELIANCE.NS":    {"name": "RELIANC",  "nse": "RELIANCE",   "lot": 500,  "step": 20,  "is_idx": False},
-    "HDFCBANK.NS":    {"name": "HDFCBNK",  "nse": "HDFCBANK",   "lot": 550,  "step": 20,  "is_idx": False},
-    "ICICIBANK.NS":   {"name": "ICICIBK",  "nse": "ICICIBANK",  "lot": 700,  "step": 20,  "is_idx": False},
-    "SBIN.NS":        {"name": "SBIN",     "nse": "SBIN",       "lot": 750,  "step": 10,  "is_idx": False},
-    "TATASTEEL.NS":   {"name": "TATASTE",  "nse": "TATASTEEL",  "lot": 5500, "step": 2.5, "is_idx": False},
-    "BAJFINANCE.NS":  {"name": "BAJFINA",  "nse": "BAJFINANCE", "lot": 125,  "step": 100, "is_idx": False},
-    "HAL.NS":         {"name": "HAL",      "nse": "HAL",        "lot": 150,  "step": 50,  "is_idx": False},
-    "BEL.NS":         {"name": "BEL",      "nse": "BEL",        "lot": 2850, "step": 5,   "is_idx": False},
-    "TRENT.NS":       {"name": "TRENT",    "nse": "TRENT",      "lot": 100,  "step": 100, "is_idx": False},
-    "CAMS.NS":        {"name": "CAMS",     "nse": "CAMS",       "lot": 150,  "step": 50,  "is_idx": False},
-    "NTPC.NS":        {"name": "NTPC",     "nse": "NTPC",       "lot": 1500, "step": 5,   "is_idx": False},
-    "ADANIPORTS.NS":  {"name": "ADANIPO",  "nse": "ADANIPORTS", "lot": 400,  "step": 20,  "is_idx": False},
-    "INDHOTEL.NS":    {"name": "INDHOTE",  "nse": "INDHOTEL",   "lot": 1000, "step": 10,  "is_idx": False},
-    "MOTHERSON.NS":   {"name": "MOTHERS",  "nse": "MOTHERSON",  "lot": 4100, "step": 2.5, "is_idx": False},
-    "NYKAA.NS":       {"name": "NYKAA",    "nse": "NYKAA",      "lot": 3125, "step": 5,   "is_idx": False},
-    "SUPREMEIND.NS":  {"name": "SUPREME",  "nse": "SUPREMEIND", "lot": 175,  "step": 50,  "is_idx": False},
+    # --- LIQUID NSE F&O STOCKS (FULL REAL OFFICIAL NSE SYMBOLS, MONTHLY EXPIRY ONLY) ---
+    "ETERNAL.NS":     {"name": "ETERNAL",    "nse": "ETERNAL",    "lot": 2000, "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ANGELONE.NS":    {"name": "ANGELONE",   "nse": "ANGELONE",   "lot": 200,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "TECHM.NS":       {"name": "TECHM",      "nse": "TECHM",      "lot": 600,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "FEDERALBNK.NS":  {"name": "FEDERALBNK", "nse": "FEDERALBNK", "lot": 5000, "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "WIPRO.NS":       {"name": "WIPRO",      "nse": "WIPRO",      "lot": 3000, "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "LTF.NS":         {"name": "LTF",        "nse": "LTF",        "lot": 4462, "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "CROMPTON.NS":    {"name": "CROMPTON",   "nse": "CROMPTON",   "lot": 1800, "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "PERSISTENT.NS":  {"name": "PERSISTENT", "nse": "PERSISTENT", "lot": 100,  "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "TCS.NS":         {"name": "TCS",        "nse": "TCS",        "lot": 175,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "OBEROIRLTY.NS":  {"name": "OBEROIRLTY", "nse": "OBEROIRLTY", "lot": 350,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "DIXON.NS":       {"name": "DIXON",      "nse": "DIXON",      "lot": 50,   "step": 200, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "DLF.NS":         {"name": "DLF",        "nse": "DLF",        "lot": 825,  "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "BHARTIARTL.NS":  {"name": "BHARTIARTL", "nse": "BHARTIARTL", "lot": 475,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "AXISBANK.NS":    {"name": "AXISBANK",   "nse": "AXISBANK",   "lot": 625,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "KOTAKBANK.NS":   {"name": "KOTAKBANK",  "nse": "KOTAKBANK",  "lot": 400,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "MARUTI.NS":      {"name": "MARUTI",     "nse": "MARUTI",     "lot": 50,   "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "M&M.NS":         {"name": "M&M",        "nse": "M&M",        "lot": 175,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "LT.NS":          {"name": "LT",         "nse": "LT",         "lot": 150,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "INFY.NS":        {"name": "INFY",       "nse": "INFY",       "lot": 400,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "AUROPHARMA.NS":  {"name": "AUROPHARMA", "nse": "AUROPHARMA", "lot": 550,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ZYDUSLIFE.NS":   {"name": "ZYDUSLIFE",  "nse": "ZYDUSLIFE",  "lot": 900,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "RBLBANK.NS":     {"name": "RBLBANK",    "nse": "RBLBANK",    "lot": 2500, "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "CONCOR.NS":      {"name": "CONCOR",     "nse": "CONCOR",     "lot": 1000, "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "VOLTAS.NS":      {"name": "VOLTAS",     "nse": "VOLTAS",     "lot": 375,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "TITAN.NS":       {"name": "TITAN",      "nse": "TITAN",      "lot": 175,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ABB.NS":         {"name": "ABB",        "nse": "ABB",        "lot": 125,  "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "RELIANCE.NS":    {"name": "RELIANCE",   "nse": "RELIANCE",   "lot": 500,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "HDFCBANK.NS":    {"name": "HDFCBANK",   "nse": "HDFCBANK",   "lot": 550,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ICICIBANK.NS":   {"name": "ICICIBANK",  "nse": "ICICIBANK",  "lot": 700,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "SBIN.NS":        {"name": "SBIN",       "nse": "SBIN",       "lot": 750,  "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "TATASTEEL.NS":   {"name": "TATASTEEL",  "nse": "TATASTEEL",  "lot": 5500, "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "BAJFINANCE.NS":  {"name": "BAJFINANCE", "nse": "BAJFINANCE", "lot": 125,  "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "HAL.NS":         {"name": "HAL",        "nse": "HAL",        "lot": 150,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "BEL.NS":         {"name": "BEL",        "nse": "BEL",        "lot": 2850, "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "TRENT.NS":       {"name": "TRENT",      "nse": "TRENT",      "lot": 100,  "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "CAMS.NS":        {"name": "CAMS",       "nse": "CAMS",       "lot": 150,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "NTPC.NS":        {"name": "NTPC",       "nse": "NTPC",       "lot": 1500, "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ADANIPORTS.NS":  {"name": "ADANIPORTS", "nse": "ADANIPORTS", "lot": 400,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "INDHOTEL.NS":    {"name": "INDHOTEL",   "nse": "INDHOTEL",   "lot": 1000, "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "MOTHERSON.NS":   {"name": "MOTHERSON",  "nse": "MOTHERSON",  "lot": 4100, "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "NYKAA.NS":       {"name": "NYKAA",      "nse": "NYKAA",      "lot": 3125, "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "SUPREMEIND.NS":  {"name": "SUPREMEIND", "nse": "SUPREMEIND", "lot": 175,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
 }
 
 # ==============================================================================
-# 🗓️ 4. FAR-EXPIRY (15+ DTE) CALCULATOR & DHAN API v2 CLIENT
+# 🗓️ 4. EXCHANGE-ACCURATE EXPIRY ENGINE (MONTHLY STOCKS vs WEEKLY INDICES)
 # ==============================================================================
-def get_target_expiry_and_dte(min_dte: int = 15) -> tuple[int, str]:
+def _last_weekday_of_month(year: int, month: int, target_weekday: int) -> date:
     """
-    Finds the next Tuesday/Thursday F&O expiry that is at least `min_dte` calendar days out
-    (e.g., from Oct 19, min_dte=15 selects Nov 3 / Nov 5 onwards) for fallback pricing.
+    Returns the exact last Tuesday (weekday=1) or last Thursday (weekday=3) of a given month.
+    """
+    cal = calendar.monthcalendar(year, month)
+    days = [week[target_weekday] for week in cal if week[target_weekday] != 0]
+    return date(year, month, days[-1])
+
+
+def get_exchange_accurate_expiry(meta: dict, min_dte: int) -> tuple[int, str]:
+    """
+    Calculates the TRUE NSE/BSE expiry date for any instrument:
+      1. NSE Stock Options + BANKNIFTY/FINNIFTY/MIDCPNIFTY ("NSE_MONTHLY_TUE"):
+         ONLY expire on the LAST TUESDAY of the month (e.g., 27OCT, 24NOV, 29DEC).
+         Never assigns fake weekly expiries (like 03NOV) to stocks!
+      2. NIFTY ("NSE_WEEKLY_TUE"):
+         Expires every Tuesday (e.g., 27OCT, 03NOV, 10NOV, 17NOV, 24NOV).
+      3. SENSEX ("BSE_WEEKLY_THU"):
+         Expires every Thursday (e.g., 22OCT, 29OCT, 05NOV, 12NOV, 19NOV, 26NOV).
     """
     ist = pytz.timezone("Asia/Kolkata")
     today = datetime.now(ist).date()
-    target_date = today + timedelta(days=min_dte)
-    while target_date.weekday() not in (1, 3):
-        target_date += timedelta(days=1)
-    dte = max((target_date - today).days, min_dte)
-    exp_tag = target_date.strftime("%d%b").upper()
-    return dte, exp_tag
+    rule = meta.get("exp_rule", "NSE_MONTHLY_TUE")
+
+    if rule == "NSE_MONTHLY_TUE":
+        # Check current month, next month, and month+2 for the first Last-Tuesday >= min_dte
+        y, m = today.year, today.month
+        for _ in range(4):
+            exp_dt = _last_weekday_of_month(y, m, calendar.TUESDAY)
+            dte = (exp_dt - today).days
+            if dte >= min_dte:
+                return dte, exp_dt.strftime("%d%b").upper()
+            # Advance to next month
+            m += 1
+            if m > 12:
+                m = 1
+                y += 1
+
+    elif rule == "NSE_WEEKLY_TUE":
+        # Weekly Tuesday expiry (NIFTY) >= min_dte
+        target_dt = today + timedelta(days=min_dte)
+        while target_dt.weekday() != calendar.TUESDAY:
+            target_dt += timedelta(days=1)
+        dte = (target_dt - today).days
+        return dte, target_dt.strftime("%d%b").upper()
+
+    elif rule == "BSE_WEEKLY_THU":
+        # Weekly Thursday expiry (SENSEX) >= min_dte
+        target_dt = today + timedelta(days=min_dte)
+        while target_dt.weekday() != calendar.THURSDAY:
+            target_dt += timedelta(days=1)
+        dte = (target_dt - today).days
+        return dte, target_dt.strftime("%d%b").upper()
+
+    # Default fallback: Last Tuesday of next month
+    exp_dt = _last_weekday_of_month(today.year, today.month, calendar.TUESDAY)
+    return max((exp_dt - today).days, min_dte), exp_dt.strftime("%d%b").upper()
 
 
 class DhanOptionEngine:
     """
     Fetches live Option Chain from Dhan v2 API and specifically selects the first
-    expiry that meets `min_dte` (e.g., >= 15 days out for Positional & Far Index options).
+    official exchange expiry that meets `min_dte`.
     """
     def __init__(self, client_id: str, access_token: str):
         self.client_id = client_id
@@ -327,10 +375,6 @@ def classify_institutional_oi(price_chg_pct: float, oi_chg_pct: float, opt_type:
 # 📈 6. ZERO-REPAINTING DATA SLICER, INDICATORS & BLACK-SCHOLES GREEKS
 # ==============================================================================
 def get_closed_bar_slice(df: pd.DataFrame, is_intraday: bool) -> pd.DataFrame:
-    """
-    For 15m intraday: drops forming bar during 09:15-15:30 IST.
-    For 1D positional: only drops forming daily bar before 14:15 IST (after 2:15 PM, uses today's candle).
-    """
     if df.empty or len(df) < 30:
         return df
     ist = pytz.timezone("Asia/Kolkata")
@@ -578,7 +622,7 @@ def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, i
 
 
 # ==============================================================================
-# 💰 8. OPTION TRADE BUILDER (WITH CAPITAL + QUALITY SCORE CALCULATION)
+# 💰 8. OPTION TRADE BUILDER (FULL REAL NAMES + EXCHANGE-ACCURATE EXPIRY)
 # ==============================================================================
 def build_option_trade_row(
     meta, df, opt_type, total_trades, expectancy, win_pct, india_vix, is_intraday, oi_tag, is_oi_boosted, dhan_engine: DhanOptionEngine
@@ -601,7 +645,7 @@ def build_option_trade_row(
         exp_tag    = dhan_quote["exp_tag"]
         src_flag   = "*"
     else:
-        dte, exp_tag = get_target_expiry_and_dte(min_dte=min_dte_req)
+        dte, exp_tag = get_exchange_accurate_expiry(meta, min_dte=min_dte_req)
         iv = india_vix * 1.12 if meta["is_idx"] else max(hv20 * 1.05, india_vix * 1.35)
         opt_entry, delta, gamma = black_scholes_greeks(
             S=spot, K=atm_strike, T=dte / 365.0, r=RISK_FREE_RATE, sigma=iv, option_type=opt_type
@@ -627,7 +671,6 @@ def build_option_trade_row(
     opt_t1 = round(opt_entry + (actual_risk * t1_rr), 1)
     opt_tgt = round(opt_entry + (actual_risk * target_rr), 1)
 
-    # Use verified 2026 NSE lot size from FNO_UNIVERSE
     lot_size = meta["lot"]
     risk_per_lot = max(actual_risk * lot_size, 1.0)
     cost_per_lot = max(opt_entry * lot_size, 1.0)
@@ -644,13 +687,15 @@ def build_option_trade_row(
     capital = int(round(opt_entry * qty))
     total_rupee_risk = int(round(actual_risk * qty))
 
-    # Institutional Quality Score = (ExpR * 100) + Win%
     exp_rounded = round(expectancy, 2)
     win_rounded = round(win_pct, 1)
     quality_score = round((exp_rounded * 100.0) + win_rounded, 1)
 
+    # Full Real NSE/BSE Symbol + Strike + Option Type (Zero Truncation!)
+    full_contract_name = f"{src_flag}{meta['nse']} {strike_str}{opt_type}"
+
     return {
-        "Contract": f"{src_flag}{meta['name'][:7]} {strike_str}{opt_type}",
+        "Contract": full_contract_name,
         "Expiry": exp_tag,
         "Entry": opt_entry,
         "Qty": qty,
@@ -664,23 +709,21 @@ def build_option_trade_row(
         "WinProb": win_rounded,
         "Score": quality_score,
         "OIBoost": 1 if is_oi_boosted else 0,
-        "OptType": opt_type,
-        "IsIdx": meta["is_idx"],
     }
 
 
 # ==============================================================================
-# 📱 9. TABLE FORMATTER (WITH Cap(₹), Score & AUTO TOP-2 TRIAGE PICKS)
+# 📱 9. TABLE FORMATTER (19-CHAR FULL CONTRACT NAMES + Cap(₹) + Score)
 # ==============================================================================
 def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine: DhanOptionEngine, oi_count: int):
     if dhan_engine.enabled and dhan_engine.live_quotes_fetched > 0:
         feed_str = f"Dhan Live ({dhan_engine.live_quotes_fetched}) + NSE OI ({oi_count})"
     else:
-        feed_str = f"NSE OI ({oi_count}) + BS Model (15+ DTE)"
+        feed_str = f"NSE OI ({oi_count}) + Exchange Calendar BS"
 
-    # Includes both Cap(₹) and Score columns in pure fixed-width ASCII
+    # 19-char Contract column ensures full real names like BAJFINANCE 1000PE or MIDCPNIFTY 13575PE never get cut off!
     col_hdr = (
-        f"{'Contract':<14}|{'Exp':>5}|{'Entry':>6}|{'Qty':>4}|{'Cap(₹)':>6}|"
+        f"{'Contract':<19}|{'Exp':>5}|{'Entry':>6}|{'Qty':>4}|{'Cap(₹)':>6}|"
         f"{'SL':>6}|{'T1-50%':>6}|{'Target':>6}|{'OI_Flow':>7}|{'ExpR':>5}|{'Win%':>5}|{'Score':>5}"
     )
     sep = "-" * len(col_hdr)
@@ -697,8 +740,8 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
         lines.append(sep)
         for r in idx_records:
             row_str = (
-                f"{r['Contract'][:14]:<14}|"
-                f"{r['Expiry'][:5]:>5}|"
+                f"{r['Contract']:<19}|"
+                f"{r['Expiry']:>5}|"
                 f"{r['Entry']:>6.1f}|"
                 f"{r['Qty']:>4d}|"
                 f"{r['Capital']:>6d}|"
@@ -720,8 +763,8 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
         lines.append(sep)
         for r in stk_records[:TOP_N_STOCKS]:
             row_str = (
-                f"{r['Contract'][:14]:<14}|"
-                f"{r['Expiry'][:5]:>5}|"
+                f"{r['Contract']:<19}|"
+                f"{r['Expiry']:>5}|"
                 f"{r['Entry']:>6.1f}|"
                 f"{r['Qty']:>4d}|"
                 f"{r['Capital']:>6d}|"
@@ -740,7 +783,6 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
     # 🏆 AUTO 3-STEP TRIAGE: HIGHLIGHT TOP 2 BEST TRADES AUTOMATICALLY
     # ------------------------------------------------------------------
     all_cands = list(idx_records) + list(stk_records[:TOP_N_STOCKS])
-    # Filter by Step 1 (ExpR >= 0.08 & Win% >= 48%) and Step 2 (Active OI Boost preferred)
     prime_picks = [
         r for r in all_cands
         if r["Expectancy"] >= 0.08 and r["WinProb"] >= 48.0 and r["OIBoost"] == 1
@@ -763,7 +805,7 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
             )
 
     lines.append(
-        "\n💡 <i>Score = (ExpR×100) + Win% | Cap(₹) = Entry×Qty | LB=Long Build, SB=Short Build, SC=Short Cover</i>"
+        "\n💡 <i>Score = (ExpR×100) + Win% | Stocks = Monthly Expiry Only (27OCT / 24NOV) | LB=Long Build, SB=Short Build</i>"
     )
     return "\n".join(lines)
 
@@ -859,7 +901,6 @@ def main():
             if tot >= INTRA_MIN_SETUPS and exp_r >= INTRA_MIN_EXP_R:
                 intra_stk.append((q_score, is_boosted, meta, df15, opt_type, tot, exp_r, wp, oi_tag))
 
-    # Sort primarily by OI Alignment + Quality Score
     intra_idx.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
     intra_stk.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
 
@@ -884,7 +925,7 @@ def main():
         messages_sent += 1
 
     # ------------------------------------------------------------------
-    # 2. POSITIONAL 3-5D F&O SWINGS (15+ DTE FAR EXPIRY: NOV 3 ONWARDS!)
+    # 2. POSITIONAL 3-5D F&O SWINGS (15+ DTE FAR EXPIRY: 24NOV FOR STOCKS!)
     # ------------------------------------------------------------------
     raw_1d = yf.download(tickers, period="5y", interval="1d", group_by="ticker", progress=False)
     swing_idx, swing_stk = [], []
@@ -920,7 +961,6 @@ def main():
             if tot >= SWING_MIN_SETUPS and exp_r >= SWING_MIN_EXP_R:
                 swing_stk.append((q_score, is_boosted, meta, df1d, opt_type, tot, exp_r, wp, oi_tag))
 
-    # Sort primarily by OI Alignment + Quality Score
     swing_idx.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
     swing_stk.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
 
