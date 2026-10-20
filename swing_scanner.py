@@ -768,9 +768,10 @@ def main():
                     if row:
                         swing_short_cands.append((row["FlowBoost"], row["Score"], row))
 
+    # FIXED SYNTAX HERE:
     swing_idx_cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    swing_buy_cands.sort(key=lambda x: (x[0], x[1], reverse=True))
-    swing_short_cands.sort(key=lambda x: (x[0], x[1], reverse=True))
+    swing_buy_cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    swing_short_cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
     swing_idx_rows = [x[2] for x in swing_idx_cands]
     swing_buy_rows = [x[2] for x in swing_buy_cands[:TOP_N_STOCKS]]
