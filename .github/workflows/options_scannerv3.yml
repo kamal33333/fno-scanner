@@ -1,4 +1,4 @@
-name: F&O Options Scanner v2
+name: F&O Options Scanner v3
 
 on:
   schedule:
@@ -9,7 +9,7 @@ on:
 
 # Never let two runs overlap - they share the state file (de-dup + open-signal tracking).
 concurrency:
-  group: fno-scanner-v2
+  group: fno-scanner-v3
   cancel-in-progress: false
 
 permissions:
@@ -40,10 +40,10 @@ jobs:
       - name: Restore scanner state
         uses: actions/cache/restore@v4
         with:
-          path: scanner_state_v2.json
-          key: fno-v2-state-${{ github.run_id }}
+          path: scanner_state_v3.json
+          key: fno-v3-state-${{ github.run_id }}
           restore-keys: |
-            fno-v2-state-
+            fno-v3-state-
 
       - name: Run scanner
         env:
@@ -51,7 +51,7 @@ jobs:
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
           DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
-          SCANNER_STATE_FILE: scanner_state_v2.json
+          SCANNER_STATE_FILE: scanner_state_v3.json
           # ---- optional tuning (defaults shown in the script; uncomment to override) ----
           # RISK_PER_TRADE: "3000"
           # MAX_CAPITAL_PER_TRADE: "45000"
@@ -62,11 +62,11 @@ jobs:
           # NSE_EXPIRY_WEEKDAY: "1"
           # NSE_HOLIDAYS: "2026-11-09,2026-11-24"
           # SKIP_SYMBOLS: "ANGELONE,NYKAA"
-        run: python options_scannerv2.py
+        run: python options_scannerv3.py
 
       - name: Save scanner state
         if: always()
         uses: actions/cache/save@v4
         with:
-          path: scanner_state_v2.json
-          key: fno-v2-state-${{ github.run_id }}
+          path: scanner_state_v3.json
+          key: fno-v3-state-${{ github.run_id }}
