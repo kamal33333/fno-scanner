@@ -1,6 +1,5 @@
 import os
 import re
-import sys
 import time
 import html
 import warnings
@@ -30,15 +29,15 @@ TELEGRAM_CHAT_ID   = RAW_CHATID
 # ==============================================================================
 NSE_HOLIDAYS_2026 = {
     date(2026, 10, 2),   # Mahatma Gandhi Jayanti
-    date(2026, 10, 20),  # Dussehra (Market Holiday)
+    date(2026, 10, 20),  # Dussehra
     date(2026, 11, 10),  # Diwali - Balipratipada
     date(2026, 11, 24),  # Guru Nanak Jayanti
     date(2026, 12, 25),  # Christmas
 }
 
-RISK_PER_TRADE         = 1000     # Strict Max Rupee risk per trade (₹1,000 hard cap)
-MAX_CAPITAL_PER_TRADE  = 35000    # Strict Max Capital outlay per trade (₹35,000 hard cap)
-TOP_N_STOCKS           = 10       # Top 10 Stock setups per scan section
+RISK_PER_TRADE         = 1000     # Max Rupee risk per trade (₹1,000 hard cap)
+MAX_CAPITAL_PER_TRADE  = 35000    # Max Capital outlay per trade (₹35,000 hard cap)
+TOP_N_PER_SECTION      = 5        # Keep tables ultra-clean: Top 5 setups per section!
 COST_SLIPPAGE_R        = 0.05     # 0.05R deduction per backtest trade
 
 INTRA_RR               = 2.0
@@ -46,22 +45,20 @@ INTRA_T1_RR            = 1.0
 INTRA_ATR_SL_MULT      = 1.0
 INTRA_MAX_BARS         = 12
 INTRA_MIN_SETUPS       = 10
-INTRA_MIN_EXP_R        = 0.00
+INTRA_MIN_EXP_R        = 0.08     # Only show high-edge Intraday setups (ExpR >= +0.08)
 
 SWING_RR               = 2.5
 SWING_T1_RR            = 1.25
 SWING_ATR_SL_MULT      = 1.2
 SWING_MAX_DAYS         = 8
 SWING_MIN_SETUPS       = 10
-SWING_MIN_EXP_R        = 0.05
+SWING_MIN_EXP_R        = 0.08     # Only show high-edge Positional setups (ExpR >= +0.08)
 
 INDEX_UNIVERSE = {
     "^NSEI":                "NIFTY",
     "^NSEBANK":             "BANKNIFTY",
-    "^BSESN":               "SENSEX",
-    "NIFTY_MID_SELECT.NS":  "MIDCPNIFTY",
     "NIFTY_FIN_SERVICE.NS": "FINNIFTY",
-    "^CNXIT":               "NIFTYIT",
+    "NIFTY_MID_SELECT.NS":  "MIDCPNIFTY",
 }
 
 STOCK_UNIVERSE = [
@@ -105,7 +102,7 @@ STOCK_UNIVERSE = list(dict.fromkeys(STOCK_UNIVERSE))
 
 
 # ==============================================================================
-# 🕸️ 4. SCRAPERS & INDICATORS
+# 🕸️ 3. LIVE NSE OI SPURTS SCRAPER & HYBRID FLOW CLASSIFIER
 # ==============================================================================
 def fetch_nse_oi_spurts_map() -> dict:
     base_url = "https://www.nseindia.com"
@@ -166,6 +163,9 @@ def classify_hybrid_flow(price_chg_pct: float, oi_chg_pct: float, rvol: float, s
     return False, False, "   --  "
 
 
+# ==============================================================================
+# 📈 4. DATA SLICER, INDICATORS & BACKTEST ENGINE
+# ==============================================================================
 def get_closed_bar_slice(df: pd.DataFrame, is_intraday: bool) -> pd.DataFrame:
     if df.empty or len(df) < 30:
         return df
@@ -218,7 +218,7 @@ def extract_ticker_df(raw_data, ticker):
         return pd.DataFrame()
 
 
-def compute_daily_swing_indicators(df: pd.DataFrame, is_index: bool = False) -> pd.DataFrame:
+def compute_daily_swing_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     c = df["Close"]
     df["EMA21"] = c.ewm(span=21, adjust=False).mean()
@@ -405,46 +405,8 @@ def backtest_cash_signals(
     return total_trades, expectancy, win_pct
 
 
-def build_index_regime_row(sym: str, df: pd.DataFrame, side: str, is_intraday: bool, flow_tag: str, exp_r: float, win_pct: float):
-    latest = df.iloc[-1]
-    spot = round(float(latest["Close"]), 1)
-    atr = float(latest["ATR"])
-    atr_mult = INTRA_ATR_SL_MULT if is_intraday else SWING_ATR_SL_MULT
-    t1_rr = INTRA_T1_RR if is_intraday else SWING_T1_RR
-    full_rr = INTRA_RR if is_intraday else SWING_RR
-
-    risk_pts = max(round(atr * atr_mult, 1), 1.0)
-    if side == "BUY":
-        sl = round(spot - risk_pts, 1)
-        t1 = round(spot + risk_pts * t1_rr, 1)
-        tgt = round(spot + risk_pts * full_rr, 1)
-        regime = "BULL"
-    else:
-        sl = round(spot + risk_pts, 1)
-        t1 = round(spot - risk_pts * t1_rr, 1)
-        tgt = round(spot - risk_pts * full_rr, 1)
-        regime = "BEAR"
-
-    exp_rounded = round(exp_r, 2)
-    win_rounded = round(win_pct, 1)
-    score = round((exp_rounded * 100.0) + win_rounded, 1)
-
-    return {
-        "Index": sym,
-        "Bias": regime,
-        "Spot": spot,
-        "SL": sl,
-        "T1": t1,
-        "Target": tgt,
-        "Flow": flow_tag,
-        "ExpR": exp_rounded,
-        "WinProb": win_rounded,
-        "Score": score,
-    }
-
-
 def build_stock_trade_row(
-    sym: str, df: pd.DataFrame, side: str, is_intraday: bool, flow_tag: str, is_boosted: bool, exp_r: float, win_pct: float
+    sym: str, df: pd.DataFrame, side: str, is_intraday: bool, flow_tag: str, is_boosted: bool, exp_r: float, win_pct: float, horizon_tag: str
 ):
     latest = df.iloc[-1]
     entry = round(float(latest["Close"]), 1)
@@ -489,6 +451,7 @@ def build_stock_trade_row(
     return {
         "Symbol": sym,
         "Side": side,
+        "Horizon": horizon_tag,
         "Entry": entry,
         "Qty": qty,
         "Capital": capital,
@@ -504,96 +467,84 @@ def build_stock_trade_row(
     }
 
 
-def format_swing_report(idx_rows, stk_rows, title, section_subtitle, now_str, oi_count: int, is_intraday: bool):
-    feed_str = f"NSE OI ({oi_count}) + Cash RVOL"
-    rr_str = "1:2.0" if is_intraday else "1:2.5"
-
-    idx_hdr = (
-        f"{'Index':<11}|{'Bias':<4}|{'Spot':>7}|{'SL':>7}|{'T1-50%':>7}|"
-        f"{'Target':>7}|{'OI_Flow':>7}|{'ExpR':>5}|{'Win%':>5}|{'Score':>5}"
-    )
-    idx_sep = "-" * len(idx_hdr)
-
+# ==============================================================================
+# 📱 5. UNIFIED SINGLE-MESSAGE FORMATTER (SIMPLE, CLEAN & ACTIONABLE)
+# ==============================================================================
+def format_stock_table_block(rows):
     stk_hdr = (
         f"{'Symbol':<11}|{'Side':<5}|{'Entry':>6}|{'Qty':>4}|{'Cap(₹)':>6}|"
         f"{'SL':>6}|{'T1-50%':>6}|{'Target':>6}|{'Flow':>7}|{'ExpR':>5}|{'Win%':>5}|{'Score':>5}"
     )
     stk_sep = "-" * len(stk_hdr)
+    block = ["<pre>", stk_hdr, stk_sep]
+    for r in rows:
+        row_str = (
+            f"{r['Symbol']:<11}|"
+            f"{r['Side']:<5}|"
+            f"{r['Entry']:>6.1f}|"
+            f"{r['Qty']:>4d}|"
+            f"{r['Capital']:>6d}|"
+            f"{r['Stop']:>6.1f}|"
+            f"{r['T1']:>6.1f}|"
+            f"{r['Target']:>6.1f}|"
+            f"{r['Flow'][:7]:>7}|"
+            f"{r['Expectancy']:>+5.2f}|"
+            f"{r['WinProb']:>4.1f}%|"
+            f"{r['Score']:>5.1f}"
+        )
+        block.append(html.escape(row_str))
+    block.append("</pre>")
+    return "\n".join(block)
 
+
+def build_single_master_message(mood_summary, intra_rows, short_1d_rows, buy_1d_rows, now_str, oi_count: int):
     lines = [
-        f"<b>🔥 {html.escape(title)}</b>",
-        f"🕒 <code>{html.escape(now_str)}</code> | Feed: <code>{html.escape(feed_str)}</code> | Max Risk: <code>₹{RISK_PER_TRADE:,}</code> | R:R: <code>{rr_str}</code>\n",
+        "<b>🎯 MASTER STOCK SCANNER (INTRADAY &amp; 3-5D SWING)</b>",
+        f"🕒 <code>{html.escape(now_str)}</code> | Max Risk: <code>₹{RISK_PER_TRADE:,}</code> | Max Cap: <code>₹{MAX_CAPITAL_PER_TRADE:,}</code>\n",
+        mood_summary,
     ]
 
-    if idx_rows:
-        lines.append("<b>📌 MAJOR INDICES MACRO REGIME (SORTED BY QUALITY SCORE)</b>")
-        lines.append("<pre>")
-        lines.append(idx_hdr)
-        lines.append(idx_sep)
-        for r in idx_rows:
-            row_str = (
-                f"{r['Index']:<11}|"
-                f"{r['Bias']:<4}|"
-                f"{r['Spot']:>7.1f}|"
-                f"{r['SL']:>7.1f}|"
-                f"{r['T1']:>7.1f}|"
-                f"{r['Target']:>7.1f}|"
-                f"{r['Flow'][:7]:>7}|"
-                f"{r['ExpR']:>+5.2f}|"
-                f"{r['WinProb']:>4.1f}%|"
-                f"{r['Score']:>5.1f}"
-            )
-            lines.append(html.escape(row_str))
-        lines.append("</pre>\n")
+    if intra_rows:
+        lines.append(f"\n<b>⚡ 1. TOP {len(intra_rows)} INTRADAY 15M SCALPS (1:2.0 RR | MIS)</b>")
+        lines.append(format_stock_table_block(intra_rows))
 
-    if stk_rows:
-        lines.append(f"<b>🚀 TOP {len(stk_rows[:TOP_N_STOCKS])} {html.escape(section_subtitle)}</b>")
-        lines.append("<pre>")
-        lines.append(stk_hdr)
-        lines.append(stk_sep)
-        for r in stk_rows[:TOP_N_STOCKS]:
-            row_str = (
-                f"{r['Symbol']:<11}|"
-                f"{r['Side']:<5}|"
-                f"{r['Entry']:>6.1f}|"
-                f"{r['Qty']:>4d}|"
-                f"{r['Capital']:>6d}|"
-                f"{r['Stop']:>6.1f}|"
-                f"{r['T1']:>6.1f}|"
-                f"{r['Target']:>6.1f}|"
-                f"{r['Flow'][:7]:>7}|"
-                f"{r['Expectancy']:>+5.2f}|"
-                f"{r['WinProb']:>4.1f}%|"
-                f"{r['Score']:>5.1f}"
-            )
-            lines.append(html.escape(row_str))
-        lines.append("</pre>")
+    if short_1d_rows:
+        lines.append(f"\n<b>📉 2. TOP {len(short_1d_rows)} POSITIONAL SHORT BREAKDOWNS (1D | 1:2.5 RR)</b>")
+        lines.append(format_stock_table_block(short_1d_rows))
 
-    cands = list(stk_rows[:TOP_N_STOCKS])
-    prime_picks = [
-        r for r in cands
-        if r["Expectancy"] >= 0.08 and r["WinProb"] >= 48.0 and r["FlowBoost"] == 1
-    ]
-    if not prime_picks:
-        prime_picks = [r for r in cands if r["Expectancy"] >= 0.05 and r["WinProb"] >= 47.0]
+    if buy_1d_rows:
+        lines.append(f"\n<b>🚀 3. TOP {len(buy_1d_rows)} POSITIONAL CASH SWING BUYS (1D | GTT 1:2.5 RR)</b>")
+        lines.append(format_stock_table_block(buy_1d_rows))
 
-    prime_picks.sort(key=lambda x: (x["FlowBoost"], x["Score"]), reverse=True)
-    top_two = prime_picks[:2]
+    # Master Top-3 Best Trades Across All Active Sections (Prioritizing FlowBoost == 1)
+    all_cands = list(intra_rows) + list(short_1d_rows) + list(buy_1d_rows)
+    boosted = [r for r in all_cands if r["FlowBoost"] == 1 and r["Expectancy"] >= 0.10]
+    if not boosted:
+        boosted = all_cands
+    boosted.sort(key=lambda x: (x["FlowBoost"], x["Score"]), reverse=True)
 
-    if top_two:
-        lines.append("\n<b>🏆 TOP HIGH-CONVICTION TRADES (AUTO 3-STEP TRIAGE):</b>")
-        for idx, p in enumerate(top_two, 1):
+    # Deduplicate by Symbol so the same stock doesn't take two spots in Top 3
+    seen_syms = set()
+    top_three = []
+    for r in boosted:
+        if r["Symbol"] not in seen_syms:
+            seen_syms.add(r["Symbol"])
+            top_three.append(r)
+        if len(top_three) == 3:
+            break
+
+    if top_three:
+        lines.append("\n<b>🏆 TOP 3 BEST TRADES TO TAKE RIGHT NOW:</b>")
+        for idx, p in enumerate(top_three, 1):
             lines.append(
-                f"{idx}. <b>{html.escape(p['Symbol'])} ({p['Side']})</b> "
+                f"{idx}. <b>{html.escape(p['Symbol'])} ({p['Side']} - {p['Horizon']})</b> "
                 f"👉 Entry: <code>₹{p['Entry']:.1f}</code> | Qty: <code>{p['Qty']}</code> "
                 f"| Cap: <code>₹{p['Capital']:,}</code> | Risk: <code>₹{p['RiskRs']:,}</code> "
-                f"| SL: <code>{p['Stop']:.1f}</code> | T1-50%: <code>{p['T1']:.1f}</code> | Tgt: <code>{p['Target']:.1f}</code> "
+                f"| SL: <code>{p['Stop']:.1f}</code> | T1: <code>{p['T1']:.1f}</code> | Tgt: <code>{p['Target']:.1f}</code> "
                 f"| Flow: <code>{html.escape(p['Flow'].strip())}</code> | <b>Score: {p['Score']:.1f}</b>"
             )
 
-    lines.append(
-        "\n💡 <i>Score = (ExpR×100) + Win% | Flow: LB/SB/SC/LU = NSE OI Spurts, VL = Cash Volume Surge</i>"
-    )
+    lines.append("\n💡 <i>SB=Short Build, LU=Long Unwind, LB=Long Build, VL=Volume Surge</i>")
     return "\n".join(lines)
 
 
@@ -615,13 +566,15 @@ def send_telegram_alert(html_text: str):
         print(f"❌ Telegram API Error ({r.status_code}): {r.text}")
 
 
+# ==============================================================================
+# 🚀 6. MAIN EXECUTION ENGINE
+# ==============================================================================
 def main():
     ist = pytz.timezone("Asia/Kolkata")
     now_ist = datetime.now(ist)
     now_str = now_ist.strftime("%d-%b %I:%M %p IST")
     current_minutes = now_ist.hour * 60 + now_ist.minute
 
-    # HOLIDAY GUARD: Automatically pauses execution on NSE Trading Holidays
     if EVENT_NAME == "schedule":
         if (
             now_ist.weekday() >= 5
@@ -634,172 +587,125 @@ def main():
 
     oi_spurts_map = fetch_nse_oi_spurts_map()
     all_tickers = list(INDEX_UNIVERSE.keys()) + STOCK_UNIVERSE
-    messages_sent = 0
-    intraday_chg_map = {}
 
-    # 1. 15M INTRADAY SCALPS
     raw_15m = yf.download(all_tickers, period="60d", interval="15m", group_by="ticker", progress=False)
-    intra_idx_cands, intra_stk_cands = [], []
+    raw_1d  = yf.download(all_tickers, period="5y", interval="1d", group_by="ticker", progress=False)
 
+    intraday_chg_map = {}
+    idx_badges = []
+    bear_count = 0
+    total_idx  = 0
+
+    # 1. TRUE MACRO REGIME CHECK (Uses Daily EMA21 + Intraday Session Change + OI Flow!)
     for tk, idx_name in INDEX_UNIVERSE.items():
-        df15_raw = extract_ticker_df(raw_15m, tk)
-        df15 = get_closed_bar_slice(df15_raw, is_intraday=True)
-        if len(df15) < 80:
+        df15 = get_closed_bar_slice(extract_ticker_df(raw_15m, tk), is_intraday=True)
+        df1d = get_closed_bar_slice(extract_ticker_df(raw_1d, tk), is_intraday=False)
+        if len(df15) < 40 or len(df1d) < 60:
             continue
-        df15 = compute_intraday_15m_indicators(df15, is_index=True)
-        last = df15.iloc[-1]
+        df1d = compute_daily_swing_indicators(df1d)
+        last15 = df15.iloc[-1]
+        last1d = df1d.iloc[-1]
 
-        today_bars = df15[df15.index.date == last.name.date()]
-        day_open = float(today_bars["Open"].iloc[0]) if not today_bars.empty else float(last["Open"])
-        price_chg_pct = ((float(last["Close"]) - day_open) / day_open) * 100.0
+        today_bars = df15[df15.index.date == last15.name.date()]
+        day_open = float(today_bars["Open"].iloc[0]) if not today_bars.empty else float(last15["Open"])
+        spot = float(last15["Close"])
+        price_chg_pct = ((spot - day_open) / day_open) * 100.0
         intraday_chg_map[idx_name] = price_chg_pct
         oi_chg_pct = oi_spurts_map.get(idx_name, 0.0)
-        rvol = float(last.get("RVOL", 1.0))
 
-        side = "BUY" if float(last["Close"]) >= float(last["TREND_ANCHOR"]) else "SHORT"
-        is_blocked, is_boosted, flow_tag = classify_hybrid_flow(price_chg_pct, oi_chg_pct, rvol, side)
-        tot, exp_r, wp = backtest_cash_signals(df15, side, INTRA_ATR_SL_MULT, INTRA_RR, INTRA_MAX_BARS, True)
-        if tot >= 5:
-            row = build_index_regime_row(idx_name, df15, side, True, flow_tag, exp_r, wp)
-            intra_idx_cands.append((1 if is_boosted else 0, row["Score"], row))
+        # True Institutional Bias: If price < Day Open with OI build-up (SB) OR below Daily EMA21 -> BEAR!
+        is_bearish = (price_chg_pct < 0 and oi_chg_pct >= 2.0) or (spot < float(last1d["EMA21"]))
+        total_idx += 1
+        if is_bearish:
+            bear_count += 1
+            flow_lbl = f"SB {oi_chg_pct:+.0f}%" if (price_chg_pct < 0 and oi_chg_pct >= 1.0) else f"{price_chg_pct:+.1f}%"
+            idx_badges.append(f"<code>{idx_name}: {spot:,.0f} (BEAR 🔴 | {flow_lbl})</code>")
+        else:
+            flow_lbl = f"LB {oi_chg_pct:+.0f}%" if (price_chg_pct >= 0 and oi_chg_pct >= 1.0) else f"{price_chg_pct:+.1f}%"
+            idx_badges.append(f"<code>{idx_name}: {spot:,.0f} (BULL 🟢 | {flow_lbl})</code>")
+
+    overall_mood = "BEARISH 🔴 (Focus on SHORTS / PUTS)" if bear_count >= 2 else "BULLISH 🟢 (Focus on BUYS / CALLS)"
+    mood_lines = [f"<b>🧭 MARKET MOOD: {overall_mood}</b>"]
+    if len(idx_badges) >= 2:
+        mood_lines.append("• " + " | ".join(idx_badges[:2]))
+    if len(idx_badges) >= 4:
+        mood_lines.append("• " + " | ".join(idx_badges[2:4]))
+    mood_summary = "\n".join(mood_lines)
+
+    # 2. SCAN STOCKS ON 15M (INTRADAY) & 1D (POSITIONAL SHORT & BUY)
+    intra_stk_cands = []
+    swing_short_cands = []
+    swing_buy_cands = []
 
     for tk in STOCK_UNIVERSE:
         sym = tk.replace(".NS", "")
         df15_raw = extract_ticker_df(raw_15m, tk)
         df15 = get_closed_bar_slice(df15_raw, is_intraday=True)
-        if len(df15) < 80:
-            continue
-        df15 = compute_intraday_15m_indicators(df15, is_index=False)
-        last = df15.iloc[-1]
-        prev = df15.iloc[-2]
+        if len(df15) >= 80:
+            df15 = compute_intraday_15m_indicators(df15, is_index=False)
+            last = df15.iloc[-1]
+            prev = df15.iloc[-2]
 
-        today_bars = df15[df15.index.date == last.name.date()]
-        day_open = float(today_bars["Open"].iloc[0]) if not today_bars.empty else float(last["Open"])
-        price_chg_pct = ((float(last["Close"]) - day_open) / day_open) * 100.0
-        intraday_chg_map[sym] = price_chg_pct
-        oi_chg_pct = oi_spurts_map.get(sym, 0.0)
-        rvol = float(last.get("RVOL", 1.0))
+            today_bars = df15[df15.index.date == last.name.date()]
+            day_open = float(today_bars["Open"].iloc[0]) if not today_bars.empty else float(last["Open"])
+            price_chg_pct = ((float(last["Close"]) - day_open) / day_open) * 100.0
+            intraday_chg_map[sym] = price_chg_pct
+            oi_chg_pct = oi_spurts_map.get(sym, 0.0)
+            rvol = float(last.get("RVOL", 1.0))
 
-        side = "BUY" if float(last["Close"]) >= float(last["TREND_ANCHOR"]) else "SHORT"
-        sig_col = "BUY_Signal" if side == "BUY" else "SHORT_Signal"
-        is_blocked, is_boosted, flow_tag = classify_hybrid_flow(price_chg_pct, oi_chg_pct, rvol, side)
+            side = "BUY" if float(last["Close"]) >= float(last["TREND_ANCHOR"]) else "SHORT"
+            sig_col = "BUY_Signal" if side == "BUY" else "SHORT_Signal"
+            is_blocked, is_boosted, flow_tag = classify_hybrid_flow(price_chg_pct, oi_chg_pct, rvol, side)
 
-        if is_blocked:
-            continue
-        if not (bool(last[sig_col]) or bool(prev[sig_col]) or is_boosted):
-            continue
+            # Only include Intraday setups backed by active OI/Volume Flow (is_boosted) or strong signal
+            if not is_blocked and is_boosted and (bool(last[sig_col]) or bool(prev[sig_col]) or is_boosted):
+                tot, exp_r, wp = backtest_cash_signals(df15, side, INTRA_ATR_SL_MULT, INTRA_RR, INTRA_MAX_BARS, True)
+                if tot >= INTRA_MIN_SETUPS and exp_r >= INTRA_MIN_EXP_R:
+                    row = build_stock_trade_row(sym, df15, side, True, flow_tag, is_boosted, exp_r, wp, "15M")
+                    if row:
+                        intra_stk_cands.append((row["FlowBoost"], row["Score"], row))
 
-        tot, exp_r, wp = backtest_cash_signals(df15, side, INTRA_ATR_SL_MULT, INTRA_RR, INTRA_MAX_BARS, True)
-        if tot >= INTRA_MIN_SETUPS and exp_r >= INTRA_MIN_EXP_R:
-            row = build_stock_trade_row(sym, df15, side, True, flow_tag, is_boosted, exp_r, wp)
-            if row:
-                intra_stk_cands.append((row["FlowBoost"], row["Score"], row))
+        df1d_raw = extract_ticker_df(raw_1d, tk)
+        df1d = get_closed_bar_slice(df1d_raw, is_intraday=False)
+        if len(df1d) >= 200:
+            df1d = compute_daily_swing_indicators(df1d)
+            last = df1d.iloc[-1]
+            prev = df1d.iloc[-2]
 
-    intra_idx_cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
+            daily_chg = ((float(last["Close"]) - float(prev["Close"])) / float(prev["Close"])) * 100.0
+            price_chg_pct = intraday_chg_map.get(sym, daily_chg)
+            oi_chg_pct = oi_spurts_map.get(sym, 0.0)
+            rvol = float(last.get("RVOL", 1.0))
+
+            if float(last["Close"]) >= float(last["EMA21"]):
+                side = "BUY"
+                is_blocked, is_boosted, flow_tag = classify_hybrid_flow(price_chg_pct, oi_chg_pct, rvol, side)
+                if not is_blocked and is_boosted and (bool(last["BUY_Signal"]) or bool(prev["BUY_Signal"]) or is_boosted):
+                    tot, exp_r, wp = backtest_cash_signals(df1d, side, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False)
+                    if tot >= SWING_MIN_SETUPS and exp_r >= SWING_MIN_EXP_R:
+                        row = build_stock_trade_row(sym, df1d, side, False, flow_tag, is_boosted, exp_r, wp, "3-5D")
+                        if row:
+                            swing_buy_cands.append((row["FlowBoost"], row["Score"], row))
+            else:
+                side = "SHORT"
+                is_blocked, is_boosted, flow_tag = classify_hybrid_flow(price_chg_pct, oi_chg_pct, rvol, side)
+                if not is_blocked and is_boosted and (bool(last["SHORT_Signal"]) or bool(prev["SHORT_Signal"]) or is_boosted):
+                    tot, exp_r, wp = backtest_cash_signals(df1d, side, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False)
+                    if tot >= SWING_MIN_SETUPS and exp_r >= SWING_MIN_EXP_R:
+                        row = build_stock_trade_row(sym, df1d, side, False, flow_tag, is_boosted, exp_r, wp, "3-5D")
+                        if row:
+                            swing_short_cands.append((row["FlowBoost"], row["Score"], row))
+
     intra_stk_cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
-
-    intra_idx_rows = [x[2] for x in intra_idx_cands]
-    intra_stk_rows = [x[2] for x in intra_stk_cands[:TOP_N_STOCKS]]
-
-    if intra_idx_rows or intra_stk_rows:
-        msg = format_swing_report(
-            intra_idx_rows, intra_stk_rows, "15M INTRADAY STOCK SCALPS (LOCKED 1:2.0 RR)",
-            "INTRADAY STOCK SCALPS (BUY & SHORT)", now_str, len(oi_spurts_map), is_intraday=True
-        )
-        send_telegram_alert(msg)
-        messages_sent += 1
-
-    # 2 & 3. POSITIONAL SWINGS (BULLISH BUY + BEARISH SHORT BREAKDOWNS)
-    raw_1d = yf.download(all_tickers, period="5y", interval="1d", group_by="ticker", progress=False)
-    swing_idx_cands, swing_buy_cands, swing_short_cands = [], [], []
-
-    for tk, idx_name in INDEX_UNIVERSE.items():
-        df1d_raw = extract_ticker_df(raw_1d, tk)
-        df1d = get_closed_bar_slice(df1d_raw, is_intraday=False)
-        if len(df1d) < 200:
-            continue
-        df1d = compute_daily_swing_indicators(df1d, is_index=True)
-        last = df1d.iloc[-1]
-        prev = df1d.iloc[-2]
-
-        daily_chg = ((float(last["Close"]) - float(prev["Close"])) / float(prev["Close"])) * 100.0
-        price_chg_pct = intraday_chg_map.get(idx_name, daily_chg)
-        oi_chg_pct = oi_spurts_map.get(idx_name, 0.0)
-        rvol = float(last.get("RVOL", 1.0))
-
-        side = "BUY" if float(last["Close"]) >= float(last["EMA21"]) else "SHORT"
-        is_blocked, is_boosted, flow_tag = classify_hybrid_flow(price_chg_pct, oi_chg_pct, rvol, side)
-        tot, exp_r, wp = backtest_cash_signals(df1d, side, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False)
-        if tot >= 5:
-            row = build_index_regime_row(idx_name, df1d, side, False, flow_tag, exp_r, wp)
-            swing_idx_cands.append((1 if is_boosted else 0, row["Score"], row))
-
-    for tk in STOCK_UNIVERSE:
-        sym = tk.replace(".NS", "")
-        df1d_raw = extract_ticker_df(raw_1d, tk)
-        df1d = get_closed_bar_slice(df1d_raw, is_intraday=False)
-        if len(df1d) < 200:
-            continue
-        df1d = compute_daily_swing_indicators(df1d, is_index=False)
-        last = df1d.iloc[-1]
-        prev = df1d.iloc[-2]
-
-        daily_chg = ((float(last["Close"]) - float(prev["Close"])) / float(prev["Close"])) * 100.0
-        price_chg_pct = intraday_chg_map.get(sym, daily_chg)
-        oi_chg_pct = oi_spurts_map.get(sym, 0.0)
-        rvol = float(last.get("RVOL", 1.0))
-
-        if float(last["Close"]) >= float(last["EMA21"]):
-            side = "BUY"
-            is_blocked, is_boosted, flow_tag = classify_hybrid_flow(price_chg_pct, oi_chg_pct, rvol, side)
-            if not is_blocked and (bool(last["BUY_Signal"]) or bool(prev["BUY_Signal"]) or is_boosted):
-                tot, exp_r, wp = backtest_cash_signals(df1d, side, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False)
-                if tot >= SWING_MIN_SETUPS and exp_r >= SWING_MIN_EXP_R:
-                    row = build_stock_trade_row(sym, df1d, side, False, flow_tag, is_boosted, exp_r, wp)
-                    if row:
-                        swing_buy_cands.append((row["FlowBoost"], row["Score"], row))
-        else:
-            side = "SHORT"
-            is_blocked, is_boosted, flow_tag = classify_hybrid_flow(price_chg_pct, oi_chg_pct, rvol, side)
-            if not is_blocked and (bool(last["SHORT_Signal"]) or bool(prev["SHORT_Signal"]) or is_boosted):
-                tot, exp_r, wp = backtest_cash_signals(df1d, side, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False)
-                if tot >= SWING_MIN_SETUPS and exp_r >= SWING_MIN_EXP_R:
-                    row = build_stock_trade_row(sym, df1d, side, False, flow_tag, is_boosted, exp_r, wp)
-                    if row:
-                        swing_short_cands.append((row["FlowBoost"], row["Score"], row))
-
-    # FIXED SYNTAX HERE:
-    swing_idx_cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
-    swing_buy_cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
     swing_short_cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    swing_buy_cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
 
-    swing_idx_rows = [x[2] for x in swing_idx_cands]
-    swing_buy_rows = [x[2] for x in swing_buy_cands[:TOP_N_STOCKS]]
-    swing_short_rows = [x[2] for x in swing_short_cands[:TOP_N_STOCKS]]
+    intra_rows    = [x[2] for x in intra_stk_cands[:TOP_N_PER_SECTION]]
+    short_1d_rows = [x[2] for x in swing_short_cands[:TOP_N_PER_SECTION]]
+    buy_1d_rows   = [x[2] for x in swing_buy_cands[:TOP_N_PER_SECTION]]
 
-    if swing_idx_rows or swing_buy_rows:
-        msg_buy = format_swing_report(
-            swing_idx_rows, swing_buy_rows, "3-5D POSITIONAL BULLISH CASH SWINGS (1:2.5 RR)",
-            "BULLISH CASH SWING SETUPS (KOTAK NEO GTT BUY)", now_str, len(oi_spurts_map), is_intraday=False
-        )
-        send_telegram_alert(msg_buy)
-        messages_sent += 1
-
-    if swing_short_rows:
-        msg_short = format_swing_report(
-            [], swing_short_rows, "📉 3-5D POSITIONAL SHORT BREAKDOWNS (BEARISH DAILY 1:2.5 RR)",
-            "BEARISH DAILY BREAKDOWN STOCKS (SHORT / PUT CANDIDATES)", now_str, len(oi_spurts_map), is_intraday=False
-        )
-        send_telegram_alert(msg_short)
-        messages_sent += 1
-
-    if messages_sent == 0:
-        fallback_msg = (
-            f"<b>ℹ️ SWING SCANNER ({html.escape(now_str)})</b>\n"
-            f"Scanner ran cleanly (Scraped {len(oi_spurts_map)} NSE OI records), "
-            f"but no setups passed the strict risk &amp; positive ExpR filters."
-        )
-        send_telegram_alert(fallback_msg)
+    msg = build_single_master_message(mood_summary, intra_rows, short_1d_rows, buy_1d_rows, now_str, len(oi_spurts_map))
+    send_telegram_alert(msg)
 
 
 if __name__ == "__main__":
