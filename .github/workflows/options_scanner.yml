@@ -2,32 +2,26 @@ name: NSE F&O Options Buying Scanner (15m & Swing)
 
 on:
   schedule:
-    # 04:15 UTC = 09:45 AM IST (First settled options scan)
-    - cron: '15 4,6,8,9 * * 1-5'
-    # 10:05 UTC = 03:35 PM IST (Final Post-Market Closing Scan)
-    - cron: '5 10 * * 1-5'
+    - cron: "15,45 4-9 * * 1-5"
+    - cron: "5 10 * * 1-5"
   workflow_dispatch:
 
 jobs:
   scan-and-notify:
     runs-on: ubuntu-latest
     timeout-minutes: 10
-
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-          cache: 'pip'
-
+          python-version: "3.11"
+          cache: "pip"
       - name: Install Dependencies
         run: |
           pip install --upgrade pip
           pip install yfinance pandas numpy scipy requests pytz
-
       - name: Run F&O Options Scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
