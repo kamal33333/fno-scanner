@@ -1,5 +1,7 @@
 import os
 import re
+import gc
+import sys
 import time
 import html
 import warnings
@@ -18,7 +20,7 @@ import numpy as np
 # ==============================================================================
 RAW_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 RAW_CHATID = os.environ.get("TELEGRAM_CHAT_ID", "").strip().strip('"').strip("'")
-EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "manual")
+FORCE_RUN  = ("--force" in sys.argv) or (os.environ.get("FORCE_RUN", "0") == "1")
 
 token_match = re.search(r"(\d+:[A-Za-z0-9_-]+)", RAW_TOKEN)
 TELEGRAM_BOT_TOKEN = token_match.group(1) if token_match else RAW_TOKEN.lstrip("bot").strip('"').strip("'")
@@ -37,12 +39,13 @@ NSE_HOLIDAYS_2026 = {
 
 RISK_PER_TRADE         = 1000     # Max Rupee risk per trade (₹1,000 hard cap)
 MAX_CAPITAL_PER_TRADE  = 35000    # Max Capital outlay per trade (₹35,000 hard cap)
+INTRA_MIS_LEVERAGE     = 2.0      # Conservative 2x MIS Intraday Margin multiplier
 TOP_N_PER_SECTION      = 5        # Keep tables ultra-clean: Top 5 setups per section!
 COST_SLIPPAGE_R        = 0.05     # 0.05R deduction per backtest trade
 
 INTRA_RR               = 2.0
 INTRA_T1_RR            = 1.0
-INTRA_ATR_SL_MULT      = 1.0
+INTRA_ATR_SL_MULT      = 1.1
 INTRA_MAX_BARS         = 12
 INTRA_MIN_SETUPS       = 10
 INTRA_MIN_EXP_R        = 0.08     # Only show high-edge Intraday setups (ExpR >= +0.08)
@@ -72,12 +75,12 @@ STOCK_UNIVERSE = [
     "LTF.NS", "RBLBANK.NS", "ABB.NS", "CAMS.NS", "INDHOTEL.NS",
     "MOTHERSON.NS", "NYKAA.NS", "SUPREMEIND.NS", "POLYCAB.NS", "COFORGE.NS",
     "CHAMBLFERT.NS", "COROMANDEL.NS", "DEEPAKNTR.NS", "NAVINFLUOR.NS", "ATUL.NS",
-    "REDINGTON.NS", "CASTROLIND.NS", "CESC.NS", "KARURVYSYA.NS", "CITYUNIONBK.NS",
+    "REDINGTON.NS", "CASTROLIND.NS", "CESC.NS", "KARURVYSYA.NS", "CUB.NS",
     "IDFCFIRSTB.NS", "MANAPPURAM.NS", "MUTHOOTFIN.NS", "CHOLAFIN.NS", "LICHSGFIN.NS",
     "CANBK.NS", "PNB.NS", "BANKBARODA.NS", "UNIONBANK.NS", "INDIANB.NS",
-    "BEML.NS", "MAZDOCK.NS", "COCHINSHIP.NS", "BDL.NS", "DATA_PATTERNS.NS",
+    "BEML.NS", "MAZDOCK.NS", "COCHINSHIP.NS", "BDL.NS", "DATAPATTNS.NS",
     "KPITTECH.NS", "TATAELXSI.NS", "CYIENT.NS", "ZENSARTECH.NS", "BSOFT.NS",
-    "SONACOMS.NS", "ENDURANCE.NS", "EXIDEIND.NS", "AMARAJABAT.NS", "APOLLOTYRE.NS",
+    "SONACOMS.NS", "ENDURANCE.NS", "EXIDEIND.NS", "ARE&M.NS", "APOLLOTYRE.NS",
     "CEATLTD.NS", "JKTYRE.NS", "BALKRISIND.NS", "ASHOKLEY.NS", "ESCORTS.NS",
     "KEI.NS", "HAVELLS.NS", "BLUESTARCO.NS", "WHIRLPOOL.NS", "CUMMINSIND.NS",
     "THERMAX.NS", "BHEL.NS", "CGPOWER.NS", "SIEMENS.NS", "APARINDS.NS",
@@ -85,15 +88,15 @@ STOCK_UNIVERSE = [
     "SAIL.NS", "JINDALSAW.NS", "WELCORP.NS", "APLAPOLLO.NS", "RATNAMANI.NS",
     "GNFC.NS", "GSFC.NS", "RCF.NS", "FACT.NS", "PARADEEP.NS",
     "RADICO.NS", "UBL.NS", "UNITDSPR.NS", "ITC.NS", "TATACONSUM.NS",
-    "VARUNBEV.NS", "JUBLFOOD.NS", "DEVYANI.NS", "CHALET.NS", "EIHOTEL.NS",
-    "LEMON_TREE.NS", "IRCTC.NS", "RVNL.NS", "IRCON.NS", "IRFC.NS",
-    "REC.NS", "PFC.NS", "IREDA.NS", "SJVN.NS", "NHPC.NS",
+    "VBL.NS", "JUBLFOOD.NS", "DEVYANI.NS", "CHALET.NS", "EIHOTEL.NS",
+    "LEMONTREE.NS", "IRCTC.NS", "RVNL.NS", "IRCON.NS", "IRFC.NS",
+    "RECLTD.NS", "PFC.NS", "IREDA.NS", "SJVN.NS", "NHPC.NS",
     "TATAPOWER.NS", "JSWENERGY.NS", "TORNTPOWER.NS", "IGL.NS", "MGL.NS",
     "PETRONET.NS", "GAIL.NS", "ONGC.NS", "OIL.NS", "IOC.NS",
-    "BPCL.NS", "HPCL.NS", "CHENNPETRO.NS", "MRPL.NS", "NATCOPHARM.NS",
+    "BPCL.NS", "HINDPETRO.NS", "CHENNPETRO.NS", "MRPL.NS", "NATCOPHARM.NS",
     "LAURUSLABS.NS", "GRANULES.NS", "GLENMARK.NS", "BIOCON.NS", "LUPIN.NS",
     "ALKEM.NS", "TORNTPHARM.NS", "IPCALAB.NS", "AJANTPHARM.NS", "JBCHEPHARM.NS",
-    "APOLLOHOSP.NS", "MAXHEALTH.NS", "FORTIS.NS", "NARAYANA.NS", "ASTERDM.NS",
+    "APOLLOHOSP.NS", "MAXHEALTH.NS", "FORTIS.NS", "NH.NS", "ASTERDM.NS",
     "METROPOLIS.NS", "LALPATHLAB.NS", "SYNGENE.NS", "DIVISLAB.NS", "CIPLA.NS",
     "DRREDDY.NS", "PRESTIGE.NS", "BRIGADE.NS", "SOBHA.NS", "GODREJPROP.NS",
     "PHOENIXLTD.NS", "MAHLIFE.NS", "NCC.NS", "KNRCON.NS", "PNCINFRA.NS",
@@ -155,7 +158,7 @@ def classify_hybrid_flow(price_chg_pct: float, oi_chg_pct: float, rvol: float, s
             return False, True, f"LU{sign_str:>5}"
         return False, False, f"OI{sign_str:>5}"
 
-    if rvol >= 1.5:
+    if rvol >= 1.5 and rvol <= 8.0:
         if (side == "BUY" and price_chg_pct > 0) or (side == "SHORT" and price_chg_pct < 0):
             return False, True, f"VL{rvol:>4.1f}x"
         return False, False, f"VL{rvol:>4.1f}x"
@@ -169,13 +172,14 @@ def classify_hybrid_flow(price_chg_pct: float, oi_chg_pct: float, rvol: float, s
 def get_closed_bar_slice(df: pd.DataFrame, is_intraday: bool) -> pd.DataFrame:
     if df.empty or len(df) < 30:
         return df
+    if not is_intraday:
+        return df.copy()
     ist = pytz.timezone("Asia/Kolkata")
     now_ist = datetime.now(ist)
     now_mins = now_ist.hour * 60 + now_ist.minute
-    cutoff_mins = (15 * 60 + 30) if is_intraday else (14 * 60 + 15)
     in_forming_window = (
         now_ist.weekday() < 5
-        and (9 * 60 + 15) <= now_mins < cutoff_mins
+        and (9 * 60 + 15) <= now_mins < (15 * 60 + 30)
     )
     if in_forming_window:
         last_ts = df.index[-1]
@@ -248,13 +252,13 @@ def compute_daily_swing_indicators(df: pd.DataFrame) -> pd.DataFrame:
         & (df["EMA21"] >= df["EMA55"] * 0.99)
         & (c < df["BB_UP_38"])
         & (df["RSI"] >= 44)
-        & (df["RSI"] <= 70)
+        & (df["RSI"] <= 68)
     )
     df["SHORT_Signal"] = (
         (c <= df["EMA21"] * 1.005)
         & (c > df["BB_LO_38"])
-        & (df["RSI"] >= 28)
-        & (df["RSI"] <= 56)
+        & (df["RSI"] >= 30)
+        & (df["RSI"] <= 55)
     )
     return df
 
@@ -299,13 +303,13 @@ def compute_intraday_15m_indicators(df: pd.DataFrame, is_index: bool = False) ->
         & (df["EMA9"] >= df["EMA21"] * 0.998)
         & (c < df["BB_UP_38"])
         & (df["RSI"] >= 46)
-        & (df["RSI"] <= 74)
+        & (df["RSI"] <= 72)
     )
     df["SHORT_Signal"] = (
         (c <= df["TREND_ANCHOR"])
         & (df["EMA9"] <= df["EMA21"] * 1.002)
         & (c > df["BB_LO_38"])
-        & (df["RSI"] >= 26)
+        & (df["RSI"] >= 28)
         & (df["RSI"] <= 54)
     )
     return df
@@ -419,7 +423,7 @@ def build_stock_trade_row(
     full_rr = INTRA_RR if is_intraday else SWING_RR
 
     raw_risk = atr * atr_mult
-    min_risk = entry * (0.008 if is_intraday else 0.015)
+    min_risk = entry * (0.012 if is_intraday else 0.015)
     max_risk = entry * (0.030 if is_intraday else 0.055)
     risk_per_share = max(round(min(max_risk, max(min_risk, raw_risk)), 1), 0.2)
 
@@ -435,13 +439,15 @@ def build_stock_trade_row(
         tgt = round(entry - actual_risk * full_rr, 1)
 
     qty_by_risk = int(RISK_PER_TRADE // actual_risk)
-    qty_by_cap = int(MAX_CAPITAL_PER_TRADE // entry)
+    effective_buying_power = (MAX_CAPITAL_PER_TRADE * INTRA_MIS_LEVERAGE) if is_intraday else MAX_CAPITAL_PER_TRADE
+    qty_by_cap = int(effective_buying_power // entry)
     qty = min(qty_by_risk, qty_by_cap)
 
     if qty < 1:
         return None
 
-    capital = int(round(entry * qty))
+    margin_divisor = INTRA_MIS_LEVERAGE if is_intraday else 1.0
+    capital = int(round((entry * qty) / margin_divisor))
     total_rupee_risk = int(round(actual_risk * qty))
 
     exp_rounded = round(exp_r, 2)
@@ -464,6 +470,7 @@ def build_stock_trade_row(
         "WinProb": win_rounded,
         "Score": score,
         "FlowBoost": 1 if is_boosted else 0,
+        "DirectCashExec": 1 if (is_intraday or side == "BUY") else 0,
     }
 
 
@@ -505,25 +512,27 @@ def build_single_master_message(mood_summary, intra_rows, short_1d_rows, buy_1d_
     ]
 
     if intra_rows:
-        lines.append(f"\n<b>⚡ 1. TOP {len(intra_rows)} INTRADAY 15M SCALPS (1:2.0 RR | MIS)</b>")
+        lines.append(f"\n<b>⚡ 1. TOP {len(intra_rows)} INTRADAY 15M SCALPS (1:2.0 RR | 2x MIS)</b>")
         lines.append(format_stock_table_block(intra_rows))
 
     if short_1d_rows:
-        lines.append(f"\n<b>📉 2. TOP {len(short_1d_rows)} POSITIONAL SHORT BREAKDOWNS (1D | 1:2.5 RR)</b>")
+        lines.append(f"\n<b>📉 2. TOP {len(short_1d_rows)} 1D BEARISH BREAKDOWNS (MIS SHORT / PUTS ONLY)</b>")
         lines.append(format_stock_table_block(short_1d_rows))
 
     if buy_1d_rows:
-        lines.append(f"\n<b>🚀 3. TOP {len(buy_1d_rows)} POSITIONAL CASH SWING BUYS (1D | GTT 1:2.5 RR)</b>")
+        lines.append(f"\n<b>🚀 3. TOP {len(buy_1d_rows)} POSITIONAL CASH SWING BUYS (1D | CNC 1:2.5 RR)</b>")
         lines.append(format_stock_table_block(buy_1d_rows))
 
-    # Master Top-3 Best Trades Across All Active Sections (Prioritizing FlowBoost == 1)
-    all_cands = list(intra_rows) + list(short_1d_rows) + list(buy_1d_rows)
-    boosted = [r for r in all_cands if r["FlowBoost"] == 1 and r["Expectancy"] >= 0.10]
-    if not boosted:
-        boosted = all_cands
-    boosted.sort(key=lambda x: (x["FlowBoost"], x["Score"]), reverse=True)
+    # Master Top-3 Best Trades Across Direct Cash-Executable Sections (15M MIS + 1D CNC BUY)
+    exec_cands = list(intra_rows) + list(buy_1d_rows)
+    if not exec_cands:
+        exec_cands = list(short_1d_rows)
 
-    # Deduplicate by Symbol so the same stock doesn't take two spots in Top 3
+    boosted = [r for r in exec_cands if r["FlowBoost"] == 1 and r["Expectancy"] >= 0.10]
+    if not boosted:
+        boosted = exec_cands
+    boosted.sort(key=lambda x: (x["DirectCashExec"], x["FlowBoost"], x["Score"]), reverse=True)
+
     seen_syms = set()
     top_three = []
     for r in boosted:
@@ -534,7 +543,7 @@ def build_single_master_message(mood_summary, intra_rows, short_1d_rows, buy_1d_
             break
 
     if top_three:
-        lines.append("\n<b>🏆 TOP 3 BEST TRADES TO TAKE RIGHT NOW:</b>")
+        lines.append("\n<b>🏆 TOP 3 DIRECT CASH TRADES TO TAKE RIGHT NOW:</b>")
         for idx, p in enumerate(top_three, 1):
             lines.append(
                 f"{idx}. <b>{html.escape(p['Symbol'])} ({p['Side']} - {p['Horizon']})</b> "
@@ -544,7 +553,7 @@ def build_single_master_message(mood_summary, intra_rows, short_1d_rows, buy_1d_
                 f"| Flow: <code>{html.escape(p['Flow'].strip())}</code> | <b>Score: {p['Score']:.1f}</b>"
             )
 
-    lines.append("\n💡 <i>SB=Short Build, LU=Long Unwind, LB=Long Build, VL=Volume Surge</i>")
+    lines.append("\n💡 <i>15M Cap uses 2x MIS Margin | 1D Shorts = Trade via Intraday MIS or F&amp;O Puts</i>")
     return "\n".join(lines)
 
 
@@ -575,14 +584,14 @@ def main():
     now_str = now_ist.strftime("%d-%b %I:%M %p IST")
     current_minutes = now_ist.hour * 60 + now_ist.minute
 
-    if EVENT_NAME == "schedule":
+    if not FORCE_RUN:
         if (
             now_ist.weekday() >= 5
             or now_ist.date() in NSE_HOLIDAYS_2026
             or current_minutes < (9 * 60 + 15)
-            or current_minutes > (15 * 60 + 45)
+            or current_minutes > (15 * 60 + 50)
         ):
-            print(f"⏸️ Outside Market Hours or NSE Holiday ({now_str}). Exiting.")
+            print(f"⏸️ Outside Market Hours or NSE Holiday ({now_str}). Use --force to override.")
             return
 
     oi_spurts_map = fetch_nse_oi_spurts_map()
@@ -596,24 +605,29 @@ def main():
     bear_count = 0
     total_idx  = 0
 
-    # 1. TRUE MACRO REGIME CHECK (Uses Daily EMA21 + Intraday Session Change + OI Flow!)
+    # 1. TRUE MACRO REGIME CHECK (Uses Daily EMA21 + Intraday/Daily Change + OI Flow!)
     for tk, idx_name in INDEX_UNIVERSE.items():
         df15 = get_closed_bar_slice(extract_ticker_df(raw_15m, tk), is_intraday=True)
         df1d = get_closed_bar_slice(extract_ticker_df(raw_1d, tk), is_intraday=False)
-        if len(df15) < 40 or len(df1d) < 60:
+        if len(df1d) < 60:
             continue
         df1d = compute_daily_swing_indicators(df1d)
-        last15 = df15.iloc[-1]
         last1d = df1d.iloc[-1]
+        prev1d = df1d.iloc[-2]
 
-        today_bars = df15[df15.index.date == last15.name.date()]
-        day_open = float(today_bars["Open"].iloc[0]) if not today_bars.empty else float(last15["Open"])
-        spot = float(last15["Close"])
-        price_chg_pct = ((spot - day_open) / day_open) * 100.0
+        if len(df15) >= 20:
+            last15 = df15.iloc[-1]
+            today_bars = df15[df15.index.date == last15.name.date()]
+            day_open = float(today_bars["Open"].iloc[0]) if not today_bars.empty else float(last15["Open"])
+            spot = float(last15["Close"])
+            price_chg_pct = ((spot - day_open) / day_open) * 100.0
+        else:
+            spot = float(last1d["Close"])
+            price_chg_pct = ((spot - float(prev1d["Close"])) / float(prev1d["Close"])) * 100.0
+
         intraday_chg_map[idx_name] = price_chg_pct
         oi_chg_pct = oi_spurts_map.get(idx_name, 0.0)
 
-        # True Institutional Bias: If price < Day Open with OI build-up (SB) OR below Daily EMA21 -> BEAR!
         is_bearish = (price_chg_pct < 0 and oi_chg_pct >= 2.0) or (spot < float(last1d["EMA21"]))
         total_idx += 1
         if is_bearish:
@@ -628,8 +642,8 @@ def main():
     mood_lines = [f"<b>🧭 MARKET MOOD: {overall_mood}</b>"]
     if len(idx_badges) >= 2:
         mood_lines.append("• " + " | ".join(idx_badges[:2]))
-    if len(idx_badges) >= 4:
-        mood_lines.append("• " + " | ".join(idx_badges[2:4]))
+    if len(idx_badges) >= 3:
+        mood_lines.append("• " + " | ".join(idx_badges[2:]))
     mood_summary = "\n".join(mood_lines)
 
     # 2. SCAN STOCKS ON 15M (INTRADAY) & 1D (POSITIONAL SHORT & BUY)
@@ -657,11 +671,11 @@ def main():
             sig_col = "BUY_Signal" if side == "BUY" else "SHORT_Signal"
             is_blocked, is_boosted, flow_tag = classify_hybrid_flow(price_chg_pct, oi_chg_pct, rvol, side)
 
-            # Only include Intraday setups backed by active OI/Volume Flow (is_boosted) or strong signal
-            if not is_blocked and is_boosted and (bool(last[sig_col]) or bool(prev[sig_col]) or is_boosted):
+            # Strictly require BOTH active flow (is_boosted) AND technical signal trigger!
+            if not is_blocked and is_boosted and (bool(last[sig_col]) or bool(prev[sig_col])):
                 tot, exp_r, wp = backtest_cash_signals(df15, side, INTRA_ATR_SL_MULT, INTRA_RR, INTRA_MAX_BARS, True)
                 if tot >= INTRA_MIN_SETUPS and exp_r >= INTRA_MIN_EXP_R:
-                    row = build_stock_trade_row(sym, df15, side, True, flow_tag, is_boosted, exp_r, wp, "15M")
+                    row = build_stock_trade_row(sym, df15, side, True, flow_tag, is_boosted, exp_r, wp, "15M MIS")
                     if row:
                         intra_stk_cands.append((row["FlowBoost"], row["Score"], row))
 
@@ -680,21 +694,24 @@ def main():
             if float(last["Close"]) >= float(last["EMA21"]):
                 side = "BUY"
                 is_blocked, is_boosted, flow_tag = classify_hybrid_flow(price_chg_pct, oi_chg_pct, rvol, side)
-                if not is_blocked and is_boosted and (bool(last["BUY_Signal"]) or bool(prev["BUY_Signal"]) or is_boosted):
+                if not is_blocked and is_boosted and (bool(last["BUY_Signal"]) or bool(prev["BUY_Signal"])):
                     tot, exp_r, wp = backtest_cash_signals(df1d, side, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False)
                     if tot >= SWING_MIN_SETUPS and exp_r >= SWING_MIN_EXP_R:
-                        row = build_stock_trade_row(sym, df1d, side, False, flow_tag, is_boosted, exp_r, wp, "3-5D")
+                        row = build_stock_trade_row(sym, df1d, side, False, flow_tag, is_boosted, exp_r, wp, "3-5D CNC")
                         if row:
                             swing_buy_cands.append((row["FlowBoost"], row["Score"], row))
             else:
                 side = "SHORT"
                 is_blocked, is_boosted, flow_tag = classify_hybrid_flow(price_chg_pct, oi_chg_pct, rvol, side)
-                if not is_blocked and is_boosted and (bool(last["SHORT_Signal"]) or bool(prev["SHORT_Signal"]) or is_boosted):
+                if not is_blocked and is_boosted and (bool(last["SHORT_Signal"]) or bool(prev["SHORT_Signal"])):
                     tot, exp_r, wp = backtest_cash_signals(df1d, side, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False)
                     if tot >= SWING_MIN_SETUPS and exp_r >= SWING_MIN_EXP_R:
-                        row = build_stock_trade_row(sym, df1d, side, False, flow_tag, is_boosted, exp_r, wp, "3-5D")
+                        row = build_stock_trade_row(sym, df1d, side, False, flow_tag, is_boosted, exp_r, wp, "1D Watch")
                         if row:
                             swing_short_cands.append((row["FlowBoost"], row["Score"], row))
+
+    del raw_15m, raw_1d
+    gc.collect()
 
     intra_stk_cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
     swing_short_cands.sort(key=lambda x: (x[0], x[1]), reverse=True)
