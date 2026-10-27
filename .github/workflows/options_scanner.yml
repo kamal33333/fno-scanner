@@ -21,7 +21,7 @@ jobs:
       - name: Install Dependencies
         run: |
           pip install --upgrade pip
-          pip install yfinance pandas numpy scipy requests pytz
+          pip install yfinance pandas numpy scipy requests pytz python-dotenv
       - name: Run F&O Options Scanner
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
