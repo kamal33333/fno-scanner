@@ -1069,8 +1069,8 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
     if idx_records:
         lines.append("<b>📌 MAJOR INDICES F&amp;O (ANTI-TRAP PULLBACK &amp; ITM SHIELD)</b>")
         lines.append("<pre>")
-        lines.append(col_hdr)
-        lines.append(sep)
+        lines.append(html.escape(col_hdr))
+        lines.append(html.escape(sep))
         for r in idx_records:
             row_str = (
                 f"{r['Contract']:<19}|"
@@ -1092,8 +1092,8 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
     if stk_records:
         lines.append(f"<b>🚀 TOP {len(stk_records[:TOP_N_STOCKS])} STOCK OPTIONS (1-LOT EXCHANGE QTY &amp; QUALITY SCORE)</b>")
         lines.append("<pre>")
-        lines.append(col_hdr)
-        lines.append(sep)
+        lines.append(html.escape(col_hdr))
+        lines.append(html.escape(sep))
         for r in stk_records[:TOP_N_STOCKS]:
             row_str = (
                 f"{r['Contract']:<19}|"
@@ -1136,11 +1136,10 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
             )
 
     lines.append(
-        "\n💡 <i>* = Live Dhan Chain | DTE<=5 Auto-Shifts 1-Strike ITM | Lower/Upper BB Exhaustion Traps Blocked</i>"
+        "\n💡 <i>* = Live Dhan Chain | DTE&lt;=5 Auto-Shifts 1-Strike ITM | Lower/Upper BB Exhaustion Traps Blocked</i>"
     )
     return "\n".join(lines)
-
-
+    
 def send_telegram_alert(html_text):
     if not TELEGRAM_BOT_TOKEN or ":" not in TELEGRAM_BOT_TOKEN:
         print(html_text)
