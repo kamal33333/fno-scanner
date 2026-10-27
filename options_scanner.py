@@ -23,6 +23,7 @@ from scipy.stats import norm
 RAW_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 RAW_CHATID = os.environ.get("TELEGRAM_CHAT_ID", "").strip().strip('"').strip("'")
 EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "manual")
+FORCE_RUN  = "--force" in sys.argv
 
 token_match = re.search(r"(\d+:[A-Za-z0-9_-]+)", RAW_TOKEN)
 TELEGRAM_BOT_TOKEN = token_match.group(1) if token_match else RAW_TOKEN.lstrip("bot").strip('"').strip("'")
@@ -32,41 +33,59 @@ DHAN_CLIENT_ID    = os.environ.get("DHAN_CLIENT_ID", "").strip().strip('"').stri
 DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN", "").strip().strip('"').strip("'")
 
 # ==============================================================================
-# ⚖️ 2. OFFICIAL NSE HOLIDAYS 2026 & TRADING PARAMETERS
+# ⚖️ 2. OFFICIAL NSE HOLIDAYS 2026 & INSTITUTIONAL PARAMETERS
 # ==============================================================================
 NSE_HOLIDAYS_2026 = {
+    date(2026, 1, 26),   # Republic Day
+    date(2026, 3, 20),   # Id-Ul-Fitr
+    date(2026, 4, 2),    # Ram Navami
+    date(2026, 4, 3),    # Good Friday
+    date(2026, 4, 6),    # Mahavir Jayanti
+    date(2026, 4, 14),   # Dr. Baba Saheb Ambedkar Jayanti
+    date(2026, 5, 1),    # Maharashtra Day
+    date(2026, 8, 15),   # Independence Day
     date(2026, 10, 2),   # Mahatma Gandhi Jayanti
     date(2026, 10, 20),  # Dussehra (Market Holiday)
     date(2026, 11, 10),  # Diwali - Balipratipada
-    date(2026, 11, 24),  # Guru Nanak Jayanti (Last Tuesday of Nov -> Expiry shifts to Mon 23NOV!)
+    date(2026, 11, 24),  # Guru Nanak Jayanti (Expiry shifts to Mon 23NOV)
     date(2026, 12, 25),  # Christmas
 }
 
 TARGET_RISK_PER_TRADE  = 3000     # Target Rupee risk per 1-lot trade (₹3,000)
-MAX_SINGLE_LOT_RISK    = 6000     # Max allowed risk for 1 single lot
+MAX_SINGLE_LOT_RISK    = 6000     # Max allowed risk for 1 single lot (₹6,000)
 MAX_CAPITAL_PER_TRADE  = 50000    # Max 1-lot Option Premium outlay (₹50,000 cap)
 LOCK_TO_SINGLE_LOT     = True     # Exact 1-Lot Exchange Qty (Matches Dhan Order Window 1:1)
 TOP_N_STOCKS           = 10       # Top 10 Stock Option setups per scan
 COST_SLIPPAGE_R        = 0.05     # 0.05R brokerage + STT + slippage deducted per trade
 
-MIN_DTE_INTRADAY       = 4        # Minimum 4 DTE for Intraday Scalps
-MIN_DTE_POSITIONAL     = 15       # Minimum 15+ DTE for Positional & Index Swings
+# --- Adaptive Spread & Expiry Rollover Protection ---
+MAX_SPREAD_FRONT_PCT   = 4.5      # Max live bid-ask spread % for front-month liquid contracts (DTE <= 10)
+MAX_SPREAD_FAR_PCT     = 7.2      # Relaxed spread % for next-month rollover contracts (DTE > 10)
+MIN_DTE_INTRADAY       = 1        # Allow liquid Mon/Tue expiry-week scalps (1+ DTE), skip 0-DTE gambling
+MIN_DTE_POSITIONAL     = 12       # Minimum 12+ DTE for Positional & Index Swings (protects Theta)
+ITM_SHIFT_DTE_THRESH   = 5        # Shift 1 strike ITM when DTE <= 5 to defeat Gamma/Theta whipsaws
 
-INTRA_OPT_RR           = 2.0      # Locked 1:2.0 Option Risk:Reward
+# --- Intraday 15M Parameters ---
+INTRA_OPT_RR           = 1.75     # Aligned 1:1.75 Option Risk:Reward
 INTRA_T1_RR            = 1.0      # Book 50% at +1.0R and trail SL to Entry
 INTRA_UND_RR           = 1.6      # Underlying ATR target multiple
-INTRA_ATR_SL_MULT      = 0.9      # 0.9x ATR stop loss
+INTRA_ATR_SL_MULT      = 1.05     # 1.05x ATR structural stop loss (prevents 15M stop-hunts)
 INTRA_MAX_BARS         = 12       # 12 bars intraday window
-INTRA_MIN_SETUPS       = 10       # Minimum historical sample size
-INTRA_MIN_EXP_R        = 0.00     # Minimum Net R-Expectancy after costs
+INTRA_MIN_SETUPS       = 8        # Minimum historical sample size for selective pullback signals
+INTRA_MIN_EXP_R        = 0.05     # Minimum Net R-Expectancy after costs
 
+# --- Positional 1D Swing Parameters ---
 SWING_OPT_RR           = 2.5      # Locked 1:2.5 Option Risk:Reward
 SWING_T1_RR            = 1.25     # Book 50% at +1.25R and trail SL to Entry
 SWING_UND_RR           = 1.8      # Underlying ATR target multiple
-SWING_ATR_SL_MULT      = 1.0      # 1.0x Daily ATR stop loss
+SWING_ATR_SL_MULT      = 1.15     # 1.15x Daily ATR stop loss (survives morning opening range fakeouts)
 SWING_MAX_DAYS         = 6        # 6 trading days hold window
-SWING_MIN_SETUPS       = 10       # Minimum 5-year historical sample size
+SWING_MIN_SETUPS       = 8        # Minimum 5-year historical sample size for anti-trap signals
 SWING_MIN_EXP_R        = 0.02     # Minimum Net R-Expectancy after costs
+
+EXEC_GATE_ENABLED      = True     # Require positive expectancy in option-premium space (replay_executed)
+EXEC_MIN_EXP_R         = 0.03     # Minimum executed-geometry Expectancy R
+EXEC_MIN_SETUPS        = 10       # Minimum setups in executed-geometry replay
 
 RISK_FREE_RATE         = 0.068
 
@@ -74,14 +93,14 @@ RISK_FREE_RATE         = 0.068
 # 📋 3. TRADABLE INDEX OPTIONS + LIQUID NSE F&O STOCKS (LIVE LOT SYNC)
 # ==============================================================================
 FNO_UNIVERSE = {
-    "^NSEI":                 {"name": "NIFTY",      "nse": "NIFTY",      "lot": 65,   "step": 50,  "is_idx": True,  "dhan_id": 13,  "dhan_seg": "IDX_I", "exp_rule": "NSE_WEEKLY_TUE"},
+    "^NSEI":                 {"name": "NIFTY",      "nse": "NIFTY",      "lot": 75,   "step": 50,  "is_idx": True,  "dhan_id": 13,  "dhan_seg": "IDX_I", "exp_rule": "NSE_WEEKLY_TUE"},
     "^NSEBANK":              {"name": "BANKNIFTY",  "nse": "BANKNIFTY",  "lot": 30,   "step": 100, "is_idx": True,  "dhan_id": 25,  "dhan_seg": "IDX_I", "exp_rule": "NSE_MONTHLY_TUE"},
     "^BSESN":                {"name": "SENSEX",     "nse": "SENSEX",     "lot": 20,   "step": 100, "is_idx": True,  "dhan_id": 51,  "dhan_seg": "IDX_I", "exp_rule": "BSE_WEEKLY_THU"},
     "NIFTY_MID_SELECT.NS":   {"name": "MIDCPNIFTY", "nse": "MIDCPNIFTY", "lot": 120,  "step": 25,  "is_idx": True,  "dhan_id": 442, "dhan_seg": "IDX_I", "exp_rule": "NSE_MONTHLY_TUE"},
     "NIFTY_FIN_SERVICE.NS":  {"name": "FINNIFTY",   "nse": "FINNIFTY",   "lot": 65,   "step": 50,  "is_idx": True,  "dhan_id": 27,  "dhan_seg": "IDX_I", "exp_rule": "NSE_MONTHLY_TUE"},
 
     # --- LIQUID NSE F&O STOCKS ---
-    "BAJFINANCE.NS":  {"name": "BAJFINANCE", "nse": "BAJFINANCE", "lot": 750,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "BAJFINANCE.NS":  {"name": "BAJFINANCE", "nse": "BAJFINANCE", "lot": 125,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "ETERNAL.NS":     {"name": "ETERNAL",    "nse": "ETERNAL",    "lot": 2000, "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "ANGELONE.NS":    {"name": "ANGELONE",   "nse": "ANGELONE",   "lot": 200,  "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
     "TECHM.NS":       {"name": "TECHM",      "nse": "TECHM",      "lot": 600,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
@@ -125,14 +144,26 @@ FNO_UNIVERSE = {
     "SUPREMEIND.NS":  {"name": "SUPREMEIND", "nse": "SUPREMEIND", "lot": 175,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
 }
 
+
+def _tick(x: float) -> float:
+    """Round to the 0.05 NSE option tick."""
+    return round(round(x / 0.05) * 0.05, 2)
+
+
+def is_market_open_now() -> bool:
+    ist = pytz.timezone("Asia/Kolkata")
+    now = datetime.now(ist)
+    return (
+        now.weekday() < 5
+        and now.date() not in NSE_HOLIDAYS_2026
+        and (9, 15) <= (now.hour, now.minute) < (15, 30)
+    )
+
+
 # ==============================================================================
-# 🗓️ 4. HOLIDAY-ADJUSTED EXPIRY ENGINE (24NOV -> 23NOV SHIFT)
+# 🗓️ 4. HOLIDAY-ADJUSTED EXPIRY ENGINE & DHAN LIVE ENGINE
 # ==============================================================================
 def adjust_for_nse_holiday(exp_dt: date) -> date:
-    """
-    SEBI/NSE Rule: If an expiry date falls on a trading holiday or weekend,
-    it shifts backwards to the immediately preceding trading day (e.g., Nov 24 -> Nov 23).
-    """
     while exp_dt in NSE_HOLIDAYS_2026 or exp_dt.weekday() >= 5:
         exp_dt -= timedelta(days=1)
     return exp_dt
@@ -190,8 +221,15 @@ class DhanOptionEngine:
         self.enabled = bool(self.client_id and self.access_token)
         self.eq_sec_map = {}
         self.lot_map = {}
-        self.active_calls = 0
+        self.expiry_cache = {}
+        self.chain_cache = {}
+        self.last_call_start = 0.0
+        self.last_call_end = 0.0
+        self.chain_gap = 3.8
+        self.consec_429 = 0
         self.live_quotes_fetched = 0
+        self.session = requests.Session()
+        self.session.headers.update(self._headers())
         self._load_public_security_master()
 
     def _headers(self):
@@ -202,26 +240,62 @@ class DhanOptionEngine:
             "Accept": "application/json",
         }
 
+    def _throttle(self):
+        now = time.time()
+        wait = max(
+            self.chain_gap - (now - self.last_call_start),
+            (self.chain_gap - 0.5) - (now - self.last_call_end),
+        )
+        if wait > 0:
+            time.sleep(wait)
+        self.last_call_start = time.time()
+
+    def _on_429(self, label: str):
+        self.consec_429 += 1
+        self.chain_gap = min(self.chain_gap + 0.8, 6.0)
+        print(f"⚠️ Dhan {label} HTTP 429 -- cooling down 6s, gap now {self.chain_gap:.1f}s")
+        time.sleep(6)
+
     def _load_public_security_master(self):
+        cache_file = "dhan_scrip_master_cache.csv"
         url = "https://images.dhan.co/api-data/api-scrip-master.csv"
+        ist_zone = pytz.timezone("Asia/Kolkata")
+
+        is_cached_today = False
+        if os.path.exists(cache_file):
+            file_mtime = datetime.fromtimestamp(os.path.getmtime(cache_file), ist_zone)
+            if file_mtime.date() == datetime.now(ist_zone).date():
+                is_cached_today = True
+
         try:
-            r = requests.get(url, timeout=15)
-            if r.status_code != 200:
-                return
-            df = pd.read_csv(io.StringIO(r.text), low_memory=False)
+            if is_cached_today:
+                print("Loading Dhan scrip master from local cache...")
+                df = pd.read_csv(cache_file, low_memory=False)
+            else:
+                print("Downloading fresh Dhan scrip master CSV from Dhan...")
+                r = requests.get(url, timeout=30)
+                if r.status_code != 200:
+                    if os.path.exists(cache_file):
+                        print("Download failed. Falling back to existing local cache...")
+                        df = pd.read_csv(cache_file, low_memory=False)
+                    else:
+                        print("Error: Failed to download scrip master and no cache found.")
+                        return
+                else:
+                    with open(cache_file, "w", encoding="utf-8") as f:
+                        f.write(r.text)
+                    df = pd.read_csv(cache_file, low_memory=False)
+
             df.columns = [str(c).strip() for c in df.columns]
 
             eq_df = df[(df["SEM_EXM_EXCH_ID"] == "NSE") & (df["SEM_INSTRUMENT_NAME"] == "EQUITY")]
-            for _, row in eq_df.iterrows():
-                sym = str(row.get("SEM_TRADING_SYMBOL", "")).strip().upper()
-                sec_id = row.get("SEM_SMST_SECURITY_ID")
-                if sym and pd.notna(sec_id):
-                    self.eq_sec_map[sym] = int(sec_id)
+            for sym, sec_id in zip(eq_df["SEM_TRADING_SYMBOL"], eq_df["SEM_SMST_SECURITY_ID"]):
+                if pd.notna(sec_id):
+                    self.eq_sec_map[str(sym).strip().upper()] = int(sec_id)
 
             fno_df = df[df["SEM_INSTRUMENT_NAME"].isin(["FUTSTK", "FUTIDX", "OPTSTK", "OPTIDX"])].copy()
             if not fno_df.empty and "SEM_EXPIRY_DATE" in fno_df.columns:
-                ist = pytz.timezone("Asia/Kolkata")
-                today_str = datetime.now(ist).strftime("%Y-%m-%d")
+                today_str = datetime.now(ist_zone).strftime("%Y-%m-%d")
                 fno_df["EXP_STR"] = fno_df["SEM_EXPIRY_DATE"].astype(str).str.slice(0, 10)
                 fno_df = fno_df[fno_df["EXP_STR"] >= today_str].sort_values("EXP_STR")
 
@@ -248,8 +322,68 @@ class DhanOptionEngine:
         except Exception as e:
             print(f"⚠️ Public Scrip Master lot-sync warning: {e}")
 
-    def get_live_atm_option(self, meta: dict, atm_strike: float, opt_type: str, min_dte: int):
-        if not self.enabled:
+    def _fetch_expiry_list(self, sec_id: int, seg: str, cache_key: str) -> list:
+        if cache_key in self.expiry_cache:
+            return self.expiry_cache[cache_key]
+        if self.consec_429 >= 2:
+            return []
+        for attempt in (1, 2):
+            self._throttle()
+            try:
+                resp = self.session.post(
+                    f"{self.base_url}/optionchain/expirylist",
+                    json={"UnderlyingScrip": int(sec_id), "UnderlyingSeg": seg},
+                    timeout=10,
+                )
+            except Exception:
+                self.last_call_end = time.time()
+                return []
+            self.last_call_end = time.time()
+            if resp.status_code == 429:
+                self._on_429("ExpiryList")
+                if attempt == 1:
+                    continue
+            break
+        if resp.status_code == 200:
+            self.consec_429 = 0
+            data = resp.json().get("data", [])
+            if data:
+                self.expiry_cache[cache_key] = data
+            return data
+        return []
+
+    def _fetch_option_chain(self, sec_id: int, seg: str, expiry: str):
+        ck = (int(sec_id), expiry)
+        if ck in self.chain_cache:
+            return self.chain_cache[ck]
+        if self.consec_429 >= 2:
+            return None
+        for attempt in (1, 2):
+            self._throttle()
+            try:
+                resp = self.session.post(
+                    f"{self.base_url}/optionchain",
+                    json={"UnderlyingScrip": int(sec_id), "UnderlyingSeg": seg, "Expiry": expiry},
+                    timeout=15,
+                )
+            except Exception:
+                self.last_call_end = time.time()
+                return None
+            self.last_call_end = time.time()
+            if resp.status_code == 429:
+                self._on_429("OptionChain")
+                if attempt == 1:
+                    continue
+            break
+        if resp.status_code == 200:
+            self.consec_429 = 0
+            data = resp.json().get("data")
+            self.chain_cache[ck] = data
+            return data
+        return None
+
+    def get_live_option_quote(self, meta: dict, spot_price: float, step: float, opt_type: str, min_dte: int, is_intraday: bool):
+        if not self.enabled or self.consec_429 >= 2:
             return None
         sec_id = meta.get("dhan_id") or self.eq_sec_map.get(meta["nse"])
         seg = meta.get("dhan_seg", "NSE_EQ")
@@ -257,68 +391,64 @@ class DhanOptionEngine:
             return None
 
         try:
-            if self.active_calls > 0:
-                time.sleep(3.1)
-            self.active_calls += 1
-
-            exp_resp = requests.post(
-                f"{self.base_url}/optionchain/expirylist",
-                headers=self._headers(),
-                json={"UnderlyingScrip": int(sec_id), "UnderlyingSeg": seg},
-                timeout=8,
-            )
-            if exp_resp.status_code != 200:
-                return None
-            expiries = exp_resp.json().get("data", [])
+            cache_key = meta["nse"] if meta["is_idx"] else "NSE_STOCKS"
+            expiries = self._fetch_expiry_list(int(sec_id), seg, cache_key)
             if not expiries:
                 return None
 
             ist = pytz.timezone("Asia/Kolkata")
             today = datetime.now(ist).date()
-            chosen_expiry = expiries[-1]
-            chosen_dte = min_dte
+            chosen_expiry = None
+            chosen_dte = None
             for exp_str in sorted(expiries):
                 try:
                     exp_dt = datetime.strptime(str(exp_str)[:10], "%Y-%m-%d").date()
                     dte_days = (exp_dt - today).days
                     if dte_days >= min_dte:
-                        chosen_expiry = exp_str
+                        chosen_expiry = str(exp_str)[:10]
                         chosen_dte = dte_days
                         break
                 except Exception:
                     continue
-
-            oc_resp = requests.post(
-                f"{self.base_url}/optionchain",
-                headers=self._headers(),
-                json={"UnderlyingScrip": int(sec_id), "UnderlyingSeg": seg, "Expiry": chosen_expiry},
-                timeout=8,
-            )
-            if oc_resp.status_code != 200:
+            if not chosen_expiry:
                 return None
 
-            oc_data = oc_resp.json().get("data", {}).get("oc", {})
-            if not oc_data:
+            chain_data = self._fetch_option_chain(int(sec_id), seg, chosen_expiry)
+            if not chain_data or not chain_data.get("oc"):
                 return None
 
-            strike_keys = [float(k) for k in oc_data.keys()]
+            oc_data = chain_data["oc"]
+            und_ltp = float(chain_data.get("last_price") or spot_price)
+            strike_keys = sorted([float(k) for k in oc_data.keys()])
             if not strike_keys:
                 return None
-            best_strike = min(strike_keys, key=lambda x: abs(x - float(atm_strike)))
+
+            # Smart Expiry-Week ITM Strike Shift: If DTE <= 5 on Intraday, shift 1 step ITM to boost Delta & cut Gamma/Theta bleed
+            target_spot = und_ltp
+            if is_intraday and chosen_dte is not None and chosen_dte <= ITM_SHIFT_DTE_THRESH:
+                target_spot = (und_ltp - step) if opt_type == "CE" else (und_ltp + step)
+
+            best_strike = min(strike_keys, key=lambda x: abs(x - target_spot))
             raw_key = next(k for k in oc_data.keys() if abs(float(k) - best_strike) < 1e-4)
             leg = oc_data.get(raw_key, {}).get("ce" if opt_type == "CE" else "pe", {})
-            ltp = float(leg.get("last_price", 0.0))
+            ltp = float(leg.get("last_price") or 0.0)
             if ltp <= 0.5:
                 return None
 
-            greeks = leg.get("greeks", {})
-            exp_label = datetime.strptime(str(chosen_expiry)[:10], "%Y-%m-%d").strftime("%d%b").upper()
+            bid = float(leg.get("top_bid_price") or 0.0)
+            ask = float(leg.get("top_ask_price") or 0.0)
+            greeks = leg.get("greeks") or {}
+            exp_label = datetime.strptime(chosen_expiry, "%Y-%m-%d").strftime("%d%b").upper()
             self.live_quotes_fetched += 1
             return {
                 "ltp": ltp,
-                "delta": max(abs(float(greeks.get("delta", 0.48))), 0.25),
-                "gamma": max(float(greeks.get("gamma", 0.0015)), 0.0001),
-                "iv": max(float(leg.get("implied_volatility", 18.0)) / 100.0, 0.11),
+                "bid": bid,
+                "ask": ask,
+                "und_ltp": und_ltp,
+                "delta": max(abs(float(greeks.get("delta") or 0.52)), 0.25),
+                "gamma": max(float(greeks.get("gamma") or 0.0015), 0.0001),
+                "theta": abs(float(greeks.get("theta") or 0.0)),
+                "iv": max(float(leg.get("implied_volatility") or 18.0) / 100.0, 0.11),
                 "strike": best_strike,
                 "dte": chosen_dte,
                 "exp_tag": exp_label,
@@ -328,7 +458,7 @@ class DhanOptionEngine:
 
 
 # ==============================================================================
-# 🕸️ 5. LIVE OI SPURTS & INDICATORS
+# 🕸️ 5. LIVE OI SPURTS & INSTITUTIONAL ANTI-TRAP INDICATORS
 # ==============================================================================
 def fetch_nse_oi_spurts_map() -> dict:
     base_url = "https://www.nseindia.com"
@@ -389,21 +519,18 @@ def classify_institutional_oi(price_chg_pct: float, oi_chg_pct: float, opt_type:
 
 
 def get_closed_bar_slice(df: pd.DataFrame, is_intraday: bool) -> pd.DataFrame:
-    if df.empty or len(df) < 30:
+    if df is None or df.empty or len(df) < 30:
         return df
     ist = pytz.timezone("Asia/Kolkata")
     now_ist = datetime.now(ist)
-    now_mins = now_ist.hour * 60 + now_ist.minute
-    cutoff_mins = (15 * 60 + 30) if is_intraday else (14 * 60 + 15)
-    in_forming_window = (
-        now_ist.weekday() < 5
-        and (9 * 60 + 15) <= now_mins < cutoff_mins
-    )
-    if in_forming_window:
-        last_ts = df.index[-1]
-        last_date = last_ts.date() if hasattr(last_ts, "date") else now_ist.date()
-        if last_date == now_ist.date():
-            return df.iloc[:-1].copy()
+    last_ts = df.index[-1]
+    if hasattr(last_ts, "tzinfo") and last_ts.tzinfo is not None:
+        last_ts = last_ts.astimezone(ist)
+    else:
+        last_ts = ist.localize(last_ts)
+    bar_end = last_ts + timedelta(minutes=15) if is_intraday else last_ts.replace(hour=15, minute=30, second=0, microsecond=0)
+    if now_ist.weekday() < 5 and bar_end > now_ist:
+        return df.iloc[:-1].copy()
     return df.copy()
 
 
@@ -441,7 +568,7 @@ def extract_ticker_df(raw_data, ticker):
 
 
 def black_scholes_greeks(S, K, T, r, sigma, option_type="CE"):
-    T = max(T, 3.0 / 365.0)
+    T = max(T, 2.0 / 365.0)
     sigma = max(sigma, 0.11)
     d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
     d2 = d1 - sigma * np.sqrt(T)
@@ -449,15 +576,23 @@ def black_scholes_greeks(S, K, T, r, sigma, option_type="CE"):
     if option_type == "CE":
         price = S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
         delta = norm.cdf(d1)
+        theta_annual = (
+            -(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T))
+            - r * K * np.exp(-r * T) * norm.cdf(d2)
+        )
     else:
         price = K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
         delta = -norm.cdf(-d1)
-    return max(float(price), 1.0), abs(float(delta)), float(gamma)
+        theta_annual = (
+            -(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T))
+            + r * K * np.exp(-r * T) * norm.cdf(-d2)
+        )
+    return max(float(price), 1.0), abs(float(delta)), float(gamma), abs(float(theta_annual)) / 365.0
 
 
 def get_dynamic_strike_step(spot: float, meta: dict) -> float:
-    if meta["is_idx"]:
-        return meta["step"]
+    if meta["is_idx"] or meta.get("step", 0) >= 50:
+        return float(meta["step"])
     if spot < 250:
         return 2.5 if meta["step"] == 2.5 else 5.0
     elif spot < 600:
@@ -472,8 +607,16 @@ def get_dynamic_strike_step(spot: float, meta: dict) -> float:
 
 
 def compute_daily_indicators(df):
+    """
+    Institutional Anti-Trap Daily Signal Engine:
+    - Computes Bollinger %B (BB_PCT_B) to ban Put buying in the bottom 22% exhaustion zone
+      and Call buying in the top 78% exhaustion zone.
+    - Requires either a fresh rejection off the EMA9/EMA21/BB_SMA_38 supply/demand zone
+      OR a fresh momentum crossover with room to expand before the Bollinger boundary.
+    """
     df = df.copy()
-    c = df["Close"]
+    c, o, h, l = df["Close"], df["Open"], df["High"], df["Low"]
+    df["EMA9"]  = c.ewm(span=9, adjust=False).mean()
     df["EMA21"] = c.ewm(span=21, adjust=False).mean()
     df["EMA55"] = c.ewm(span=55, adjust=False).mean()
 
@@ -481,7 +624,9 @@ def compute_daily_indicators(df):
     std_38 = c.rolling(38).std(ddof=0)
     df["BB_UP_38"] = df["BB_SMA_38"] + (2.0 * std_38)
     df["BB_LO_38"] = df["BB_SMA_38"] - (2.0 * std_38)
-    df["BB_SMA_61"] = c.rolling(61).mean()
+
+    bb_range = (df["BB_UP_38"] - df["BB_LO_38"]).replace(0, np.nan)
+    df["BB_PCT_B"] = ((c - df["BB_LO_38"]) / bb_range).fillna(0.5)
 
     delta = c.diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
@@ -489,39 +634,58 @@ def compute_daily_indicators(df):
     df["RSI"] = (100 - (100 / (1 + (gain / loss.replace(0, np.nan))))).fillna(50.0)
 
     tr = pd.concat(
-        [df["High"] - df["Low"], (df["High"] - c.shift()).abs(), (df["Low"] - c.shift()).abs()],
+        [h - l, (h - c.shift()).abs(), (l - c.shift()).abs()],
         axis=1,
     ).max(axis=1)
     df["ATR"] = tr.rolling(14).mean()
     df["HV20"] = np.log(c / c.shift(1)).rolling(20).std() * np.sqrt(252)
 
+    # Candle rejection anatomy (prevents buying into adverse continuation)
+    bar_range = (h - l).replace(0, np.nan)
+    upper_wick_ratio = ((h - np.maximum(o, c)) / bar_range).fillna(0.0)
+    lower_wick_ratio = ((np.minimum(o, c) - l) / bar_range).fillna(0.0)
+
+    # Bullish Trigger: Pullback bounce off EMA9/EMA21 or fresh reclaim, NOT stretched at upper band (%B <= 0.78)
+    pullback_ce = (l <= df["EMA9"] * 1.006) & (c >= df["EMA9"]) & ((c > o) | (lower_wick_ratio >= 0.30))
+    reclaim_ce  = (c >= df["EMA21"]) & (c.shift(1) < df["EMA21"].shift(1) * 1.003) & (c > o)
+
     df["CE_Signal"] = (
-        (c >= df["EMA21"] * 0.995)
-        & (c < df["BB_UP_38"])
-        & (df["RSI"] >= 42)
-        & (df["RSI"] <= 70)
+        (c >= df["EMA21"] * 0.997)
+        & (df["BB_PCT_B"] >= 0.25) & (df["BB_PCT_B"] <= 0.78)
+        & (df["RSI"] >= 44) & (df["RSI"] <= 67)
+        & (pullback_ce | reclaim_ce)
     )
+
+    # Bearish Trigger: Pullback rejection off EMA9/EMA21/BB_SMA_38 or fresh breakdown, NOT stretched at lower band (%B >= 0.22, RSI >= 38)
+    pullback_pe  = (h >= df["EMA9"] * 0.994) & (c <= df["EMA9"]) & ((c < o) | (upper_wick_ratio >= 0.30))
+    breakdown_pe = (c <= df["EMA21"]) & (c.shift(1) > df["EMA21"].shift(1) * 0.997) & (c < o)
+
     df["PE_Signal"] = (
-        (c <= df["EMA21"] * 1.005)
-        & (c > df["BB_LO_38"])
-        & (df["RSI"] >= 30)
-        & (df["RSI"] <= 58)
+        (c <= df["EMA21"] * 1.003)
+        & (df["BB_PCT_B"] >= 0.22) & (df["BB_PCT_B"] <= 0.75)
+        & (df["RSI"] >= 38) & (df["RSI"] <= 56)
+        & (pullback_pe | breakdown_pe)
     )
     return df
 
 
 def compute_intraday_15m_indicators(df, is_index=False):
+    """
+    Institutional 15M Anti-Trap Signal Engine:
+    - Eliminates buying Puts at bottom of 15M waterfall (requires BB_PCT_B >= 0.20 & RSI >= 34).
+    - Requires price to either reject off EMA9/TREND_ANCHOR (VWAP) on a pullback or cross freshly.
+    """
     df = df.copy()
     if df.index.tz is not None:
         df.index = df.index.tz_convert("Asia/Kolkata").tz_localize(None)
-    c = df["Close"]
-    df["EMA9"] = c.ewm(span=9, adjust=False).mean()
+    c, o, h, l = df["Close"], df["Open"], df["High"], df["Low"]
+    df["EMA9"]  = c.ewm(span=9, adjust=False).mean()
     df["EMA21"] = c.ewm(span=21, adjust=False).mean()
 
     if is_index or (df["Volume"].sum() == 0):
         df["TREND_ANCHOR"] = df["EMA21"]
     else:
-        tp = (df["High"] + df["Low"] + c) / 3.0
+        tp = (h + l + c) / 3.0
         vol_clean = df["Volume"].replace(0, 1)
         dates = pd.Series(df.index.date, index=df.index)
         df["TREND_ANCHOR"] = (tp * vol_clean).groupby(dates).cumsum() / vol_clean.groupby(dates).cumsum()
@@ -531,36 +695,52 @@ def compute_intraday_15m_indicators(df, is_index=False):
     df["BB_UP_38"] = df["BB_SMA_38"] + (2.0 * std_38)
     df["BB_LO_38"] = df["BB_SMA_38"] - (2.0 * std_38)
 
+    bb_range = (df["BB_UP_38"] - df["BB_LO_38"]).replace(0, np.nan)
+    df["BB_PCT_B"] = ((c - df["BB_LO_38"]) / bb_range).fillna(0.5)
+
     delta = c.diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
     df["RSI"] = (100 - (100 / (1 + (gain / loss.replace(0, np.nan))))).fillna(50.0)
 
     tr = pd.concat(
-        [df["High"] - df["Low"], (df["High"] - c.shift()).abs(), (df["Low"] - c.shift()).abs()],
+        [h - l, (h - c.shift()).abs(), (l - c.shift()).abs()],
         axis=1,
     ).max(axis=1)
     df["ATR"] = tr.rolling(14).mean()
     df["HV20"] = np.log(c / c.shift(1)).rolling(50).std() * np.sqrt(252 * 25)
 
+    bar_range = (h - l).replace(0, np.nan)
+    upper_wick_ratio = ((h - np.maximum(o, c)) / bar_range).fillna(0.0)
+    lower_wick_ratio = ((np.minimum(o, c) - l) / bar_range).fillna(0.0)
+
+    # Intraday Bullish Pullback / Reclaim (Avoids buying top of 15M spike where %B > 0.82)
+    pullback_ce = ((l <= df["EMA9"] * 1.003) | (l <= df["TREND_ANCHOR"] * 1.003)) & ((c > o) | (lower_wick_ratio >= 0.30))
+    cross_ce    = (c >= df["TREND_ANCHOR"]) & (c.shift(1) < df["TREND_ANCHOR"].shift(1) * 1.002) & (c > o)
+
     df["CE_Signal"] = (
         (c >= df["TREND_ANCHOR"])
         & (df["EMA9"] >= df["EMA21"] * 0.998)
-        & (c < df["BB_UP_38"])
-        & (df["RSI"] >= 46)
-        & (df["RSI"] <= 74)
+        & (df["BB_PCT_B"] >= 0.25) & (df["BB_PCT_B"] <= 0.82)
+        & (df["RSI"] >= 46) & (df["RSI"] <= 70)
+        & (pullback_ce | cross_ce)
     )
+
+    # Intraday Bearish Pullback / Breakdown (Avoids shorting bottom of 15M waterfall where %B < 0.18 or RSI < 34)
+    pullback_pe = ((h >= df["EMA9"] * 0.997) | (h >= df["TREND_ANCHOR"] * 0.997)) & ((c < o) | (upper_wick_ratio >= 0.30))
+    cross_pe    = (c <= df["TREND_ANCHOR"]) & (c.shift(1) > df["TREND_ANCHOR"].shift(1) * 0.998) & (c < o)
+
     df["PE_Signal"] = (
         (c <= df["TREND_ANCHOR"])
         & (df["EMA9"] <= df["EMA21"] * 1.002)
-        & (c > df["BB_LO_38"])
-        & (df["RSI"] >= 26)
-        & (df["RSI"] <= 54)
+        & (df["BB_PCT_B"] >= 0.18) & (df["BB_PCT_B"] <= 0.75)
+        & (df["RSI"] >= 34) & (df["RSI"] <= 54)
+        & (pullback_pe | cross_pe)
     )
     return df
 
 
-def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, is_intraday=False):
+def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, is_intraday=False, t1_on=True):
     sig_col = "CE_Signal" if direction == "CE" else "PE_Signal"
     closes, highs, lows, atrs, sigs = (
         df["Close"].values,
@@ -613,10 +793,10 @@ def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, i
                     outcome_resolved = True
                     break
                 if highs[j] >= tgt:
-                    trade_r = 0.5 * t1_r_Lock + 0.5 * full_r_Lock
+                    trade_r = (0.5 * t1_r_Lock + 0.5 * full_r_Lock) if t1_on else full_r_Lock
                     outcome_resolved = True
                     break
-                if highs[j] >= t1:
+                if t1_on and highs[j] >= t1:
                     t1_reached = True
             else:
                 curr_sl = entry if t1_reached else sl
@@ -625,10 +805,10 @@ def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, i
                     outcome_resolved = True
                     break
                 if lows[j] <= tgt:
-                    trade_r = 0.5 * t1_r_Lock + 0.5 * full_r_Lock
+                    trade_r = (0.5 * t1_r_Lock + 0.5 * full_r_Lock) if t1_on else full_r_Lock
                     outcome_resolved = True
                     break
-                if lows[j] <= t1:
+                if t1_on and lows[j] <= t1:
                     t1_reached = True
 
         if not outcome_resolved:
@@ -648,59 +828,165 @@ def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, i
     return total_trades, expectancy, win_pct
 
 
+def replay_executed(df: pd.DataFrame, direction: str, eps: float, kappa: float, stop_rel: float,
+                    t1_rr: float, rr: float, cost_r: float, is_intraday: bool, max_bars: int, theta_bar: float = 0.0) -> dict:
+    """
+    Replay the EXECUTED option trade at every historical signal bar in OPTION-PREMIUM space,
+    incorporating T1-50% partial profit booking and breakeven trailing stop.
+    """
+    sig = df["CE_Signal" if direction == "CE" else "PE_Signal"].values
+    cl, hi, lo = df["Close"].values, df["High"].values, df["Low"].values
+    n = len(df)
+    sgn = 1.0 if direction == "CE" else -1.0
+    t1_Prem  = t1_rr * stop_rel
+    tgt_Prem = rr * stop_rel
+
+    if is_intraday:
+        day_id = (df.index.year * 10000 + df.index.month * 100 + df.index.day).values
+        mins   = (df.index.hour * 60 + df.index.minute).values
+        last_of_day = np.zeros(n, dtype=int)
+        last_of_day[n - 1] = n - 1
+        for k in range(n - 2, -1, -1):
+            last_of_day[k] = last_of_day[k + 1] if day_id[k] == day_id[k + 1] else k
+
+    def prem(x):
+        return max(eps * x + 0.5 * kappa * x * x, -1.0)
+
+    out = []
+    i = 50
+    while i < n - 1:
+        if not sig[i] or cl[i] <= 0 or (is_intraday and not (570 <= mins[i] <= 870)):
+            i += 1
+            continue
+        entry = cl[i]
+        end = last_of_day[i] if is_intraday else min(i + max_bars, n - 1)
+        if end <= i:
+            i += 1
+            continue
+
+        t1_hit = False
+        r_val, exit_j = None, end
+        for j in range(i + 1, end + 1):
+            fav = sgn * ((hi[j] if sgn > 0 else lo[j]) - entry) / entry
+            adv = sgn * ((lo[j] if sgn > 0 else hi[j]) - entry) / entry
+            decay = theta_bar * (j - i)
+            p_hi, p_lo = prem(fav) - decay, prem(adv) - decay
+
+            curr_stop_level = 0.0 if t1_hit else -stop_rel
+            if p_lo <= curr_stop_level:
+                raw_r = (0.5 * t1_rr) if t1_hit else -1.0
+                r_val, exit_j = raw_r - cost_r, j
+                break
+            if p_hi >= tgt_Prem:
+                raw_r = 0.5 * t1_rr + 0.5 * rr
+                r_val, exit_j = raw_r - cost_r, j
+                break
+            if not t1_hit and p_hi >= t1_Prem:
+                t1_hit = True
+
+        if r_val is None:
+            x = sgn * (cl[end] - entry) / entry
+            end_prem = prem(x) - theta_bar * (end - i)
+            if t1_hit:
+                rem_r = max(end_prem / stop_rel, 0.0)
+                r_val = (0.5 * t1_rr + 0.5 * rem_r) - cost_r
+            else:
+                r_val = max(end_prem / stop_rel, -1.0) - cost_r
+        out.append(r_val)
+        i = max(i + 1, exit_j)
+
+    if not out:
+        return {"n": 0, "exp": -1.0, "win": 0.0, "full_loss": 0.0}
+    arr = np.array(out)
+    return {
+        "n": len(arr),
+        "exp": float(arr.mean()),
+        "win": float((arr > 0).mean() * 100.0),
+        "full_loss": float((arr <= -0.9).mean() * 100.0),
+    }
+
+
 def build_option_trade_row(
-    meta, df, opt_type, total_trades, expectancy, win_pct, india_vix, is_intraday, oi_tag, is_oi_boosted, dhan_engine: DhanOptionEngine
+    meta, df, opt_type, total_trades, expectancy, win_pct, india_vix, is_intraday, oi_tag, is_oi_boosted,
+    dhan_engine: DhanOptionEngine, telemetry: dict
 ):
     latest = df.iloc[-1]
     spot = float(latest["Close"])
     atr = float(latest["ATR"])
     hv20 = float(latest["HV20"]) if not np.isnan(latest["HV20"]) else 0.22
     step = get_dynamic_strike_step(spot, meta)
-    atm_strike = int(round(spot / step) * step) if step >= 5 else round(spot / step) * step
 
     min_dte_req = MIN_DTE_INTRADAY if is_intraday else MIN_DTE_POSITIONAL
+    mkt_open = is_market_open_now()
 
-    dhan_quote = dhan_engine.get_live_atm_option(meta, atm_strike, opt_type, min_dte=min_dte_req) if dhan_engine else None
+    dhan_quote = (
+        dhan_engine.get_live_option_quote(meta, spot, step, opt_type, min_dte=min_dte_req, is_intraday=is_intraday)
+        if dhan_engine else None
+    )
     if dhan_quote:
-        opt_entry  = dhan_quote["ltp"]
+        bid = dhan_quote["bid"]
+        ask = dhan_quote["ask"]
+        dte = dhan_quote["dte"] or min_dte_req
+        max_allowed_spread = MAX_SPREAD_FRONT_PCT if dte <= 10 else MAX_SPREAD_FAR_PCT
+        if mkt_open and bid > 0 and ask > 0:
+            spread_pct = (ask - bid) / ((ask + bid) / 2.0) * 100.0
+            if spread_pct > max_allowed_spread:
+                telemetry["spread_drop"] += 1
+                return None
+            opt_entry = ask
+        else:
+            opt_entry = dhan_quote["ltp"]
         delta      = dhan_quote["delta"]
         gamma      = dhan_quote["gamma"]
-        atm_strike = dhan_quote["strike"]
+        theta      = dhan_quote["theta"]
+        und_ltp    = dhan_quote["und_ltp"]
+        strike_val = dhan_quote["strike"]
         exp_tag    = dhan_quote["exp_tag"]
         src_flag   = "*"
     else:
         dte, exp_tag = get_exchange_accurate_expiry(meta, min_dte=min_dte_req)
+        target_spot = spot
+        if is_intraday and dte <= ITM_SHIFT_DTE_THRESH:
+            target_spot = (spot - step) if opt_type == "CE" else (spot + step)
+        strike_val = int(round(target_spot / step) * step) if step >= 5 else round(target_spot / step) * step
+
         iv = india_vix * 1.12 if meta["is_idx"] else max(hv20 * 1.05, india_vix * 1.35)
-        opt_entry, delta, gamma = black_scholes_greeks(
-            S=spot, K=atm_strike, T=dte / 365.0, r=RISK_FREE_RATE, sigma=iv, option_type=opt_type
+        opt_entry, delta, gamma, theta = black_scholes_greeks(
+            S=spot, K=strike_val, T=dte / 365.0, r=RISK_FREE_RATE, sigma=iv, option_type=opt_type
         )
+        bid = ask = 0.0
+        und_ltp = spot
         src_flag = ""
 
-    strike_str = f"{int(atm_strike)}" if atm_strike == int(atm_strike) else f"{atm_strike:.1f}"
+    strike_str = f"{int(strike_val)}" if strike_val == int(strike_val) else f"{strike_val:.1f}"
     lot_size = dhan_engine.lot_map.get(meta["nse"], meta["lot"]) if dhan_engine else meta["lot"]
 
+    # --- Structural Spot Invalidation & Volatility-Adaptive Option Stop Loss ---
     atr_mult = INTRA_ATR_SL_MULT if is_intraday else SWING_ATR_SL_MULT
     und_risk = atr * atr_mult
-    raw_opt_sl_dist = delta * und_risk - 0.5 * gamma * (und_risk ** 2)
-    max_pct_sl = 0.15 if meta["is_idx"] else (0.18 if is_intraday else 0.20)
-    min_pct_sl = 0.10 if (is_intraday or meta["is_idx"]) else 0.12
-    opt_risk = min(opt_entry * max_pct_sl, max(opt_entry * min_pct_sl, raw_opt_sl_dist))
+    spot_sl  = round(und_ltp - und_risk, 1) if opt_type == "CE" else round(und_ltp + und_risk, 1)
 
-    opt_entry = round(opt_entry, 1)
-    opt_risk = max(round(opt_risk, 1), 0.3)
-    opt_sl = round(max(0.5, opt_entry - opt_risk), 1)
-    actual_risk = max(round(opt_entry - opt_sl, 1), 0.2)
+    # Include 2nd-order Gamma/Vega buffer so normal intraday wicks don't prematurely stop out long options
+    raw_opt_sl_dist = delta * und_risk + 0.25 * gamma * (und_risk ** 2)
+    max_pct_sl = 0.24 if meta["is_idx"] else (0.25 if is_intraday else 0.28)
+    min_pct_sl = 0.14 if (is_intraday or meta["is_idx"]) else 0.16
+
+    opt_entry = _tick(opt_entry)
+    opt_risk = max(round(min(opt_entry * max_pct_sl, max(opt_entry * min_pct_sl, raw_opt_sl_dist)), 1), 0.3)
+    opt_sl = _tick(max(0.5, opt_entry - opt_risk))
+    actual_risk = max(round(opt_entry - opt_sl, 2), 0.2)
 
     target_rr = INTRA_OPT_RR if is_intraday else SWING_OPT_RR
     t1_rr = INTRA_T1_RR if is_intraday else SWING_T1_RR
-    opt_t1 = round(opt_entry + (actual_risk * t1_rr), 1)
-    opt_tgt = round(opt_entry + (actual_risk * target_rr), 1)
+    opt_t1 = _tick(opt_entry + (actual_risk * t1_rr))
+    opt_tgt = _tick(opt_entry + (actual_risk * target_rr))
 
     risk_per_lot = max(actual_risk * lot_size, 1.0)
     cost_per_lot = max(opt_entry * lot_size, 1.0)
 
     if LOCK_TO_SINGLE_LOT:
         if risk_per_lot > MAX_SINGLE_LOT_RISK or cost_per_lot > MAX_CAPITAL_PER_TRADE:
+            telemetry["risk_cap_drop"] += 1
             return None
         num_lots = 1
     else:
@@ -708,14 +994,38 @@ def build_option_trade_row(
         lots_by_cap = int(MAX_CAPITAL_PER_TRADE // cost_per_lot)
         num_lots = min(lots_by_risk, lots_by_cap)
         if num_lots < 1:
+            telemetry["risk_cap_drop"] += 1
             return None
+
+    # --- Executed-Geometry Replay Gate (with T1-50% & Breakeven Trail) ---
+    stop_rel = actual_risk / opt_entry
+    eps_ = delta * und_ltp / opt_entry
+    kap_ = gamma * und_ltp * und_ltp / opt_entry
+    spread_r = (0.5 * (ask - bid) / actual_risk) if (mkt_open and ask > 0 and bid > 0) else 0.05
+    spread_r = min(spread_r, 0.20)
+    cost_r = COST_SLIPPAGE_R + spread_r
+    theta_rel_day = min(theta / opt_entry, 0.20) if opt_entry > 0 else 0.0
+    theta_bar = theta_rel_day / 25.0 if is_intraday else theta_rel_day
+
+    ex = replay_executed(
+        df, opt_type, eps_, kap_, stop_rel, t1_rr, target_rr, cost_r,
+        is_intraday, INTRA_MAX_BARS if is_intraday else SWING_MAX_DAYS, theta_bar
+    )
+    if EXEC_GATE_ENABLED and not meta["is_idx"]:
+        if ex["n"] < EXEC_MIN_SETUPS or ex["exp"] < EXEC_MIN_EXP_R:
+            telemetry["exec_gate_drop"] += 1
+            return None
+
+    telemetry["passed"] += 1
+    final_exp = ex["exp"] if ex["n"] >= 8 else expectancy
+    final_win = ex["win"] if ex["n"] >= 8 else win_pct
 
     qty = num_lots * lot_size
     capital = int(round(opt_entry * qty))
     total_rupee_risk = int(round(actual_risk * qty))
 
-    exp_rounded = round(expectancy, 2)
-    win_rounded = round(win_pct, 1)
+    exp_rounded = round(final_exp, 2)
+    win_rounded = round(final_win, 1)
     quality_score = round((exp_rounded * 100.0) + win_rounded, 1)
     full_contract_name = f"{src_flag}{meta['nse']} {strike_str}{opt_type}"
 
@@ -727,6 +1037,7 @@ def build_option_trade_row(
         "Capital": capital,
         "RiskRs": total_rupee_risk,
         "Stop": opt_sl,
+        "SpotSL": spot_sl,
         "T1": opt_t1,
         "Target": opt_tgt,
         "OI_Flow": oi_tag,
@@ -739,7 +1050,7 @@ def build_option_trade_row(
 
 def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine: DhanOptionEngine, oi_count: int):
     lot_sync_cnt = len(dhan_engine.lot_map) if dhan_engine else 0
-    if dhan_engine.enabled and dhan_engine.live_quotes_fetched > 0:
+    if dhan_engine and dhan_engine.enabled and dhan_engine.live_quotes_fetched > 0:
         feed_str = f"Dhan Live ({dhan_engine.live_quotes_fetched}) + {lot_sync_cnt} Lots Synced"
     else:
         feed_str = f"Dhan Lot Master ({lot_sync_cnt}) + NSE OI ({oi_count})"
@@ -756,7 +1067,7 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
     ]
 
     if idx_records:
-        lines.append("<b>📌 MAJOR INDICES F&amp;O (SORTED BY QUALITY SCORE)</b>")
+        lines.append("<b>📌 MAJOR INDICES F&amp;O (ANTI-TRAP PULLBACK &amp; ITM SHIELD)</b>")
         lines.append("<pre>")
         lines.append(col_hdr)
         lines.append(sep)
@@ -813,18 +1124,19 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
     top_two = prime_picks[:2]
 
     if top_two:
-        lines.append("\n<b>🏆 TOP HIGH-CONVICTION TRADES (AUTO 3-STEP TRIAGE):</b>")
+        lines.append("\n<b>🏆 TOP HIGH-CONVICTION TRADES (WITH SPOT INVALIDATION SHIELD):</b>")
         for idx, p in enumerate(top_two, 1):
             lines.append(
                 f"{idx}. <b>{html.escape(p['Contract'])} ({html.escape(p['Expiry'])})</b> "
-                f"👉 Entry: <code>₹{p['Entry']:.1f}</code> | 1-Lot Qty: <code>{p['Qty']}</code> "
+                f"👉 Entry: <code>₹{p['Entry']:.2f}</code> | Qty: <code>{p['Qty']}</code> "
                 f"| Cap: <code>₹{p['Capital']:,}</code> | Risk: <code>₹{p['RiskRs']:,}</code> "
-                f"| SL: <code>{p['Stop']:.1f}</code> | T1: <code>{p['T1']:.1f}</code> | Tgt: <code>{p['Target']:.1f}</code> "
+                f"| OptSL: <code>{p['Stop']:.2f}</code> (SpotSL: <code>{p['SpotSL']:.1f}</code>) "
+                f"| T1: <code>{p['T1']:.2f}</code> | Tgt: <code>{p['Target']:.2f}</code> "
                 f"| OI: <code>{html.escape(p['OI_Flow'].strip())}</code> | <b>Score: {p['Score']:.1f}</b>"
             )
 
     lines.append(
-        "\n💡 <i>Qty = Exact 1-Lot Exchange Quantity | Holiday-Adjusted Expiry (23NOV) | Score = (ExpR×100) + Win%</i>"
+        "\n💡 <i>* = Live Dhan Chain | DTE<=5 Auto-Shifts 1-Strike ITM | Lower/Upper BB Exhaustion Traps Blocked</i>"
     )
     return "\n".join(lines)
 
@@ -866,8 +1178,7 @@ def main():
     now_str = now_ist.strftime("%d-%b %I:%M %p IST")
     current_minutes = now_ist.hour * 60 + now_ist.minute
 
-    # HOLIDAY GUARD: Automatically pauses execution on NSE Trading Holidays (Dussehra, Diwali, etc.)
-    if EVENT_NAME == "schedule":
+    if EVENT_NAME == "schedule" and not FORCE_RUN:
         if (
             now_ist.weekday() >= 5
             or now_ist.date() in NSE_HOLIDAYS_2026
@@ -881,6 +1192,16 @@ def main():
     india_vix = get_live_vix()
     oi_spurts_map = fetch_nse_oi_spurts_map()
     dhan_engine = DhanOptionEngine(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+
+    telemetry = {
+        "signals": 0,
+        "oi_block": 0,
+        "bt_drop": 0,
+        "spread_drop": 0,
+        "risk_cap_drop": 0,
+        "exec_gate_drop": 0,
+        "passed": 0,
+    }
 
     messages_sent = 0
 
@@ -904,47 +1225,57 @@ def main():
 
         opt_type = "CE" if float(last["Close"]) >= float(last["TREND_ANCHOR"]) else "PE"
         sig_col = "CE_Signal" if opt_type == "CE" else "PE_Signal"
-        is_blocked, is_boosted, oi_tag = classify_institutional_oi(price_chg_pct, oi_chg_pct, opt_type)
 
+        if not (bool(last[sig_col]) or bool(prev[sig_col])):
+            continue
+        telemetry["signals"] += 1
+
+        is_blocked, is_boosted, oi_tag = classify_institutional_oi(price_chg_pct, oi_chg_pct, opt_type)
         if is_blocked:
+            telemetry["oi_block"] += 1
             continue
 
-        tot, exp_r, wp = backtest_signals(df15, opt_type, INTRA_ATR_SL_MULT, INTRA_UND_RR, INTRA_MAX_BARS, True)
+        tot, exp_r, wp = backtest_signals(df15, opt_type, INTRA_ATR_SL_MULT, INTRA_UND_RR, INTRA_MAX_BARS, True, t1_on=True)
         q_score = (round(exp_r, 2) * 100.0) + round(wp, 1)
 
         if meta["is_idx"]:
-            if tot >= 5:
+            if tot >= 4:
                 intra_idx.append((q_score, is_boosted, meta, df15, opt_type, tot, exp_r, wp, oi_tag))
+            else:
+                telemetry["bt_drop"] += 1
         else:
-            if not (bool(last[sig_col]) or bool(prev[sig_col]) or is_boosted):
-                continue
             if tot >= INTRA_MIN_SETUPS and exp_r >= INTRA_MIN_EXP_R:
                 intra_stk.append((q_score, is_boosted, meta, df15, opt_type, tot, exp_r, wp, oi_tag))
+            else:
+                telemetry["bt_drop"] += 1
 
     intra_idx.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
     intra_stk.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
 
     intra_idx_rows = [
         r for r in (
-            build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, True, tag, b, dhan_engine)
+            build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, True, tag, b, dhan_engine, telemetry)
             for _, b, m, d, o, t, exp_r, wp, tag in intra_idx
         ) if r
     ]
-    intra_stk_rows = [
-        r for r in (
-            build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, True, tag, b, dhan_engine)
-            for _, b, m, d, o, t, exp_r, wp, tag in intra_stk[:TOP_N_STOCKS + 4]
-        ) if r
-    ][:TOP_N_STOCKS]
+    intra_stk_rows = []
+    for _, b, m, d, o, t, exp_r, wp, tag in intra_stk[:TOP_N_STOCKS + 10]:
+        if len(intra_stk_rows) >= TOP_N_STOCKS:
+            break
+        row = build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, True, tag, b, dhan_engine, telemetry)
+        if row:
+            intra_stk_rows.append(row)
+
+    intra_stk_rows.sort(key=lambda x: (x["OIBoost"], x["Score"]), reverse=True)
 
     if intra_idx_rows or intra_stk_rows:
         msg = format_combined_table(
-            intra_idx_rows, intra_stk_rows, "15M INTRADAY F&O SCALPS (LOCKED 1:2.0 RR)", now_str, dhan_engine, len(oi_spurts_map)
+            intra_idx_rows, intra_stk_rows, "15M INTRADAY F&O SCALPS (ANTI-TRAP | 1:1.75 RR)", now_str, dhan_engine, len(oi_spurts_map)
         )
         send_telegram_alert(msg)
         messages_sent += 1
 
-    # 2. POSITIONAL 3-5D SWINGS (HOLIDAY-ADJUSTED 23NOV EXPIRY)
+    # 2. POSITIONAL 3-5D SWINGS (HOLIDAY-ADJUSTED FAR EXPIRY)
     raw_1d = yf.download(tickers, period="5y", interval="1d", group_by="ticker", progress=False)
     swing_idx, swing_stk = [], []
 
@@ -962,51 +1293,68 @@ def main():
 
         opt_type = "CE" if float(last["Close"]) >= float(last["EMA21"]) else "PE"
         sig_col = "CE_Signal" if opt_type == "CE" else "PE_Signal"
-        is_blocked, is_boosted, oi_tag = classify_institutional_oi(price_chg_pct, oi_chg_pct, opt_type)
 
+        if not bool(last[sig_col]):
+            continue
+        telemetry["signals"] += 1
+
+        is_blocked, is_boosted, oi_tag = classify_institutional_oi(price_chg_pct, oi_chg_pct, opt_type)
         if is_blocked:
+            telemetry["oi_block"] += 1
             continue
 
-        tot, exp_r, wp = backtest_signals(df1d, opt_type, SWING_ATR_SL_MULT, SWING_UND_RR, SWING_MAX_DAYS, False)
+        tot, exp_r, wp = backtest_signals(df1d, opt_type, SWING_ATR_SL_MULT, SWING_UND_RR, SWING_MAX_DAYS, False, t1_on=True)
         q_score = (round(exp_r, 2) * 100.0) + round(wp, 1)
 
         if meta["is_idx"]:
-            if tot >= 5:
+            if tot >= 4:
                 swing_idx.append((q_score, is_boosted, meta, df1d, opt_type, tot, exp_r, wp, oi_tag))
+            else:
+                telemetry["bt_drop"] += 1
         else:
-            if not (bool(last[sig_col]) or is_boosted):
-                continue
             if tot >= SWING_MIN_SETUPS and exp_r >= SWING_MIN_EXP_R:
                 swing_stk.append((q_score, is_boosted, meta, df1d, opt_type, tot, exp_r, wp, oi_tag))
+            else:
+                telemetry["bt_drop"] += 1
 
     swing_idx.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
     swing_stk.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
 
     swing_idx_rows = [
         r for r in (
-            build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, False, tag, b, dhan_engine)
+            build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, False, tag, b, dhan_engine, telemetry)
             for _, b, m, d, o, t, exp_r, wp, tag in swing_idx
         ) if r
     ]
-    swing_stk_rows = [
-        r for r in (
-            build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, False, tag, b, dhan_engine)
-            for _, b, m, d, o, t, exp_r, wp, tag in swing_stk[:TOP_N_STOCKS + 4]
-        ) if r
-    ][:TOP_N_STOCKS]
+    swing_stk_rows = []
+    for _, b, m, d, o, t, exp_r, wp, tag in swing_stk[:TOP_N_STOCKS + 8]:
+        if len(swing_stk_rows) >= TOP_N_STOCKS:
+            break
+        row = build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, False, tag, b, dhan_engine, telemetry)
+        if row:
+            swing_stk_rows.append(row)
+
+    swing_stk_rows.sort(key=lambda x: (x["OIBoost"], x["Score"]), reverse=True)
 
     if swing_idx_rows or swing_stk_rows:
         msg = format_combined_table(
-            swing_idx_rows, swing_stk_rows, "3-5D POSITIONAL F&O (15+ DTE FAR EXPIRY | 1:2.5 RR)", now_str, dhan_engine, len(oi_spurts_map)
+            swing_idx_rows, swing_stk_rows, "3-5D POSITIONAL F&O (ANTI-TRAP | 12+ DTE | 1:2.5 RR)", now_str, dhan_engine, len(oi_spurts_map)
         )
         send_telegram_alert(msg)
         messages_sent += 1
 
+    diag_str = (
+        f"Sigs:{telemetry['signals']} | OI_Blk:{telemetry['oi_block']} | BT_Drop:{telemetry['bt_drop']} | "
+        f"Spread_Drop:{telemetry['spread_drop']} | Cap_Drop:{telemetry['risk_cap_drop']} | "
+        f"Exec_Drop:{telemetry['exec_gate_drop']} | Passed:{telemetry['passed']}"
+    )
+    print(f"📊 Pipeline Telemetry: {diag_str}")
+
     if messages_sent == 0:
         fallback_msg = (
             f"<b>ℹ️ F&amp;O OPTIONS SCANNER ({html.escape(now_str)})</b>\n"
-            f"Scanner ran cleanly (Scraped {len(oi_spurts_map)} NSE OI records), "
-            f"but no setups passed the strict risk &amp; positive ExpR filters."
+            f"Scanner ran cleanly (Scraped {len(oi_spurts_map)} NSE OI records).\n"
+            f"<code>{html.escape(diag_str)}</code>"
         )
         send_telegram_alert(fallback_msg)
 
