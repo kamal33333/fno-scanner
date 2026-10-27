@@ -29,4 +29,5 @@ jobs:
           DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
           DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
+          python options_scanner.py --force
         run: python options_scanner.py
