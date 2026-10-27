@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import os
 import re
 import io
@@ -16,6 +17,12 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 from scipy.stats import norm
+from dotenv import load_dotenv
+
+# Ensure local .env is loaded even if invoked directly outside run_scanner.sh
+ENV_FILE_PATH = "/home/ubuntu/scanners/.env"
+if os.path.exists(ENV_FILE_PATH):
+    load_dotenv(ENV_FILE_PATH)
 
 # ==============================================================================
 # 🔐 1. CREDENTIALS & ENVIRONMENT VARIABLES (AUTO-SANITIZED)
@@ -161,7 +168,7 @@ def is_market_open_now() -> bool:
 
 
 # ==============================================================================
-# 🗓️ 4. HOLIDAY-ADJUSTED EXPIRY ENGINE & DHAN LIVE ENGINE
+# 🗓️ 4. HOLIDAY-ADJUSTED EXPIRY ENGINE & SELF-HEALING DHAN LIVE ENGINE
 # ==============================================================================
 def adjust_for_nse_holiday(exp_dt: date) -> date:
     while exp_dt in NSE_HOLIDAYS_2026 or exp_dt.weekday() >= 5:
@@ -227,6 +234,7 @@ class DhanOptionEngine:
         self.last_call_end = 0.0
         self.chain_gap = 3.8
         self.consec_429 = 0
+        self.attempted_401_heal = False
         self.live_quotes_fetched = 0
         self.session = requests.Session()
         self.session.headers.update(self._headers())
@@ -239,6 +247,29 @@ class DhanOptionEngine:
             "Content-Type": "application/json",
             "Accept": "application/json",
         }
+
+    def _try_self_heal_401(self) -> bool:
+        """If Dhan returns HTTP 401 mid-day, invoke refresh_token.py once and hot-reload .env."""
+        if self.attempted_401_heal:
+            return False
+        self.attempted_401_heal = True
+        try:
+            import subprocess
+            refresh_script = "/home/ubuntu/scanners/refresh_token.py"
+            if os.path.exists(refresh_script):
+                print("🔄 Dhan HTTP 401 detected! Triggering self-healing refresh_token.py...")
+                subprocess.run([sys.executable, refresh_script], timeout=25, check=False)
+                if os.path.exists(ENV_FILE_PATH):
+                    load_dotenv(ENV_FILE_PATH, override=True)
+                    new_tok = os.environ.get("DHAN_ACCESS_TOKEN", "").strip().strip('"').strip("'")
+                    if new_tok and new_tok != self.access_token:
+                        self.access_token = new_tok
+                        self.session.headers.update(self._headers())
+                        print("✅ Hot-reloaded refreshed Dhan JWT token into active session!")
+                        return True
+        except Exception as e:
+            print(f"⚠️ Self-heal 401 failed: {e}")
+        return False
 
     def _throttle(self):
         now = time.time()
@@ -339,6 +370,8 @@ class DhanOptionEngine:
                 self.last_call_end = time.time()
                 return []
             self.last_call_end = time.time()
+            if resp.status_code == 401 and attempt == 1 and self._try_self_heal_401():
+                continue
             if resp.status_code == 429:
                 self._on_429("ExpiryList")
                 if attempt == 1:
@@ -370,6 +403,8 @@ class DhanOptionEngine:
                 self.last_call_end = time.time()
                 return None
             self.last_call_end = time.time()
+            if resp.status_code == 401 and attempt == 1 and self._try_self_heal_401():
+                continue
             if resp.status_code == 429:
                 self._on_429("OptionChain")
                 if attempt == 1:
@@ -611,8 +646,7 @@ def compute_daily_indicators(df):
     Institutional Anti-Trap Daily Signal Engine:
     - Computes Bollinger %B (BB_PCT_B) to ban Put buying in the bottom 22% exhaustion zone
       and Call buying in the top 78% exhaustion zone.
-    - Requires either a fresh rejection off the EMA9/EMA21/BB_SMA_38 supply/demand zone
-      OR a fresh momentum crossover with room to expand before the Bollinger boundary.
+    - Requires a structural pullback bounce/rejection off EMA9/EMA21 OR a fresh momentum reclaim/breakdown.
     """
     df = df.copy()
     c, o, h, l = df["Close"], df["Open"], df["High"], df["Low"]
@@ -640,12 +674,10 @@ def compute_daily_indicators(df):
     df["ATR"] = tr.rolling(14).mean()
     df["HV20"] = np.log(c / c.shift(1)).rolling(20).std() * np.sqrt(252)
 
-    # Candle rejection anatomy (prevents buying into adverse continuation)
     bar_range = (h - l).replace(0, np.nan)
     upper_wick_ratio = ((h - np.maximum(o, c)) / bar_range).fillna(0.0)
     lower_wick_ratio = ((np.minimum(o, c) - l) / bar_range).fillna(0.0)
 
-    # Bullish Trigger: Pullback bounce off EMA9/EMA21 or fresh reclaim, NOT stretched at upper band (%B <= 0.78)
     pullback_ce = (l <= df["EMA9"] * 1.006) & (c >= df["EMA9"]) & ((c > o) | (lower_wick_ratio >= 0.30))
     reclaim_ce  = (c >= df["EMA21"]) & (c.shift(1) < df["EMA21"].shift(1) * 1.003) & (c > o)
 
@@ -656,7 +688,6 @@ def compute_daily_indicators(df):
         & (pullback_ce | reclaim_ce)
     )
 
-    # Bearish Trigger: Pullback rejection off EMA9/EMA21/BB_SMA_38 or fresh breakdown, NOT stretched at lower band (%B >= 0.22, RSI >= 38)
     pullback_pe  = (h >= df["EMA9"] * 0.994) & (c <= df["EMA9"]) & ((c < o) | (upper_wick_ratio >= 0.30))
     breakdown_pe = (c <= df["EMA21"]) & (c.shift(1) > df["EMA21"].shift(1) * 0.997) & (c < o)
 
@@ -672,8 +703,8 @@ def compute_daily_indicators(df):
 def compute_intraday_15m_indicators(df, is_index=False):
     """
     Institutional 15M Anti-Trap Signal Engine:
-    - Eliminates buying Puts at bottom of 15M waterfall (requires BB_PCT_B >= 0.20 & RSI >= 34).
-    - Requires price to either reject off EMA9/TREND_ANCHOR (VWAP) on a pullback or cross freshly.
+    - Eliminates buying Puts at bottom of 15M waterfall (requires BB_PCT_B >= 0.18 & RSI >= 34).
+    - Requires price to reject off EMA9/TREND_ANCHOR (VWAP) on a pullback, cross freshly, or expand on volume.
     """
     df = df.copy()
     if df.index.tz is not None:
@@ -714,7 +745,6 @@ def compute_intraday_15m_indicators(df, is_index=False):
     upper_wick_ratio = ((h - np.maximum(o, c)) / bar_range).fillna(0.0)
     lower_wick_ratio = ((np.minimum(o, c) - l) / bar_range).fillna(0.0)
 
-    # Intraday Bullish Pullback / Reclaim (Avoids buying top of 15M spike where %B > 0.82)
     pullback_ce = ((l <= df["EMA9"] * 1.003) | (l <= df["TREND_ANCHOR"] * 1.003)) & ((c > o) | (lower_wick_ratio >= 0.30))
     cross_ce    = (c >= df["TREND_ANCHOR"]) & (c.shift(1) < df["TREND_ANCHOR"].shift(1) * 1.002) & (c > o)
 
@@ -726,7 +756,6 @@ def compute_intraday_15m_indicators(df, is_index=False):
         & (pullback_ce | cross_ce)
     )
 
-    # Intraday Bearish Pullback / Breakdown (Avoids shorting bottom of 15M waterfall where %B < 0.18 or RSI < 34)
     pullback_pe = ((h >= df["EMA9"] * 0.997) | (h >= df["TREND_ANCHOR"] * 0.997)) & ((c < o) | (upper_wick_ratio >= 0.30))
     cross_pe    = (c <= df["TREND_ANCHOR"]) & (c.shift(1) > df["TREND_ANCHOR"].shift(1) * 0.998) & (c < o)
 
@@ -741,6 +770,11 @@ def compute_intraday_15m_indicators(df, is_index=False):
 
 
 def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, is_intraday=False, t1_on=True):
+    """
+    Underlying-space pre-screen backtest with strict conservative bar ordering:
+    - Active SL is evaluated BEFORE T1/Target on bar j.
+    - T1 hit on bar j only arms the breakeven stop starting on bar j+1 (eliminates same-bar lookahead bias).
+    """
     sig_col = "CE_Signal" if direction == "CE" else "PE_Signal"
     closes, highs, lows, atrs, sigs = (
         df["Close"].values,
@@ -832,7 +866,7 @@ def replay_executed(df: pd.DataFrame, direction: str, eps: float, kappa: float, 
                     t1_rr: float, rr: float, cost_r: float, is_intraday: bool, max_bars: int, theta_bar: float = 0.0) -> dict:
     """
     Replay the EXECUTED option trade at every historical signal bar in OPTION-PREMIUM space,
-    incorporating T1-50% partial profit booking and breakeven trailing stop.
+    incorporating T1-50% partial profit booking and next-bar breakeven trailing stop.
     """
     sig = df["CE_Signal" if direction == "CE" else "PE_Signal"].values
     cl, hi, lo = df["Close"].values, df["High"].values, df["Low"].values
@@ -966,7 +1000,6 @@ def build_option_trade_row(
     und_risk = atr * atr_mult
     spot_sl  = round(und_ltp - und_risk, 1) if opt_type == "CE" else round(und_ltp + und_risk, 1)
 
-    # Include 2nd-order Gamma/Vega buffer so normal intraday wicks don't prematurely stop out long options
     raw_opt_sl_dist = delta * und_risk + 0.25 * gamma * (und_risk ** 2)
     max_pct_sl = 0.24 if meta["is_idx"] else (0.25 if is_intraday else 0.28)
     min_pct_sl = 0.14 if (is_intraday or meta["is_idx"]) else 0.16
@@ -997,7 +1030,7 @@ def build_option_trade_row(
             telemetry["risk_cap_drop"] += 1
             return None
 
-    # --- Executed-Geometry Replay Gate (with T1-50% & Breakeven Trail) ---
+    # --- Executed-Geometry Replay Gate (with T1-50% & Next-Bar Breakeven Trail) ---
     stop_rel = actual_risk / opt_entry
     eps_ = delta * und_ltp / opt_entry
     kap_ = gamma * und_ltp * und_ltp / opt_entry
@@ -1048,7 +1081,27 @@ def build_option_trade_row(
     }
 
 
-def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine: DhanOptionEngine, oi_count: int):
+def _new_telemetry() -> dict:
+    return {
+        "signals": 0,
+        "oi_block": 0,
+        "bt_drop": 0,
+        "spread_drop": 0,
+        "risk_cap_drop": 0,
+        "exec_gate_drop": 0,
+        "passed": 0,
+    }
+
+
+def _format_telemetry(t: dict) -> str:
+    return (
+        f"Sigs:{t['signals']} | OI_Blk:{t['oi_block']} | BT_Drop:{t['bt_drop']} | "
+        f"Sprd_Drop:{t['spread_drop']} | Cap_Drop:{t['risk_cap_drop']} | "
+        f"Exec_Drop:{t['exec_gate_drop']} | Passed:{t['passed']}"
+    )
+
+
+def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine: DhanOptionEngine, oi_count: int, telemetry: dict):
     lot_sync_cnt = len(dhan_engine.lot_map) if dhan_engine else 0
     if dhan_engine and dhan_engine.enabled and dhan_engine.live_quotes_fetched > 0:
         feed_str = f"Dhan Live ({dhan_engine.live_quotes_fetched}) + {lot_sync_cnt} Lots Synced"
@@ -1135,11 +1188,13 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
                 f"| OI: <code>{html.escape(p['OI_Flow'].strip())}</code> | <b>Score: {p['Score']:.1f}</b>"
             )
 
+    lines.append(f"\n📊 <code>{html.escape(_format_telemetry(telemetry))}</code>")
     lines.append(
-        "\n💡 <i>* = Live Dhan Chain | DTE&lt;=5 Auto-Shifts 1-Strike ITM | Lower/Upper BB Exhaustion Traps Blocked</i>"
+        "💡 <i>* = Live Dhan Chain | DTE&lt;=5 Auto-Shifts 1-Strike ITM | Lower/Upper BB Exhaustion Traps Blocked</i>"
     )
     return "\n".join(lines)
-    
+
+
 def send_telegram_alert(html_text):
     if not TELEGRAM_BOT_TOKEN or ":" not in TELEGRAM_BOT_TOKEN:
         print(html_text)
@@ -1192,16 +1247,8 @@ def main():
     oi_spurts_map = fetch_nse_oi_spurts_map()
     dhan_engine = DhanOptionEngine(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
 
-    telemetry = {
-        "signals": 0,
-        "oi_block": 0,
-        "bt_drop": 0,
-        "spread_drop": 0,
-        "risk_cap_drop": 0,
-        "exec_gate_drop": 0,
-        "passed": 0,
-    }
-
+    telemetry_intra = _new_telemetry()
+    telemetry_swing = _new_telemetry()
     messages_sent = 0
 
     # 1. INTRADAY 15M SCALPS
@@ -1227,11 +1274,11 @@ def main():
 
         if not (bool(last[sig_col]) or bool(prev[sig_col])):
             continue
-        telemetry["signals"] += 1
+        telemetry_intra["signals"] += 1
 
         is_blocked, is_boosted, oi_tag = classify_institutional_oi(price_chg_pct, oi_chg_pct, opt_type)
         if is_blocked:
-            telemetry["oi_block"] += 1
+            telemetry_intra["oi_block"] += 1
             continue
 
         tot, exp_r, wp = backtest_signals(df15, opt_type, INTRA_ATR_SL_MULT, INTRA_UND_RR, INTRA_MAX_BARS, True, t1_on=True)
@@ -1241,19 +1288,19 @@ def main():
             if tot >= 4:
                 intra_idx.append((q_score, is_boosted, meta, df15, opt_type, tot, exp_r, wp, oi_tag))
             else:
-                telemetry["bt_drop"] += 1
+                telemetry_intra["bt_drop"] += 1
         else:
             if tot >= INTRA_MIN_SETUPS and exp_r >= INTRA_MIN_EXP_R:
                 intra_stk.append((q_score, is_boosted, meta, df15, opt_type, tot, exp_r, wp, oi_tag))
             else:
-                telemetry["bt_drop"] += 1
+                telemetry_intra["bt_drop"] += 1
 
     intra_idx.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
     intra_stk.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
 
     intra_idx_rows = [
         r for r in (
-            build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, True, tag, b, dhan_engine, telemetry)
+            build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, True, tag, b, dhan_engine, telemetry_intra)
             for _, b, m, d, o, t, exp_r, wp, tag in intra_idx
         ) if r
     ]
@@ -1261,7 +1308,7 @@ def main():
     for _, b, m, d, o, t, exp_r, wp, tag in intra_stk[:TOP_N_STOCKS + 10]:
         if len(intra_stk_rows) >= TOP_N_STOCKS:
             break
-        row = build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, True, tag, b, dhan_engine, telemetry)
+        row = build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, True, tag, b, dhan_engine, telemetry_intra)
         if row:
             intra_stk_rows.append(row)
 
@@ -1269,7 +1316,8 @@ def main():
 
     if intra_idx_rows or intra_stk_rows:
         msg = format_combined_table(
-            intra_idx_rows, intra_stk_rows, "15M INTRADAY F&O SCALPS (ANTI-TRAP | 1:1.75 RR)", now_str, dhan_engine, len(oi_spurts_map)
+            intra_idx_rows, intra_stk_rows, "15M INTRADAY F&O SCALPS (ANTI-TRAP | 1:1.75 RR)",
+            now_str, dhan_engine, len(oi_spurts_map), telemetry_intra
         )
         send_telegram_alert(msg)
         messages_sent += 1
@@ -1295,11 +1343,11 @@ def main():
 
         if not bool(last[sig_col]):
             continue
-        telemetry["signals"] += 1
+        telemetry_swing["signals"] += 1
 
         is_blocked, is_boosted, oi_tag = classify_institutional_oi(price_chg_pct, oi_chg_pct, opt_type)
         if is_blocked:
-            telemetry["oi_block"] += 1
+            telemetry_swing["oi_block"] += 1
             continue
 
         tot, exp_r, wp = backtest_signals(df1d, opt_type, SWING_ATR_SL_MULT, SWING_UND_RR, SWING_MAX_DAYS, False, t1_on=True)
@@ -1309,19 +1357,19 @@ def main():
             if tot >= 4:
                 swing_idx.append((q_score, is_boosted, meta, df1d, opt_type, tot, exp_r, wp, oi_tag))
             else:
-                telemetry["bt_drop"] += 1
+                telemetry_swing["bt_drop"] += 1
         else:
             if tot >= SWING_MIN_SETUPS and exp_r >= SWING_MIN_EXP_R:
                 swing_stk.append((q_score, is_boosted, meta, df1d, opt_type, tot, exp_r, wp, oi_tag))
             else:
-                telemetry["bt_drop"] += 1
+                telemetry_swing["bt_drop"] += 1
 
     swing_idx.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
     swing_stk.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
 
     swing_idx_rows = [
         r for r in (
-            build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, False, tag, b, dhan_engine, telemetry)
+            build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, False, tag, b, dhan_engine, telemetry_swing)
             for _, b, m, d, o, t, exp_r, wp, tag in swing_idx
         ) if r
     ]
@@ -1329,7 +1377,7 @@ def main():
     for _, b, m, d, o, t, exp_r, wp, tag in swing_stk[:TOP_N_STOCKS + 8]:
         if len(swing_stk_rows) >= TOP_N_STOCKS:
             break
-        row = build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, False, tag, b, dhan_engine, telemetry)
+        row = build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, False, tag, b, dhan_engine, telemetry_swing)
         if row:
             swing_stk_rows.append(row)
 
@@ -1337,23 +1385,21 @@ def main():
 
     if swing_idx_rows or swing_stk_rows:
         msg = format_combined_table(
-            swing_idx_rows, swing_stk_rows, "3-5D POSITIONAL F&O (ANTI-TRAP | 12+ DTE | 1:2.5 RR)", now_str, dhan_engine, len(oi_spurts_map)
+            swing_idx_rows, swing_stk_rows, "3-5D POSITIONAL F&O (ANTI-TRAP | 12+ DTE | 1:2.5 RR)",
+            now_str, dhan_engine, len(oi_spurts_map), telemetry_swing
         )
         send_telegram_alert(msg)
         messages_sent += 1
 
-    diag_str = (
-        f"Sigs:{telemetry['signals']} | OI_Blk:{telemetry['oi_block']} | BT_Drop:{telemetry['bt_drop']} | "
-        f"Spread_Drop:{telemetry['spread_drop']} | Cap_Drop:{telemetry['risk_cap_drop']} | "
-        f"Exec_Drop:{telemetry['exec_gate_drop']} | Passed:{telemetry['passed']}"
-    )
-    print(f"📊 Pipeline Telemetry: {diag_str}")
+    print(f"📊 15M Telemetry: {_format_telemetry(telemetry_intra)}")
+    print(f"📊 1D  Telemetry: {_format_telemetry(telemetry_swing)}")
 
     if messages_sent == 0:
         fallback_msg = (
             f"<b>ℹ️ F&amp;O OPTIONS SCANNER ({html.escape(now_str)})</b>\n"
             f"Scanner ran cleanly (Scraped {len(oi_spurts_map)} NSE OI records).\n"
-            f"<code>{html.escape(diag_str)}</code>"
+            f"• <b>15M:</b> <code>{html.escape(_format_telemetry(telemetry_intra))}</code>\n"
+            f"• <b>1D:</b> <code>{html.escape(_format_telemetry(telemetry_swing))}</code>"
         )
         send_telegram_alert(fallback_msg)
 
