@@ -5,3 +5,4 @@ scipy
 requests
 nsepythonserver
 pytz
+python-dotenv
