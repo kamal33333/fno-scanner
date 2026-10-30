@@ -26,5 +26,7 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DHAN_CLIENT_ID: ${{ secrets.DHAN_CLIENT_ID }}
+          DHAN_ACCESS_TOKEN: ${{ secrets.DHAN_ACCESS_TOKEN }}
           GITHUB_EVENT_NAME: ${{ github.event_name }}
         run: python swing_scanner.py --force
