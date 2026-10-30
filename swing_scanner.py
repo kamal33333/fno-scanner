@@ -5,6 +5,7 @@ import sys
 import json
 import time
 import html
+import base64
 import warnings
 from pathlib import Path
 from datetime import datetime, date, timedelta
@@ -28,20 +29,41 @@ token_match = re.search(r"(\d+:[A-Za-z0-9_-]+)", RAW_TOKEN)
 TELEGRAM_BOT_TOKEN = token_match.group(1) if token_match else RAW_TOKEN.lstrip("bot").strip('"').strip("'")
 TELEGRAM_CHAT_ID   = RAW_CHATID
 
-# Smart Credential Loader: Supports standard Dhan env vars used across options_scanner.py
-DHAN_CLIENT_ID = (
-    os.environ.get("DHAN_CLIENT_ID", "")
-    or os.environ.get("DHAN_CLIENT", "")
-    or os.environ.get("CLIENT_ID", "")
-).strip().strip('"').strip("'")
-
 DHAN_ACCESS_TOKEN = (
     os.environ.get("DHAN_ACCESS_TOKEN", "")
     or os.environ.get("DHAN_TOKEN", "")
     or os.environ.get("ACCESS_TOKEN", "")
 ).strip().strip('"').strip("'")
 
-DHAN_CACHE_FILE = Path("/tmp/dhan_master_eq_fno_map_v3.json")
+DHAN_CLIENT_ID = (
+    os.environ.get("DHAN_CLIENT_ID", "")
+    or os.environ.get("DHAN_CLIENT", "")
+    or os.environ.get("CLIENT_ID", "")
+).strip().strip('"').strip("'")
+
+
+def extract_client_id_from_jwt(jwt_token: str) -> str:
+    """Extracts dhanClientId directly from the Dhan JWT payload if DHAN_CLIENT_ID is not set."""
+    try:
+        parts = jwt_token.split(".")
+        if len(parts) >= 2:
+            payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+            payload_data = json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
+            for key in ("dhanClientId", "clientId", "client_id", "sub"):
+                val = str(payload_data.get(key, "")).strip()
+                if val and val.isdigit():
+                    return val
+    except Exception:
+        pass
+    return ""
+
+
+if not DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN:
+    DHAN_CLIENT_ID = extract_client_id_from_jwt(DHAN_ACCESS_TOKEN)
+    if DHAN_CLIENT_ID:
+        print(f"✅ Auto-extracted DHAN_CLIENT_ID ({DHAN_CLIENT_ID[:4]}***) from DHAN_ACCESS_TOKEN!")
+
+DHAN_CACHE_FILE = Path("/tmp/dhan_master_eq_fno_map_v4.json")
 
 # ==============================================================================
 # ⚖️ 2. OFFICIAL NSE HOLIDAYS 2026 & RISK PARAMETERS
@@ -136,6 +158,7 @@ class DhanDataEngine:
         self.client_id = client_id
         self.access_token = access_token
         self.enabled = bool(self.client_id and self.access_token)
+        self.status_note = "NoToken" if not self.access_token else ("NoClientID" if not self.client_id else "Init")
         self.headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -172,7 +195,6 @@ class DhanDataEngine:
                     "SEM_SMST_SECURITY_ID",
                     "SEM_INSTRUMENT_NAME",
                     "SEM_TRADING_SYMBOL",
-                    "SEM_CUSTOM_SYMBOL",
                     "SEM_EXPIRY_DATE",
                     "SEM_SERIES",
                 ],
@@ -205,7 +227,6 @@ class DhanDataEngine:
             fut_map = {}
             for _, row in nse_fut.iterrows():
                 trd_sym = str(row["SEM_TRADING_SYMBOL"]).strip().upper()
-                # Dhan Futures trading symbol format: e.g. RELIANCE-Oct2026-FUT or NIFTY-Oct2026-FUT
                 base_sym = trd_sym.split("-")[0].strip()
                 if base_sym and base_sym not in fut_map:
                     fut_map[base_sym] = int(row["SEM_SMST_SECURITY_ID"])
@@ -219,13 +240,37 @@ class DhanDataEngine:
                     json.dump({"date": today_str, "eq_map": eq_map, "fut_map": fut_map}, f)
                 print(f"✅ Dhan Master Mapped: {len(eq_map)} Cash Equities & {len(fut_map)} Near-Month Futures.")
         except Exception as e:
+            self.status_note = f"MapErr:{type(e).__name__}"
             print(f"⚠️ Dhan Scrip Master load warning: {e}")
+
+    def _post_quote_batch(self, payload: dict) -> dict:
+        """Posts batch quote request with automatic 429 backoff retry."""
+        for attempt in range(2):
+            try:
+                resp = requests.post(
+                    "https://api.dhan.co/v2/marketfeed/quote",
+                    headers=self.headers,
+                    json=payload,
+                    timeout=12,
+                )
+                if resp.status_code == 200:
+                    return resp.json().get("data", {})
+                if resp.status_code == 429:
+                    time.sleep(1.2)
+                    continue
+                self.status_note = f"HTTP-{resp.status_code}"
+                print(f"⚠️ Dhan Quote API status {resp.status_code}: {resp.text[:160]}")
+                return {}
+            except Exception as e:
+                self.status_note = f"Err:{type(e).__name__}"
+                print(f"⚠️ Dhan Quote error: {e}")
+        return {}
 
     def fetch_unified_market_snapshot(self, symbols: list) -> tuple[dict, dict, dict]:
         """
-        Single-request batch call to Dhan /v2/marketfeed/quote fetching:
+        Fetches Unified Dhan Market Snapshot:
         - NSE_EQ: Spot LTP, OHLC, Volume, Official VWAP (average_price), Bid/Ask Orderbook Ratio
-        -IDX_I: Index Spot LTP & OHLC
+        - IDX_I: Index Spot LTP & OHLC
         - NSE_FNO: Near-Month Futures Live OI, Previous Close OI -> Exact OI Change % & Futures Basis %
         """
         eq_quotes = {}
@@ -234,86 +279,79 @@ class DhanDataEngine:
         if not self.enabled or not self.eq_map:
             return eq_quotes, idx_quotes, fno_oi_map
 
-        eq_sec_ids = [self.eq_map[s] for s in symbols if s in self.eq_map]
-        idx_sec_ids = list(DHAN_INDEX_SEC_IDS.values())
+        eq_sec_ids = [int(self.eq_map[s]) for s in symbols if s in self.eq_map]
+        idx_sec_ids = [int(x) for x in DHAN_INDEX_SEC_IDS.values()]
         all_underlyings = list(symbols) + list(DHAN_INDEX_SEC_IDS.keys())
-        fut_sec_ids = [self.fut_map[s] for s in all_underlyings if s in self.fut_map]
+        fut_sec_ids = [int(self.fut_map[s]) for s in all_underlyings if s in self.fut_map]
 
         payload = {
             "NSE_EQ": eq_sec_ids,
             "IDX_I": idx_sec_ids,
             "NSE_FNO": fut_sec_ids,
         }
-        try:
-            resp = requests.post(
-                "https://api.dhan.co/v2/marketfeed/quote",
-                headers=self.headers,
-                json=payload,
-                timeout=10,
-            )
-            if resp.status_code == 200:
-                data = resp.json().get("data", {})
+        data = self._post_quote_batch(payload)
+        if not data:
+            return eq_quotes, idx_quotes, fno_oi_map
 
-                # 1. Parse NSE_EQ Cash Quotes
-                for sec_str, q in data.get("NSE_EQ", {}).items():
-                    sym = self.inv_eq_map.get(int(sec_str))
-                    if not sym:
-                        continue
-                    ohlc = q.get("ohlc", {})
-                    buy_q = float(q.get("buy_quantity", 0) or 0)
-                    sell_q = float(q.get("sell_quantity", 0) or 0)
-                    ob_ratio = (buy_q / sell_q) if sell_q > 0 else 1.0
-                    eq_quotes[sym] = {
-                        "ltp": float(q.get("last_price", 0.0) or 0.0),
-                        "open": float(ohlc.get("open", 0.0) or 0.0),
-                        "high": float(ohlc.get("high", 0.0) or 0.0),
-                        "low": float(ohlc.get("low", 0.0) or 0.0),
-                        "prev_close": float(ohlc.get("close", 0.0) or 0.0),
-                        "volume": float(q.get("volume", 0.0) or 0.0),
-                        "vwap": float(q.get("average_price", 0.0) or 0.0),
-                        "ob_ratio": round(ob_ratio, 2),
-                        "basis_pct": 0.0,
-                    }
+        # 1. Parse NSE_EQ Cash Quotes
+        for sec_str, q in data.get("NSE_EQ", {}).items():
+            sym = self.inv_eq_map.get(int(sec_str))
+            if not sym:
+                continue
+            ohlc = q.get("ohlc", {})
+            buy_q = float(q.get("buy_quantity", 0) or 0)
+            sell_q = float(q.get("sell_quantity", 0) or 0)
+            ob_ratio = (buy_q / sell_q) if sell_q > 0 else 1.0
+            eq_quotes[sym] = {
+                "ltp": float(q.get("last_price", 0.0) or 0.0),
+                "open": float(ohlc.get("open", 0.0) or 0.0),
+                "high": float(ohlc.get("high", 0.0) or 0.0),
+                "low": float(ohlc.get("low", 0.0) or 0.0),
+                "prev_close": float(ohlc.get("close", 0.0) or 0.0),
+                "volume": float(q.get("volume", 0.0) or 0.0),
+                "vwap": float(q.get("average_price", 0.0) or 0.0),
+                "ob_ratio": round(ob_ratio, 2),
+                "basis_pct": 0.0,
+            }
 
-                # 2. Parse IDX_I Spot Index Quotes
-                inv_idx = {v: k for k, v in DHAN_INDEX_SEC_IDS.items()}
-                for sec_str, q in data.get("IDX_I", {}).items():
-                    idx_name = inv_idx.get(int(sec_str))
-                    if not idx_name:
-                        continue
-                    ohlc = q.get("ohlc", {})
-                    idx_quotes[idx_name] = {
-                        "ltp": float(q.get("last_price", 0.0) or 0.0),
-                        "open": float(ohlc.get("open", 0.0) or 0.0),
-                        "high": float(ohlc.get("high", 0.0) or 0.0),
-                        "low": float(ohlc.get("low", 0.0) or 0.0),
-                        "prev_close": float(ohlc.get("close", 0.0) or 0.0),
-                    }
+        # 2. Parse IDX_I Spot Index Quotes (Explicitly includes volume=0.0 to prevent KeyError)
+        inv_idx = {v: k for k, v in DHAN_INDEX_SEC_IDS.items()}
+        for sec_str, q in data.get("IDX_I", {}).items():
+            idx_name = inv_idx.get(int(sec_str))
+            if not idx_name:
+                continue
+            ohlc = q.get("ohlc", {})
+            idx_quotes[idx_name] = {
+                "ltp": float(q.get("last_price", 0.0) or 0.0),
+                "open": float(ohlc.get("open", 0.0) or 0.0),
+                "high": float(ohlc.get("high", 0.0) or 0.0),
+                "low": float(ohlc.get("low", 0.0) or 0.0),
+                "prev_close": float(ohlc.get("close", 0.0) or 0.0),
+                "volume": 0.0,
+            }
 
-                # 3. Parse NSE_FNO Near-Month Futures (Exact OI Build-up % & Futures Basis %)
-                for sec_str, q in data.get("NSE_FNO", {}).items():
-                    sym = self.inv_fut_map.get(int(sec_str))
-                    if not sym:
-                        continue
-                    fut_ltp = float(q.get("last_price", 0.0) or 0.0)
-                    curr_oi = float(q.get("oi", 0.0) or 0.0)
-                    prev_oi = float(q.get("previous_close_oi", 0.0) or q.get("oi_day_low", 0.0) or 0.0)
-                    if prev_oi > 0 and curr_oi > 0:
-                        oi_chg_pct = ((curr_oi - prev_oi) / prev_oi) * 100.0
-                        fno_oi_map[sym] = round(oi_chg_pct, 2)
+        # 3. Parse NSE_FNO Near-Month Futures (Exact OI Build-up % & Futures Basis %)
+        for sec_str, q in data.get("NSE_FNO", {}).items():
+            sym = self.inv_fut_map.get(int(sec_str))
+            if not sym:
+                continue
+            fut_ltp = float(q.get("last_price", 0.0) or 0.0)
+            curr_oi = float(q.get("oi", 0.0) or 0.0)
+            prev_oi = float(q.get("previous_close_oi", 0.0) or q.get("oi_day_low", 0.0) or 0.0)
+            if prev_oi > 0 and curr_oi > 0:
+                oi_chg_pct = ((curr_oi - prev_oi) / prev_oi) * 100.0
+                fno_oi_map[sym] = round(oi_chg_pct, 2)
 
-                    if sym in eq_quotes and eq_quotes[sym]["ltp"] > 0 and fut_ltp > 0:
-                        spot_p = eq_quotes[sym]["ltp"]
-                        eq_quotes[sym]["basis_pct"] = round(((fut_ltp - spot_p) / spot_p) * 100.0, 2)
+            if sym in eq_quotes and eq_quotes[sym]["ltp"] > 0 and fut_ltp > 0:
+                spot_p = eq_quotes[sym]["ltp"]
+                eq_quotes[sym]["basis_pct"] = round(((fut_ltp - spot_p) / spot_p) * 100.0, 2)
 
-                print(
-                    f"✅ Dhan Snapshot: {len(eq_quotes)} EQ | {len(idx_quotes)} Indices | "
-                    f"{len(fno_oi_map)} Native F&O OI Feeds."
-                )
-            else:
-                print(f"⚠️ Dhan Quote API status {resp.status_code}: {resp.text[:160]}")
-        except Exception as e:
-            print(f"⚠️ Dhan Unified Snapshot error: {e}")
+        if eq_quotes:
+            self.status_note = "OK"
+        print(
+            f"✅ Dhan Snapshot: {len(eq_quotes)} EQ | {len(idx_quotes)} Indices | "
+            f"{len(fno_oi_map)} Native F&O OI Feeds."
+        )
         return eq_quotes, idx_quotes, fno_oi_map
 
     def fetch_intraday_15m_df(self, sym: str, days_back: int = 45) -> pd.DataFrame:
@@ -491,15 +529,20 @@ def patch_daily_df_with_dhan_quote(df: pd.DataFrame, dhan_q: dict) -> pd.DataFra
 
     mins_elapsed = max(15.0, min(375.0, (now_ist.hour * 60 + now_ist.minute) - (9 * 60 + 15)))
     vol_pace_mult = (375.0 / mins_elapsed) if (now_ist.weekday() < 5 and 555 <= (now_ist.hour * 60 + now_ist.minute) <= 930) else 1.0
-    projected_vol = dhan_q["volume"] * min(vol_pace_mult, 3.5)
+    raw_vol = float(dhan_q.get("volume", 0.0) or 0.0)
+    projected_vol = raw_vol * min(vol_pace_mult, 3.5)
 
     last_idx = df.index[-1]
     last_date = last_idx.date() if hasattr(last_idx, "date") else today_date
 
-    o = dhan_q["open"] if dhan_q["open"] > 0 else dhan_q["ltp"]
-    h = max(dhan_q["high"], dhan_q["ltp"], o)
-    l = min(dhan_q["low"] if dhan_q["low"] > 0 else dhan_q["ltp"], dhan_q["ltp"], o)
-    c = dhan_q["ltp"]
+    ltp = float(dhan_q["ltp"])
+    o = float(dhan_q.get("open", 0.0) or 0.0)
+    o = o if o > 0 else ltp
+    h_q = float(dhan_q.get("high", 0.0) or 0.0)
+    l_q = float(dhan_q.get("low", 0.0) or 0.0)
+    h = max(h_q, ltp, o)
+    l = min(l_q if l_q > 0 else ltp, ltp, o)
+    c = ltp
 
     if last_date == today_date:
         df.iloc[-1, df.columns.get_loc("Open")] = o
@@ -913,8 +956,10 @@ def format_stock_table_block(rows):
     return "\n".join(block)
 
 
-def build_single_master_message(mood_summary, intra_rows, short_1d_rows, buy_1d_rows, now_str, dhan_active: bool, fno_cnt: int):
-    feed_badge = f"Dhan EQ+F&O ({fno_cnt} OI) ⚡" if dhan_active else "YF + NSE Feed"
+def build_single_master_message(
+    mood_summary, intra_rows, short_1d_rows, buy_1d_rows, now_str, dhan_active: bool, fno_cnt: int, dhan_note: str = ""
+):
+    feed_badge = f"Dhan EQ+F&O ({fno_cnt} OI) ⚡" if dhan_active else f"YF + NSE ({dhan_note})"
     lines = [
         f"<b>🎯 MASTER STOCK SCANNER ({html.escape(feed_badge)})</b>",
         f"🕒 <code>{html.escape(now_str)}</code> | Max Risk: <code>₹{RISK_PER_TRADE:,}</code> | Max Cap: <code>₹{MAX_CAPITAL_PER_TRADE:,}</code>\n",
@@ -1182,7 +1227,7 @@ def main():
     buy_1d_rows   = [x[2] for x in swing_buy_cands[:TOP_N_PER_SECTION]]
 
     msg = build_single_master_message(
-        mood_summary, intra_rows, short_1d_rows, buy_1d_rows, now_str, bool(dhan_eq_quotes), len(oi_spurts_map)
+        mood_summary, intra_rows, short_1d_rows, buy_1d_rows, now_str, bool(dhan_eq_quotes), len(oi_spurts_map), dhan.status_note
     )
     send_telegram_alert(msg)
 
