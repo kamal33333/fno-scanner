@@ -422,7 +422,7 @@ def patch_daily_df_with_dhan_quote(df: pd.DataFrame, dhan_q: dict) -> pd.DataFra
     # Calculate intraday elapsed trading fraction (out of 375 mins) to pace-adjust today's volume
     mins_elapsed = max(15.0, min(375.0, (now_ist.hour * 60 + now_ist.minute) - (9 * 60 + 15)))
     vol_pace_mult = (375.0 / mins_elapsed) if (now_ist.weekday() < 5 and 555 <= (now_ist.hour * 60 + now_ist.minute) <= 930) else 1.0
-    projected_vol = dhan_q["volume"] * min(vol_pace_mult, 3.5)
+    projected_vol = float(dhan_q.get("volume", 0.0) or 0.0) * min(vol_pace_mult, 3.5)   # index quotes carry no volume
 
     last_idx = df.index[-1]
     last_date = last_idx.date() if hasattr(last_idx, "date") else today_date
