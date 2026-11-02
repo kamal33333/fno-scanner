@@ -6,6 +6,7 @@ import sys
 import time
 import json
 import html
+import base64
 import warnings
 import calendar
 from datetime import datetime, date, timedelta
@@ -43,8 +44,39 @@ token_match = re.search(r"(\d+:[A-Za-z0-9_-]+)", RAW_TOKEN)
 TELEGRAM_BOT_TOKEN = token_match.group(1) if token_match else RAW_TOKEN.lstrip("bot").strip('"').strip("'")
 TELEGRAM_CHAT_ID   = RAW_CHATID
 
-DHAN_CLIENT_ID    = os.environ.get("DHAN_CLIENT_ID", "").strip().strip('"').strip("'")
-DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN", "").strip().strip('"').strip("'")
+DHAN_ACCESS_TOKEN = (
+    os.environ.get("DHAN_ACCESS_TOKEN", "")
+    or os.environ.get("DHAN_TOKEN", "")
+    or os.environ.get("ACCESS_TOKEN", "")
+).strip().strip('"').strip("'")
+
+DHAN_CLIENT_ID = (
+    os.environ.get("DHAN_CLIENT_ID", "")
+    or os.environ.get("DHAN_CLIENT", "")
+    or os.environ.get("CLIENT_ID", "")
+).strip().strip('"').strip("'")
+
+
+def extract_client_id_from_jwt(jwt_token: str) -> str:
+    """Extracts dhanClientId directly from the Dhan JWT payload if DHAN_CLIENT_ID is not set."""
+    try:
+        parts = jwt_token.split(".")
+        if len(parts) >= 2:
+            payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
+            payload_data = json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
+            for key in ("dhanClientId", "clientId", "client_id", "sub"):
+                val = str(payload_data.get(key, "")).strip()
+                if val and val.isdigit():
+                    return val
+    except Exception:
+        pass
+    return ""
+
+
+if not DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN:
+    DHAN_CLIENT_ID = extract_client_id_from_jwt(DHAN_ACCESS_TOKEN)
+    if DHAN_CLIENT_ID:
+        print(f"✅ Auto-extracted DHAN_CLIENT_ID ({DHAN_CLIENT_ID[:4]}***) from DHAN_ACCESS_TOKEN!")
 
 SERVER_SCANNER_DIR = "/home/ubuntu/scanners"
 if os.path.isdir(SERVER_SCANNER_DIR):
@@ -68,9 +100,13 @@ SYMBOL_ALIAS_MAP = {
     "L_TFH": "LTF",
     "L&TFH": "LTF",
     "NIFTY 50": "NIFTY",
+    "NIFTY": "NIFTY",
     "NIFTY BANK": "BANKNIFTY",
+    "BANKNIFTY": "BANKNIFTY",
     "NIFTY FIN SERVICE": "FINNIFTY",
+    "FINNIFTY": "FINNIFTY",
     "NIFTY MID SELECT": "MIDCPNIFTY",
+    "MIDCPNIFTY": "MIDCPNIFTY",
 }
 
 
@@ -315,9 +351,14 @@ class DhanOptionEngine:
                 subprocess.run([sys.executable, refresh_script], timeout=25, check=False)
                 if os.path.exists(ENV_FILE_PATH):
                     load_dotenv(ENV_FILE_PATH, override=True)
-                    new_tok = os.environ.get("DHAN_ACCESS_TOKEN", "").strip().strip('"').strip("'")
+                    new_tok = (
+                        os.environ.get("DHAN_ACCESS_TOKEN", "")
+                        or os.environ.get("DHAN_TOKEN", "")
+                    ).strip().strip('"').strip("'")
                     if new_tok and new_tok != self.access_token:
                         self.access_token = new_tok
+                        if not self.client_id:
+                            self.client_id = extract_client_id_from_jwt(new_tok)
                         self.session.headers.update(self._headers())
                         print("✅ Hot-reloaded refreshed Dhan JWT token into active session!")
                         return True
@@ -479,7 +520,12 @@ class DhanOptionEngine:
                     if sym and isinstance(q, dict):
                         oi_val = float(q.get("oi") or q.get("open_interest") or 0.0)
                         if oi_val > 0:
-                            curr_oi_map[sym] = oi_val
+                            curr_oi_map[sym] = {
+                                "curr_oi": oi_val,
+                                "prev_oi": float(q.get("previous_close_oi") or 0.0),
+                                "oi_day_high": float(q.get("oi_day_high") or 0.0),
+                                "oi_day_low": float(q.get("oi_day_low") or 0.0),
+                            }
                 except Exception:
                     continue
 
@@ -722,93 +768,129 @@ def fetch_nse_oi_spurts_map() -> dict:
     return oi_map
 
 
-def _load_oi_baseline_cache() -> tuple[dict, dict]:
+def _load_oi_baseline_cache() -> dict:
     """
-    Loads /home/ubuntu/scanners/dhan_oi_baseline.json compatibly across both flat and nested schemas.
-    Returns (raw_json_container, baseline_float_dict).
+    Loads /home/ubuntu/scanners/dhan_oi_baseline.json using the unified schema
+    shared with swing_scanner.py: {"latest_date": "...", "prev_oi": {...}, "latest_oi": {...}}.
     """
-    if not os.path.exists(OI_BASELINE_CACHE_FILE):
-        return {}, {}
-    try:
-        with open(OI_BASELINE_CACHE_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
-        if not isinstance(raw, dict):
-            return {}, {}
-        target_node = raw.get("baseline") if isinstance(raw.get("baseline"), dict) else raw
-        parsed = {}
-        for k, v in target_node.items():
-            norm_k = normalize_nse_symbol(k)
-            if isinstance(v, (int, float)) and v > 0:
-                parsed[norm_k] = float(v)
-            elif isinstance(v, dict):
-                b_val = v.get("baseline_oi") or v.get("prev_oi") or v.get("oi")
-                if isinstance(b_val, (int, float)) and b_val > 0:
-                    parsed[norm_k] = float(b_val)
-        return raw, parsed
-    except Exception as e:
-        print(f"⚠️ OI Baseline cache read warning: {e}")
-        return {}, {}
+    if os.path.exists(OI_BASELINE_CACHE_FILE):
+        try:
+            with open(OI_BASELINE_CACHE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                if "prev_oi" in raw or "latest_oi" in raw:
+                    raw.setdefault("latest_date", "")
+                    raw.setdefault("prev_oi", {})
+                    raw.setdefault("latest_oi", {})
+                    return raw
+                src_node = raw.get("baseline") if isinstance(raw.get("baseline"), dict) else raw
+                migrated_prev = {}
+                for k, v in src_node.items():
+                    norm_k = normalize_nse_symbol(k)
+                    if isinstance(v, (int, float)) and v > 0:
+                        migrated_prev[norm_k] = int(round(float(v)))
+                    elif isinstance(v, dict):
+                        b_val = v.get("baseline_oi") or v.get("prev_oi") or v.get("oi")
+                        if isinstance(b_val, (int, float)) and b_val > 0:
+                            migrated_prev[norm_k] = int(round(float(b_val)))
+                return {"latest_date": "", "prev_oi": migrated_prev, "latest_oi": {}}
+        except Exception as e:
+            print(f"⚠️ OI Baseline cache read warning: {e}")
+    return {"latest_date": "", "prev_oi": {}, "latest_oi": {}}
 
 
-def _save_oi_baseline_cache(raw_container: dict, baseline_map: dict):
+def _save_oi_baseline_cache(cache_obj: dict) -> None:
     try:
-        if isinstance(raw_container, dict) and isinstance(raw_container.get("baseline"), dict):
-            for sym, val in baseline_map.items():
-                raw_container["baseline"][sym] = round(float(val), 2)
-            out_data = raw_container
-        else:
-            out_data = dict(raw_container) if isinstance(raw_container, dict) else {}
-            for sym, val in baseline_map.items():
-                if isinstance(out_data.get(sym), dict):
-                    out_data[sym]["baseline_oi"] = round(float(val), 2)
-                else:
-                    out_data[sym] = round(float(val), 2)
         with open(OI_BASELINE_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump(out_data, f, indent=2)
+            json.dump(cache_obj, f)
     except Exception as e:
         print(f"⚠️ OI Baseline cache write warning: {e}")
 
 
 def fuse_dhan_and_nse_oi(dhan_engine: DhanOptionEngine) -> tuple[dict, dict, str]:
     """
-    Parallel Dual-Source OI Failover Engine:
+    Parallel Dual-Source OI Failover Engine (Shared Cache Schema with swing_scanner.py):
     1. Fetches NSE OI Spurts and Dhan /v2/marketfeed/quote (futures OI + spot snapshot) concurrently.
-    2. Computes %chng in OI using Dhan live futures OI vs dhan_oi_baseline.json when available.
-    3. Auto-seeds missing baseline entries from NSE OI Spurts and fails over seamlessly.
+    2. Rolls latest_oi -> prev_oi on a new trading day and auto-seeds missing baselines from NSE.
+    3. Arbitrates between Dhan live futures OI and NSE OI Spurts with cold-start intraday fallback.
     """
+    ist = pytz.timezone("Asia/Kolkata")
+    today_str = datetime.now(ist).strftime("%Y-%m-%d")
+    mkt_open = is_market_open_now()
+
     with ThreadPoolExecutor(max_workers=2) as pool:
         fut_nse = pool.submit(fetch_nse_oi_spurts_map)
         fut_dhan = pool.submit(dhan_engine.fetch_dhan_futures_and_spot_snapshot)
         nse_oi_map = fut_nse.result()
         dhan_curr_oi, dhan_spot_snap = fut_dhan.result()
 
-    raw_cache, baseline_map = _load_oi_baseline_cache()
-    cache_dirty = False
-    fused_oi_map = dict(nse_oi_map)
+    cache = _load_oi_baseline_cache()
+    if cache.get("latest_date") and cache["latest_date"] != today_str and cache.get("latest_oi"):
+        cache["prev_oi"] = cache["latest_oi"].copy()
+
+    prev_oi_store = cache.setdefault("prev_oi", {})
+    latest_oi_store = cache.setdefault("latest_oi", {})
+
+    norm_nse = {normalize_nse_symbol(k): float(v) for k, v in (nse_oi_map or {}).items()}
+    norm_dhan = {normalize_nse_symbol(k): v for k, v in (dhan_curr_oi or {}).items()}
+
+    fused_oi_map = {}
     dhan_computed_cnt = 0
+    all_syms = set(norm_nse.keys()) | set(norm_dhan.keys())
 
-    for sym, curr_oi in dhan_curr_oi.items():
-        norm_sym = normalize_nse_symbol(sym)
-        base_oi = baseline_map.get(norm_sym, 0.0)
-        nse_pct = nse_oi_map.get(norm_sym)
+    for sym in all_syms:
+        dq = norm_dhan.get(sym, {})
+        if isinstance(dq, (int, float)):
+            curr_oi, api_prev_oi, oi_high, oi_low = float(dq), 0.0, 0.0, 0.0
+        else:
+            curr_oi = float(dq.get("curr_oi", 0.0) or 0.0)
+            api_prev_oi = float(dq.get("prev_oi", 0.0) or 0.0)
+            oi_high = float(dq.get("oi_day_high", 0.0) or 0.0)
+            oi_low = float(dq.get("oi_day_low", 0.0) or 0.0)
 
-        if base_oi > 0:
-            dhan_pct = ((curr_oi - base_oi) / base_oi) * 100.0
-            if abs(dhan_pct) >= 0.05 or nse_pct is None:
-                fused_oi_map[norm_sym] = round(dhan_pct, 2)
+        nse_pct = norm_nse.get(sym, None)
+
+        if sym not in prev_oi_store and curr_oi > 0 and nse_pct is not None and abs(nse_pct) > 0.01:
+            denom = 1.0 + (nse_pct / 100.0)
+            if denom > 0.1:
+                prev_oi_store[sym] = int(round(curr_oi / denom))
+
+        dhan_pct = None
+        base_oi = api_prev_oi if api_prev_oi > 0 else float(prev_oi_store.get(sym, 0) or 0)
+        if curr_oi > 0 and base_oi > 0:
+            dhan_pct = round(((curr_oi - base_oi) / base_oi) * 100.0, 2)
+            dhan_computed_cnt += 1
+        elif curr_oi > 0 and (oi_low > 0 or oi_high > 0):
+            if oi_low > 0 and (oi_high - curr_oi) <= (curr_oi - oi_low):
+                dhan_pct = round(((curr_oi - oi_low) / oi_low) * 100.0, 2)
+            elif oi_high > 0:
+                dhan_pct = round(((curr_oi - oi_high) / oi_high) * 100.0, 2)
+            if dhan_pct is not None:
                 dhan_computed_cnt += 1
-            elif nse_pct is not None:
-                fused_oi_map[norm_sym] = round(float(nse_pct), 2)
-        elif nse_pct is not None and (1.0 + (nse_pct / 100.0)) > 0.1:
-            seeded_base = curr_oi / (1.0 + (nse_pct / 100.0))
-            baseline_map[norm_sym] = seeded_base
-            fused_oi_map[norm_sym] = round(float(nse_pct), 2)
-            cache_dirty = True
 
-    if cache_dirty:
-        _save_oi_baseline_cache(raw_cache, baseline_map)
+        if curr_oi > 0:
+            latest_oi_store[sym] = int(round(curr_oi))
 
-    status_tag = f"Dual-OI ({ len(fused_oi_map) } | Dhan:{ dhan_computed_cnt } NSE:{ len(nse_oi_map) })"
+        if dhan_pct is not None and nse_pct is not None:
+            if abs(dhan_pct) > 0.05 and abs(nse_pct) > 0.05:
+                chosen = dhan_pct if mkt_open else nse_pct
+                if abs(nse_pct) > abs(chosen) * 1.25:
+                    chosen = nse_pct
+                fused_oi_map[sym] = round(float(chosen), 2)
+            elif abs(nse_pct) > 0.05:
+                fused_oi_map[sym] = round(float(nse_pct), 2)
+            else:
+                fused_oi_map[sym] = round(float(dhan_pct), 2)
+        elif nse_pct is not None:
+            fused_oi_map[sym] = round(float(nse_pct), 2)
+        elif dhan_pct is not None:
+            fused_oi_map[sym] = round(float(dhan_pct), 2)
+
+    if latest_oi_store:
+        cache["latest_date"] = today_str
+        _save_oi_baseline_cache(cache)
+
+    status_tag = f"Dual-OI ({len(fused_oi_map)} | D:{dhan_computed_cnt} N:{len(norm_nse)})"
     print(f"✅ Dual-Source OI Fusion Complete: {status_tag}")
     return fused_oi_map, dhan_spot_snap, status_tag
 
@@ -1586,11 +1668,13 @@ def main():
         last = df15.iloc[-1]
 
         nse_sym = normalize_nse_symbol(meta["nse"])
-        spot_close = float(last["Close"])
+        dhan_snap = dhan_spot_snap.get(nse_sym, {})
+        live_ltp = float(dhan_snap.get("ltp", 0.0) or 0.0)
+        spot_close = live_ltp if live_ltp > 0 else float(last["Close"])
 
         df1d_ref = daily_slices.get(tk)
         yf_prev_c = float(df1d_ref["Close"].iloc[-2]) if (df1d_ref is not None and len(df1d_ref) >= 2) else 0.0
-        dhan_prev_c = dhan_spot_snap.get(nse_sym, {}).get("prev_close", 0.0)
+        dhan_prev_c = float(dhan_snap.get("prev_close", 0.0) or 0.0)
 
         today_bars = df15[df15.index.date == last.name.date()]
         day_open = float(today_bars["Open"].iloc[0]) if not today_bars.empty else float(last["Open"])
@@ -1656,9 +1740,11 @@ def main():
         prev = df1d.iloc[-2]
 
         nse_sym = normalize_nse_symbol(meta["nse"])
-        spot_close = float(last["Close"])
+        dhan_snap = dhan_spot_snap.get(nse_sym, {})
+        live_ltp = float(dhan_snap.get("ltp", 0.0) or 0.0)
+        spot_close = live_ltp if live_ltp > 0 else float(last["Close"])
         yf_prev_c = float(prev["Close"])
-        dhan_prev_c = dhan_spot_snap.get(nse_sym, {}).get("prev_close", 0.0)
+        dhan_prev_c = float(dhan_snap.get("prev_close", 0.0) or 0.0)
         true_prev_c = resolve_true_prev_close(spot_close, dhan_prev_c, yf_prev_c)
 
         price_chg_pct = ((spot_close - true_prev_c) / true_prev_c) * 100.0 if true_prev_c > 0 else 0.0
