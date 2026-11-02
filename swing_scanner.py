@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 import os
 import re
 import gc
@@ -6,11 +5,9 @@ import sys
 import json
 import time
 import html
-import base64
 import warnings
 from pathlib import Path
 from datetime import datetime, date, timedelta
-from concurrent.futures import ThreadPoolExecutor
 
 warnings.filterwarnings("ignore")
 
@@ -19,16 +16,6 @@ import requests
 import yfinance as yf
 import pandas as pd
 import numpy as np
-
-try:
-    from dotenv import load_dotenv
-    ENV_FILE_PATH = "/home/ubuntu/scanners/.env"
-    if os.path.exists(ENV_FILE_PATH):
-        load_dotenv(ENV_FILE_PATH)
-except ImportError:
-    ENV_FILE_PATH = "/home/ubuntu/scanners/.env"
-    def load_dotenv(*args, **kwargs):
-        pass
 
 # ==============================================================================
 # 🔐 1. CREDENTIALS & ENVIRONMENT VARIABLES (TELEGRAM + DHAN HQ v2)
@@ -41,77 +28,15 @@ token_match = re.search(r"(\d+:[A-Za-z0-9_-]+)", RAW_TOKEN)
 TELEGRAM_BOT_TOKEN = token_match.group(1) if token_match else RAW_TOKEN.lstrip("bot").strip('"').strip("'")
 TELEGRAM_CHAT_ID   = RAW_CHATID
 
-DHAN_ACCESS_TOKEN = (
-    os.environ.get("DHAN_ACCESS_TOKEN", "")
-    or os.environ.get("DHAN_TOKEN", "")
-    or os.environ.get("ACCESS_TOKEN", "")
-).strip().strip('"').strip("'")
-
-DHAN_CLIENT_ID = (
-    os.environ.get("DHAN_CLIENT_ID", "")
-    or os.environ.get("DHAN_CLIENT", "")
-    or os.environ.get("CLIENT_ID", "")
-).strip().strip('"').strip("'")
-
-
-def extract_client_id_from_jwt(jwt_token: str) -> str:
-    """Extracts dhanClientId directly from the Dhan JWT payload if DHAN_CLIENT_ID is not set."""
-    try:
-        parts = jwt_token.split(".")
-        if len(parts) >= 2:
-            payload_b64 = parts[1] + "=" * (-len(parts[1]) % 4)
-            payload_data = json.loads(base64.urlsafe_b64decode(payload_b64).decode("utf-8"))
-            for key in ("dhanClientId", "clientId", "client_id", "sub"):
-                val = str(payload_data.get(key, "")).strip()
-                if val and val.isdigit():
-                    return val
-    except Exception:
-        pass
-    return ""
-
-
-if not DHAN_CLIENT_ID and DHAN_ACCESS_TOKEN:
-    DHAN_CLIENT_ID = extract_client_id_from_jwt(DHAN_ACCESS_TOKEN)
-    if DHAN_CLIENT_ID:
-        print(f"✅ Auto-extracted DHAN_CLIENT_ID ({DHAN_CLIENT_ID[:4]}***) from DHAN_ACCESS_TOKEN!")
-
-DHAN_CACHE_FILE = Path("/tmp/dhan_master_eq_fno_map_v5.json")
-DEFAULT_SCANNER_DIR = Path("/home/ubuntu/scanners")
-DHAN_OI_BASELINE_FILE = (
-    DEFAULT_SCANNER_DIR / "dhan_oi_baseline.json"
-    if DEFAULT_SCANNER_DIR.exists()
-    else Path("/tmp/dhan_oi_baseline.json")
-)
-
-SYMBOL_ALIAS_MAP = {
-    "NIFTY 50":          "NIFTY",
-    "NIFTY":             "NIFTY",
-    "NIFTY BANK":        "BANKNIFTY",
-    "BANKNIFTY":         "BANKNIFTY",
-    "NIFTY FIN SERVICE": "FINNIFTY",
-    "FINNIFTY":          "FINNIFTY",
-    "NIFTY MID SELECT":  "MIDCPNIFTY",
-    "MIDCPNIFTY":        "MIDCPNIFTY",
-}
-
-
-def normalize_symbol(sym: str) -> str:
-    clean = str(sym).strip().upper()
-    return SYMBOL_ALIAS_MAP.get(clean, clean)
-
+# Dhan API Credentials (reuses the same env vars as options_scanner.py)
+DHAN_CLIENT_ID    = os.environ.get("DHAN_CLIENT_ID", "").strip().strip('"').strip("'")
+DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN", "").strip().strip('"').strip("'")
+DHAN_CACHE_FILE   = Path("/tmp/dhan_nse_eq_map.json")
 
 # ==============================================================================
-# ⚖️ 2. OFFICIAL NSE HOLIDAYS 2026 & INSTITUTIONAL RISK PARAMETERS
+# ⚖️ 2. OFFICIAL NSE HOLIDAYS 2026 & RISK PARAMETERS
 # ==============================================================================
 NSE_HOLIDAYS_2026 = {
-    date(2026, 1, 26),   # Republic Day
-    date(2026, 3, 20),   # Id-Ul-Fitr
-    date(2026, 4, 2),    # Ram Navami
-    date(2026, 4, 3),    # Good Friday
-    date(2026, 4, 6),    # Mahavir Jayanti
-    date(2026, 4, 14),   # Dr. Baba Saheb Ambedkar Jayanti
-    date(2026, 5, 1),    # Maharashtra Day
-    date(2026, 8, 15),   # Independence Day
     date(2026, 10, 2),   # Mahatma Gandhi Jayanti
     date(2026, 10, 20),  # Dussehra
     date(2026, 11, 10),  # Diwali - Balipratipada
@@ -122,27 +47,26 @@ NSE_HOLIDAYS_2026 = {
 RISK_PER_TRADE         = 1000     # Max Rupee risk per trade (₹1,000 hard cap)
 MAX_CAPITAL_PER_TRADE  = 35000    # Max Capital outlay per trade (₹35,000 hard cap)
 INTRA_MIS_LEVERAGE     = 2.0      # Conservative 2x MIS Intraday Margin multiplier
-TOP_N_PER_SECTION      = 5        # Top 5 setups per section
+TOP_N_PER_SECTION      = 5        # Keep tables ultra-clean: Top 5 setups per section!
 COST_SLIPPAGE_R        = 0.05     # 0.05R deduction per backtest trade
-
-# --- Calibrated Standard-Error Confidence Gate & Late-Session Swing Gate ---
-BT_SE_K                = 0.35     # Penalizes high-variance flukes: requires ExpR - 0.35*SE >= MIN_EXP_R
-SWING_LATE_SCAN_ONLY   = False    # Set True to restrict 1D swings to >=15:10 IST on scheduled runs
-SWING_SCAN_FROM        = (15, 10) # 15:10 IST daily candle completion window
+BT_SE_K                = 1.0      # gate uses ExpR - BT_SE_K x standard-error (0 = old point-estimate gate)
+SWING_LATE_SCAN_ONLY   = True     # True: swing signals only in the last ~20 min of the session or after it (daily candle >=95% formed)
+SWING_SCAN_FROM        = (15, 10) # IST time from which the swing scan runs; at 15:15 ~92% of signals hold to the 15:30 close, at 15:20 ~95%
+INTRADAY_WHEN_CLOSED   = False    # True = also scan intraday when the market is closed (testing only; those rows are not tradable)
 
 INTRA_RR               = 2.0
 INTRA_T1_RR            = 1.0
 INTRA_ATR_SL_MULT      = 1.1
 INTRA_MAX_BARS         = 12
-INTRA_MIN_SETUPS       = 10       # Calibrated for 85-day 15m lookback
-INTRA_MIN_EXP_R        = 0.06     # Minimum SE-adjusted R-Expectancy
+INTRA_MIN_SETUPS       = 30       # was 8: 8 trades cannot support any expectancy estimate
+INTRA_MIN_EXP_R        = 0.05     # now tested as ExpR - BT_SE_K*SE >= 0.05 (was point ExpR >= 0.10)
 
 SWING_RR               = 2.5
 SWING_T1_RR            = 1.25
 SWING_ATR_SL_MULT      = 1.2
 SWING_MAX_DAYS         = 8
-SWING_MIN_SETUPS       = 12       # Calibrated for 5-year 1D lookback
-SWING_MIN_EXP_R        = 0.06     # Minimum SE-adjusted R-Expectancy
+SWING_MIN_SETUPS       = 30       # was 8
+SWING_MIN_EXP_R        = 0.05     # now tested as ExpR - BT_SE_K*SE >= 0.05 (was point ExpR >= 0.10)
 
 INDEX_UNIVERSE = {
     "^NSEI":                "NIFTY",
@@ -151,6 +75,7 @@ INDEX_UNIVERSE = {
     "NIFTY_MID_SELECT.NS":  "MIDCPNIFTY",
 }
 
+# Dhan IDX_I Security IDs for Instant Spot & OHLC Fetching
 DHAN_INDEX_SEC_IDS = {
     "NIFTY":      13,
     "BANKNIFTY":  25,
@@ -198,81 +123,34 @@ STOCK_UNIVERSE = [
 STOCK_UNIVERSE = list(dict.fromkeys(STOCK_UNIVERSE))
 
 
-def is_market_open_now() -> bool:
-    ist = pytz.timezone("Asia/Kolkata")
-    now = datetime.now(ist)
-    return (
-        now.weekday() < 5
-        and now.date() not in NSE_HOLIDAYS_2026
-        and (9, 15) <= (now.hour, now.minute) < (15, 30)
-    )
-
-
 # ==============================================================================
-# ⚡ 3. SELF-HEALING DHAN HQ v2 ENGINE (NSE_EQ + IDX_I + NSE_FNO + 85D 15M)
+# ⚡ 3. DHAN HQ v2 DATA ENGINE (SCRIP MAPPER + LIVE BATCH QUOTE + 15M CHARTS)
 # ==============================================================================
 class DhanDataEngine:
     def __init__(self, client_id: str, access_token: str):
         self.client_id = client_id
         self.access_token = access_token
         self.enabled = bool(self.client_id and self.access_token)
-        self.status_note = "NoToken" if not self.access_token else ("NoClientID" if not self.client_id else "Init")
-        self.attempted_401_heal = False
-        self.last_chart_call = 0.0
-        self.eq_map = {}       # sym -> securityId (NSE_EQ)
-        self.fut_map = {}      # sym -> securityId (Near-month NSE_FNO FUTSTK/FUTIDX)
-        self.inv_eq_map = {}
-        self.inv_fut_map = {}
-        if self.enabled:
-            self._load_or_build_scrip_map()
-
-    def _headers(self) -> dict:
-        return {
+        self.headers = {
             "Accept": "application/json",
             "Content-Type": "application/json",
             "client-id": self.client_id,
             "access-token": self.access_token,
         }
-
-    def _try_self_heal_401(self) -> bool:
-        if self.attempted_401_heal:
-            return False
-        self.attempted_401_heal = True
-        try:
-            import subprocess
-            refresh_script = "/home/ubuntu/scanners/refresh_token.py"
-            if os.path.exists(refresh_script):
-                print("🔄 Dhan HTTP 401 detected! Triggering self-healing refresh_token.py...")
-                subprocess.run([sys.executable, refresh_script], timeout=25, check=False)
-                if os.path.exists(ENV_FILE_PATH):
-                    load_dotenv(ENV_FILE_PATH, override=True)
-                    new_tok = (
-                        os.environ.get("DHAN_ACCESS_TOKEN", "")
-                        or os.environ.get("DHAN_TOKEN", "")
-                    ).strip().strip('"').strip("'")
-                    if new_tok and new_tok != self.access_token:
-                        self.access_token = new_tok
-                        if not self.client_id:
-                            self.client_id = extract_client_id_from_jwt(new_tok)
-                        print("✅ Hot-reloaded refreshed Dhan JWT token into active session!")
-                        return True
-        except Exception as e:
-            print(f"⚠️ Self-heal 401 failed: {e}")
-        return False
+        self.sym_to_secid = {}
+        self.secid_to_sym = {}
+        if self.enabled:
+            self._load_or_build_scrip_map()
 
     def _load_or_build_scrip_map(self):
-        ist = pytz.timezone("Asia/Kolkata")
-        today_str = datetime.now(ist).strftime("%Y-%m-%d")
         try:
             if DHAN_CACHE_FILE.exists():
-                with open(DHAN_CACHE_FILE, "r") as f:
-                    cached = json.load(f)
-                if cached.get("date") == today_str and cached.get("eq_map") and cached.get("fut_map"):
-                    self.eq_map = {k: int(v) for k, v in cached["eq_map"].items()}
-                    self.fut_map = {normalize_symbol(k): int(v) for k, v in cached["fut_map"].items()}
-                    self.inv_eq_map = {int(v): k for k, v in self.eq_map.items()}
-                    self.inv_fut_map = {int(v): k for k, v in self.fut_map.items()}
-                    return
+                mtime = datetime.fromtimestamp(DHAN_CACHE_FILE.stat().st_mtime)
+                if (datetime.now() - mtime).total_seconds() < 86400:
+                    with open(DHAN_CACHE_FILE, "r") as f:
+                        self.sym_to_secid = json.load(f)
+                        self.secid_to_sym = {int(v): k for k, v in self.sym_to_secid.items()}
+                        return
 
             url = "https://images.dhan.co/api-data/api-scrip-master.csv"
             df_scrip = pd.read_csv(
@@ -281,183 +159,108 @@ class DhanDataEngine:
                     "SEM_EXM_EXCH_ID",
                     "SEM_SEGMENT",
                     "SEM_SMST_SECURITY_ID",
-                    "SEM_INSTRUMENT_NAME",
                     "SEM_TRADING_SYMBOL",
-                    "SEM_EXPIRY_DATE",
                     "SEM_SERIES",
                 ],
                 low_memory=False,
             )
-
             nse_eq = df_scrip[
                 (df_scrip["SEM_EXM_EXCH_ID"] == "NSE")
                 & (df_scrip["SEM_SEGMENT"] == "E")
                 & (df_scrip["SEM_SERIES"] == "EQ")
             ]
-            eq_map = {}
+            mapping = {}
             for _, row in nse_eq.iterrows():
                 raw_sym = str(row["SEM_TRADING_SYMBOL"]).strip().upper()
                 clean_sym = raw_sym[:-3] if raw_sym.endswith("-EQ") else raw_sym
-                eq_map[clean_sym] = int(row["SEM_SMST_SECURITY_ID"])
+                sec_id = int(row["SEM_SMST_SECURITY_ID"])
+                mapping[clean_sym] = sec_id
 
-            nse_fut = df_scrip[
-                (df_scrip["SEM_EXM_EXCH_ID"] == "NSE")
-                & (df_scrip["SEM_SEGMENT"] == "D")
-                & (df_scrip["SEM_INSTRUMENT_NAME"].isin(["FUTSTK", "FUTIDX"]))
-            ].copy()
-
-            nse_fut["EXP_DT"] = pd.to_datetime(nse_fut["SEM_EXPIRY_DATE"], errors="coerce")
-            today_dt = pd.Timestamp(today_str)
-            nse_fut = nse_fut[nse_fut["EXP_DT"] >= today_dt].sort_values("EXP_DT")
-
-            fut_map = {}
-            for _, row in nse_fut.iterrows():
-                trd_sym = str(row["SEM_TRADING_SYMBOL"]).strip().upper()
-                base_sym = normalize_symbol(trd_sym.split("-")[0].strip())
-                if base_sym and base_sym not in fut_map:
-                    fut_map[base_sym] = int(row["SEM_SMST_SECURITY_ID"])
-
-            if eq_map:
-                self.eq_map = eq_map
-                self.fut_map = fut_map
-                self.inv_eq_map = {int(v): k for k, v in eq_map.items()}
-                self.inv_fut_map = {int(v): k for k, v in fut_map.items()}
+            if mapping:
+                self.sym_to_secid = mapping
+                self.secid_to_sym = {int(v): k for k, v in mapping.items()}
                 with open(DHAN_CACHE_FILE, "w") as f:
-                    json.dump({"date": today_str, "eq_map": eq_map, "fut_map": fut_map}, f)
-                print(f"✅ Dhan Master Mapped: {len(eq_map)} Cash Equities & {len(fut_map)} Near-Month Futures.")
+                    json.dump(mapping, f)
+                print(f"✅ Dhan Scrip Master cached ({len(mapping)} NSE EQ symbols).")
         except Exception as e:
-            self.status_note = f"MapErr:{type(e).__name__}"
             print(f"⚠️ Dhan Scrip Master load warning: {e}")
 
-    def _post_quote_batch(self, payload: dict) -> dict:
-        for attempt in range(2):
-            try:
-                resp = requests.post(
-                    "https://api.dhan.co/v2/marketfeed/quote",
-                    headers=self._headers(),
-                    json=payload,
-                    timeout=12,
-                )
-                if resp.status_code == 200:
-                    return resp.json().get("data", {})
-                if resp.status_code == 401 and attempt == 0 and self._try_self_heal_401():
-                    continue
-                if resp.status_code == 429:
-                    time.sleep(1.5)
-                    continue
-                self.status_note = f"HTTP-{resp.status_code}"
-                print(f"⚠️ Dhan Quote API status {resp.status_code}: {resp.text[:160]}")
-                return {}
-            except Exception as e:
-                self.status_note = f"Err:{type(e).__name__}"
-                print(f"⚠️ Dhan Quote error: {e}")
-        return {}
-
-    def fetch_unified_market_snapshot(self, symbols: list) -> tuple[dict, dict, dict]:
+    def fetch_batch_live_quotes(self, symbols: list) -> tuple[dict, dict]:
         """
-        Fetches NSE_EQ, IDX_I, and NSE_FNO quotes in a single batch call.
-        Returns:
-          - eq_quotes:  {sym: {ltp, open, high, low, prev_close, volume, vwap, ob_ratio, basis_pct}}
-          - idx_quotes: {idx_name: {ltp, open, high, low, prev_close, volume}}
-          - fno_quotes: {sym: {fut_ltp, curr_oi, prev_oi, oi_day_high, oi_day_low}}
+        Fetches real-time LTP, Day OHLC, Volume, ATP (VWAP), and Bid/Ask Orderbook Quantities
+        for all NSE Stocks and Indices in a SINGLE HTTP request via Dhan /v2/marketfeed/quote.
         """
         eq_quotes = {}
         idx_quotes = {}
-        fno_quotes = {}
-        if not self.enabled or not self.eq_map:
-            return eq_quotes, idx_quotes, fno_quotes
+        if not self.enabled or not self.sym_to_secid:
+            return eq_quotes, idx_quotes
 
-        eq_sec_ids = [int(self.eq_map[s]) for s in symbols if s in self.eq_map]
-        idx_sec_ids = [int(x) for x in DHAN_INDEX_SEC_IDS.values()]
-        all_underlyings = list(symbols) + list(DHAN_INDEX_SEC_IDS.keys())
-        fut_sec_ids = [int(self.fut_map[s]) for s in all_underlyings if s in self.fut_map]
+        eq_sec_ids = [self.sym_to_secid[s] for s in symbols if s in self.sym_to_secid]
+        idx_sec_ids = list(DHAN_INDEX_SEC_IDS.values())
 
         payload = {
             "NSE_EQ": eq_sec_ids,
             "IDX_I": idx_sec_ids,
-            "NSE_FNO": fut_sec_ids,
         }
-        data = self._post_quote_batch(payload)
-        if not data:
-            return eq_quotes, idx_quotes, fno_quotes
+        try:
+            resp = requests.post(
+                "https://api.dhan.co/v2/marketfeed/quote",
+                headers=self.headers,
+                json=payload,
+                timeout=10,
+            )
+            if resp.status_code == 200:
+                data = resp.json().get("data", {})
+                nse_eq_data = data.get("NSE_EQ", {})
+                for sec_str, q in nse_eq_data.items():
+                    sec_id = int(sec_str)
+                    sym = self.secid_to_sym.get(sec_id)
+                    if not sym:
+                        continue
+                    ohlc = q.get("ohlc", {})
+                    buy_q = float(q.get("buy_quantity", 0) or 0)
+                    sell_q = float(q.get("sell_quantity", 0) or 0)
+                    ob_ratio = (buy_q / sell_q) if sell_q > 0 else 1.0
+                    eq_quotes[sym] = {
+                        "ltp": float(q.get("last_price", 0.0) or 0.0),
+                        "open": float(ohlc.get("open", 0.0) or 0.0),
+                        "high": float(ohlc.get("high", 0.0) or 0.0),
+                        "low": float(ohlc.get("low", 0.0) or 0.0),
+                        "prev_close": float(ohlc.get("close", 0.0) or 0.0),
+                        "volume": float(q.get("volume", 0.0) or 0.0),
+                        "vwap": float(q.get("average_price", 0.0) or 0.0),
+                        "ob_ratio": round(ob_ratio, 2),
+                    }
 
-        # 1. Parse NSE_EQ Cash Quotes
-        for sec_str, q in data.get("NSE_EQ", {}).items():
-            sym = self.inv_eq_map.get(int(sec_str))
-            if not sym:
-                continue
-            ohlc = q.get("ohlc", {})
-            buy_q = float(q.get("buy_quantity", 0) or 0)
-            sell_q = float(q.get("sell_quantity", 0) or 0)
-            ob_ratio = (buy_q / sell_q) if sell_q > 0 else 1.0
-            eq_quotes[sym] = {
-                "ltp": float(q.get("last_price", 0.0) or 0.0),
-                "open": float(ohlc.get("open", 0.0) or 0.0),
-                "high": float(ohlc.get("high", 0.0) or 0.0),
-                "low": float(ohlc.get("low", 0.0) or 0.0),
-                "prev_close": float(ohlc.get("close", 0.0) or 0.0),
-                "volume": float(q.get("volume", 0.0) or 0.0),
-                "vwap": float(q.get("average_price", 0.0) or 0.0),
-                "ob_ratio": round(ob_ratio, 2),
-                "basis_pct": 0.0,
-            }
+                idx_data = data.get("IDX_I", {})
+                inv_idx = {v: k for k, v in DHAN_INDEX_SEC_IDS.items()}
+                for sec_str, q in idx_data.items():
+                    idx_name = inv_idx.get(int(sec_str))
+                    if not idx_name:
+                        continue
+                    ohlc = q.get("ohlc", {})
+                    idx_quotes[idx_name] = {
+                        "ltp": float(q.get("last_price", 0.0) or 0.0),
+                        "open": float(ohlc.get("open", 0.0) or 0.0),
+                        "high": float(ohlc.get("high", 0.0) or 0.0),
+                        "low": float(ohlc.get("low", 0.0) or 0.0),
+                        "prev_close": float(ohlc.get("close", 0.0) or 0.0),
+                    }
+                print(f"✅ Dhan Live Batch Quote fetched for {len(eq_quotes)} equities & {len(idx_quotes)} indices.")
+            else:
+                print(f"⚠️ Dhan Quote API status {resp.status_code}: {resp.text[:160]}")
+        except Exception as e:
+            print(f"⚠️ Dhan Batch Quote error: {e}")
+        return eq_quotes, idx_quotes
 
-        # 2. Parse IDX_I Spot Index Quotes (Includes volume=0.0 to prevent KeyError)
-        inv_idx = {v: k for k, v in DHAN_INDEX_SEC_IDS.items()}
-        for sec_str, q in data.get("IDX_I", {}).items():
-            idx_name = inv_idx.get(int(sec_str))
-            if not idx_name:
-                continue
-            ohlc = q.get("ohlc", {})
-            idx_quotes[idx_name] = {
-                "ltp": float(q.get("last_price", 0.0) or 0.0),
-                "open": float(ohlc.get("open", 0.0) or 0.0),
-                "high": float(ohlc.get("high", 0.0) or 0.0),
-                "low": float(ohlc.get("low", 0.0) or 0.0),
-                "prev_close": float(ohlc.get("close", 0.0) or 0.0),
-                "volume": 0.0,
-            }
-
-        # 3. Parse NSE_FNO Near-Month Futures (Full OI Telemetry + Futures Basis %)
-        for sec_str, q in data.get("NSE_FNO", {}).items():
-            raw_sym = self.inv_fut_map.get(int(sec_str))
-            if not raw_sym:
-                continue
-            sym = normalize_symbol(raw_sym)
-            fut_ltp = float(q.get("last_price", 0.0) or 0.0)
-            curr_oi = float(q.get("oi", 0.0) or 0.0)
-            prev_oi = float(q.get("previous_close_oi", 0.0) or 0.0)
-            oi_high = float(q.get("oi_day_high", 0.0) or 0.0)
-            oi_low  = float(q.get("oi_day_low", 0.0) or 0.0)
-
-            fno_quotes[sym] = {
-                "fut_ltp": fut_ltp,
-                "curr_oi": curr_oi,
-                "prev_oi": prev_oi,
-                "oi_day_high": oi_high,
-                "oi_day_low": oi_low,
-            }
-
-            if sym in eq_quotes and eq_quotes[sym]["ltp"] > 0 and fut_ltp > 0:
-                spot_p = eq_quotes[sym]["ltp"]
-                eq_quotes[sym]["basis_pct"] = round(((fut_ltp - spot_p) / spot_p) * 100.0, 2)
-
-        if eq_quotes:
-            self.status_note = "OK"
-        print(
-            f"✅ Dhan Snapshot: {len(eq_quotes)} EQ | {len(idx_quotes)} Indices | "
-            f"{len(fno_quotes)} Futures OI & Basis Streams."
-        )
-        return eq_quotes, idx_quotes, fno_quotes
-
-    def fetch_intraday_15m_df(self, sym: str, days_back: int = 85) -> pd.DataFrame:
+    def fetch_intraday_15m_df(self, sym: str, days_back: int = 45) -> pd.DataFrame:
         """
-        Pulls 85 days of 15-minute institutional OHLCV bars from Dhan /v2/charts/intraday
-        with rate-limit pacing and 429 retry so ZYDUSLIFE-style race conditions never occur.
+        Fetches exact 15-minute institutional OHLCV bars from Dhan /v2/charts/intraday
+        for shortlisted candidates to eliminate Yahoo Finance 15m delay/missing ticks.
         """
-        if not self.enabled or sym not in self.eq_map:
+        if not self.enabled or sym not in self.sym_to_secid:
             return pd.DataFrame()
-        sec_id = str(self.eq_map[sym])
+        sec_id = str(self.sym_to_secid[sym])
         ist = pytz.timezone("Asia/Kolkata")
         now_ist = datetime.now(ist)
         from_date = (now_ist - timedelta(days=days_back)).strftime("%Y-%m-%d")
@@ -472,45 +275,37 @@ class DhanDataEngine:
             "fromDate": from_date,
             "toDate": to_date,
         }
-        for attempt in range(2):
-            elapsed = time.time() - self.last_chart_call
-            if elapsed < 0.25:
-                time.sleep(0.25 - elapsed)
-            self.last_chart_call = time.time()
-            try:
-                resp = requests.post(
-                    "https://api.dhan.co/v2/charts/intraday",
-                    headers=self._headers(),
-                    json=payload,
-                    timeout=10,
+        try:
+            resp = requests.post(
+                "https://api.dhan.co/v2/charts/intraday",
+                headers=self.headers,
+                json=payload,
+                timeout=8,
+            )
+            if resp.status_code == 200:
+                d = resp.json()
+                ts = d.get("timestamp", [])
+                if not ts:
+                    return pd.DataFrame()
+                dt_idx = pd.to_datetime(ts, unit="s", utc=True).tz_convert("Asia/Kolkata").tz_localize(None)
+                df = pd.DataFrame(
+                    {
+                        "Open": pd.to_numeric(d.get("open", []), errors="coerce"),
+                        "High": pd.to_numeric(d.get("high", []), errors="coerce"),
+                        "Low": pd.to_numeric(d.get("low", []), errors="coerce"),
+                        "Close": pd.to_numeric(d.get("close", []), errors="coerce"),
+                        "Volume": pd.to_numeric(d.get("volume", []), errors="coerce").fillna(0),
+                    },
+                    index=dt_idx,
                 )
-                if resp.status_code == 200:
-                    d = resp.json()
-                    ts = d.get("timestamp", [])
-                    if not ts:
-                        return pd.DataFrame()
-                    dt_idx = pd.to_datetime(ts, unit="s", utc=True).tz_convert("Asia/Kolkata").tz_localize(None)
-                    df = pd.DataFrame(
-                        {
-                            "Open": pd.to_numeric(d.get("open", []), errors="coerce"),
-                            "High": pd.to_numeric(d.get("high", []), errors="coerce"),
-                            "Low": pd.to_numeric(d.get("low", []), errors="coerce"),
-                            "Close": pd.to_numeric(d.get("close", []), errors="coerce"),
-                            "Volume": pd.to_numeric(d.get("volume", []), errors="coerce").fillna(0),
-                        },
-                        index=dt_idx,
-                    )
-                    return df.dropna(subset=["Open", "High", "Low", "Close"]).sort_index()
-                if resp.status_code == 429 and attempt == 0:
-                    time.sleep(1.2)
-                    continue
-            except Exception:
-                pass
+                return df.dropna(subset=["Open", "High", "Low", "Close"]).sort_index()
+        except Exception:
+            pass
         return pd.DataFrame()
 
 
 # ==============================================================================
-# 🕸️ 4. DUAL-SOURCE OI FUSION ENGINE (NSE OI SPURTS + DHAN HQ FAILOVER)
+# 🕸️ 4. LIVE NSE OI SPURTS SCRAPER & HYBRID FLOW + ORDER-BOOK CLASSIFIER
 # ==============================================================================
 def fetch_nse_oi_spurts_map() -> dict:
     base_url = "https://www.nseindia.com"
@@ -530,149 +325,25 @@ def fetch_nse_oi_spurts_map() -> dict:
         session.get(f"{base_url}/market-data/oi-spurts", timeout=8)
         resp = session.get(f"{base_url}/api/live-analysis-oi-spurts-underlyings", timeout=10)
         if resp.status_code == 200:
-            for item in resp.json().get("data", []):
-                raw_sym = str(item.get("symbol", "")).strip().upper()
-                sym = normalize_symbol(raw_sym)
-                oi_pct = pd.to_numeric(
-                    item.get("avgInOI", item.get("pChangeInOI", item.get("%chng in OI", np.nan))),
-                    errors="coerce",
-                )
+            data = resp.json().get("data", [])
+            for item in data:
+                sym = str(item.get("symbol", "")).strip().upper()
+                oi_pct = pd.to_numeric(item.get("avgInOI", 0.0), errors="coerce")
                 if sym and not np.isnan(oi_pct):
-                    oi_map[sym] = round(float(oi_pct), 2)
+                    oi_map[sym] = float(oi_pct)
             print(f"✅ Scraped live NSE OI Spurts for {len(oi_map)} F&O underlyings.")
     except Exception as e:
         print(f"⚠️ NSE OI Spurts warning: {e}")
     return oi_map
 
 
-def _load_dhan_oi_baseline() -> dict:
-    if DHAN_OI_BASELINE_FILE.exists():
-        try:
-            with open(DHAN_OI_BASELINE_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"latest_date": "", "prev_oi": {}, "latest_oi": {}}
+def classify_hybrid_flow(price_chg_pct: float, oi_chg_pct: float, rvol: float, side: str, ob_ratio: float = 1.0):
+    # Block extreme opposite Order-Book Walls from Dhan Live Depth
+    if side == "BUY" and ob_ratio < 0.38:
+        return True, False, "OB-ASK!"
+    if side == "SHORT" and ob_ratio > 2.60:
+        return True, False, "OB-BID!"
 
-
-def _save_dhan_oi_baseline(cache_obj: dict) -> None:
-    try:
-        with open(DHAN_OI_BASELINE_FILE, "w") as f:
-            json.dump(cache_obj, f)
-    except Exception as e:
-        print(f"⚠️ Could not persist Dhan OI baseline cache: {e}")
-
-
-def fuse_dhan_and_nse_oi(dhan_fno_quotes: dict, nse_oi_map: dict, now_ist: datetime, mkt_open: bool) -> tuple[dict, str]:
-    """
-    Active-Active Dual-Source OI Fusion & Failover Engine:
-    1. Computes %OI directly from Dhan near-month futures using:
-       a) API previous_close_oi (if present)
-       b) Rolling EOD baseline cache (dhan_oi_baseline.json)
-       c) Intraday OI expansion/contraction vs oi_day_low / oi_day_high on cold start
-    2. Auto-seeds Dhan's baseline cache from NSE OI Spurts whenever NSE is reachable,
-       guaranteeing 100% continuity if NSE later blocks or drops out.
-    3. Arbitrates between Dhan and NSE per symbol so zero-value stub resets never overwrite
-       real buildup (e.g., FINNIFTY +32.9% or BANKNIFTY +1.3%).
-    """
-    today_str = now_ist.strftime("%Y-%m-%d")
-    cache = _load_dhan_oi_baseline()
-
-    # Roll previous trading day's latest_oi snapshot into prev_oi when date changes
-    if cache.get("latest_date") and cache["latest_date"] != today_str and cache.get("latest_oi"):
-        cache["prev_oi"] = cache["latest_oi"].copy()
-
-    prev_oi_store = cache.setdefault("prev_oi", {})
-    latest_oi_store = cache.setdefault("latest_oi", {})
-
-    norm_nse = {normalize_symbol(k): float(v) for k, v in (nse_oi_map or {}).items()}
-    norm_dhan = {normalize_symbol(k): v for k, v in (dhan_fno_quotes or {}).items()}
-
-    fused_map = {}
-    dhan_computed_cnt = 0
-    all_syms = set(norm_nse.keys()) | set(norm_dhan.keys())
-
-    for sym in all_syms:
-        dq = norm_dhan.get(sym, {})
-        curr_oi = float(dq.get("curr_oi", 0.0) or 0.0)
-        api_prev_oi = float(dq.get("prev_oi", 0.0) or 0.0)
-        oi_high = float(dq.get("oi_day_high", 0.0) or 0.0)
-        oi_low  = float(dq.get("oi_day_low", 0.0) or 0.0)
-        nse_pct = norm_nse.get(sym, None)
-
-        # Auto-seed Dhan prev_oi from NSE percentage if cache has no prior baseline for this symbol
-        if sym not in prev_oi_store and curr_oi > 0 and nse_pct is not None and abs(nse_pct) > 0.01:
-            denom = 1.0 + (nse_pct / 100.0)
-            if denom > 0.1:
-                prev_oi_store[sym] = int(round(curr_oi / denom))
-
-        # Compute Dhan %OI Change
-        dhan_pct = None
-        base_oi = api_prev_oi if api_prev_oi > 0 else float(prev_oi_store.get(sym, 0) or 0)
-        if curr_oi > 0 and base_oi > 0:
-            dhan_pct = round(((curr_oi - base_oi) / base_oi) * 100.0, 2)
-            dhan_computed_cnt += 1
-        elif curr_oi > 0 and (oi_low > 0 or oi_high > 0):
-            # Cold-start intraday fallback when NSE is unreachable and no EOD cache exists yet
-            if oi_low > 0 and (oi_high - curr_oi) <= (curr_oi - oi_low):
-                dhan_pct = round(((curr_oi - oi_low) / oi_low) * 100.0, 2)
-            elif oi_high > 0:
-                dhan_pct = round(((curr_oi - oi_high) / oi_high) * 100.0, 2)
-            if dhan_pct is not None:
-                dhan_computed_cnt += 1
-
-        if curr_oi > 0:
-            latest_oi_store[sym] = int(round(curr_oi))
-
-        # Smart Relevance Arbitration & Failover between Dhan and NSE
-        if dhan_pct is not None and nse_pct is not None:
-            if abs(dhan_pct) > 0.05 and abs(nse_pct) > 0.05:
-                # In live market hours, prefer low-latency Dhan tick OI unless NSE shows broader multi-expiry buildup
-                chosen = dhan_pct if mkt_open else nse_pct
-                if abs(nse_pct) > abs(chosen) * 1.25:
-                    chosen = nse_pct
-                fused_map[sym] = round(float(chosen), 2)
-            elif abs(nse_pct) > 0.05:
-                fused_map[sym] = round(float(nse_pct), 2)
-            else:
-                fused_map[sym] = round(float(dhan_pct), 2)
-        elif nse_pct is not None:
-            fused_map[sym] = round(float(nse_pct), 2)
-        elif dhan_pct is not None:
-            fused_map[sym] = round(float(dhan_pct), 2)
-
-    if latest_oi_store:
-        cache["latest_date"] = today_str
-        _save_dhan_oi_baseline(cache)
-
-    src_summary = f"D:{dhan_computed_cnt}|N:{len(norm_nse)}"
-    print(f"✅ Dual-Source OI Fused: {len(fused_map)} Underlyings ({src_summary}).")
-    return fused_map, src_summary
-
-
-def classify_hybrid_flow(
-    price_chg_pct: float,
-    oi_chg_pct: float,
-    rvol: float,
-    side: str,
-    ob_ratio: float = 1.0,
-    basis_pct: float = 0.0,
-    mkt_open: bool = False,
-):
-    # 1. Anti-Trap Futures Basis Shield
-    if side == "BUY" and basis_pct < -0.35:
-        return True, False, "BS-DISC"
-    if side == "SHORT" and basis_pct > 0.85:
-        return True, False, "BS-PREM"
-
-    # 2. Anti-Trap Live Order-Book Depth Shield (Active during live market hours only)
-    if mkt_open:
-        if side == "BUY" and 0 < ob_ratio < 0.38:
-            return True, False, "OB-ASK!"
-        if side == "SHORT" and ob_ratio > 2.60:
-            return True, False, "OB-BID!"
-
-    # 3. Primary Derivatives OI Build-Up Classification (Supports LB, SB, SC, LU)
     if abs(oi_chg_pct) >= 0.5:
         sign_str = f"{oi_chg_pct:+.0f}%"
         if price_chg_pct >= 0.0 and oi_chg_pct >= 2.0:
@@ -692,24 +363,22 @@ def classify_hybrid_flow(
                 return True, False, f"LU{sign_str:>5}"
             return False, True, f"LU{sign_str:>5}"
 
-    # 4. Cash Institutional RVOL Expansion
     if 1.35 <= rvol <= 9.0:
         if (side == "BUY" and price_chg_pct > 0) or (side == "SHORT" and price_chg_pct < 0):
             return False, True, f"VL{rvol:>4.1f}x"
         return False, False, f"VL{rvol:>4.1f}x"
 
-    # 5. Live Dhan Order-Book Accumulation / Distribution Boost
-    if mkt_open:
-        if side == "BUY" and price_chg_pct > 0.25 and ob_ratio >= 1.35 and rvol >= 1.15:
-            return False, True, f"OB{ob_ratio:>4.1f}x"
-        if side == "SHORT" and price_chg_pct < -0.25 and 0 < ob_ratio <= 0.72 and rvol >= 1.15:
-            return False, True, f"OB{ob_ratio:>4.1f}x"
+    # Boost if Dhan Live Order-Book shows strong institutional accumulation/distribution
+    if side == "BUY" and price_chg_pct > 0.25 and ob_ratio >= 1.35 and rvol >= 1.15:
+        return False, True, f"OB{ob_ratio:>4.1f}x"
+    if side == "SHORT" and price_chg_pct < -0.25 and 0 < ob_ratio <= 0.72 and rvol >= 1.15:
+        return False, True, f"OB{ob_ratio:>4.1f}x"
 
     return False, False, "   --  "
 
 
 # ==============================================================================
-# 📈 5. DATA PATCHING, DUAL-BB S/D INDICATORS & GAP-AWARE SE BACKTEST ENGINE
+# 📈 5. DATA PATCHING, PRECISION INDICATORS & TIME-DECAYED BACKTEST ENGINE
 # ==============================================================================
 def get_closed_bar_slice(df: pd.DataFrame, is_intraday: bool) -> pd.DataFrame:
     if df.empty or len(df) < 30:
@@ -729,6 +398,7 @@ def get_closed_bar_slice(df: pd.DataFrame, is_intraday: bool) -> pd.DataFrame:
     )
     if in_forming_window:
         last_ts = df.index[-1]
+        # Only drop the last 15m bar if its 15-minute completion timestamp hasn't passed yet!
         bar_close_time = last_ts + timedelta(minutes=15)
         if last_ts.date() == now_ist.date() and now_ist < bar_close_time:
             return df.iloc[:-1].copy()
@@ -736,6 +406,10 @@ def get_closed_bar_slice(df: pd.DataFrame, is_intraday: bool) -> pd.DataFrame:
 
 
 def patch_daily_df_with_dhan_quote(df: pd.DataFrame, dhan_q: dict) -> pd.DataFrame:
+    """
+    Injects or updates today's real-time NSE Daily OHLCV bar using Dhan's zero-latency quote,
+    and scales intraday volume to full-day pace so Daily RVOL works accurately mid-market.
+    """
     if df.empty or not dhan_q or dhan_q.get("ltp", 0) <= 0:
         return df
     df = df.copy()
@@ -746,22 +420,18 @@ def patch_daily_df_with_dhan_quote(df: pd.DataFrame, dhan_q: dict) -> pd.DataFra
     now_ist = datetime.now(ist)
     today_date = now_ist.date()
 
+    # Calculate intraday elapsed trading fraction (out of 375 mins) to pace-adjust today's volume
     mins_elapsed = max(15.0, min(375.0, (now_ist.hour * 60 + now_ist.minute) - (9 * 60 + 15)))
     vol_pace_mult = (375.0 / mins_elapsed) if (now_ist.weekday() < 5 and 555 <= (now_ist.hour * 60 + now_ist.minute) <= 930) else 1.0
-    raw_vol = float(dhan_q.get("volume", 0.0) or 0.0)
-    projected_vol = raw_vol * min(vol_pace_mult, 3.5)
+    projected_vol = float(dhan_q.get("volume", 0.0) or 0.0) * min(vol_pace_mult, 3.5)   # index quotes carry no volume
 
     last_idx = df.index[-1]
     last_date = last_idx.date() if hasattr(last_idx, "date") else today_date
 
-    ltp = float(dhan_q["ltp"])
-    o = float(dhan_q.get("open", 0.0) or 0.0)
-    o = o if o > 0 else ltp
-    h_q = float(dhan_q.get("high", 0.0) or 0.0)
-    l_q = float(dhan_q.get("low", 0.0) or 0.0)
-    h = max(h_q, ltp, o)
-    l = min(l_q if l_q > 0 else ltp, ltp, o)
-    c = ltp
+    o = dhan_q["open"] if dhan_q["open"] > 0 else dhan_q["ltp"]
+    h = max(dhan_q["high"], dhan_q["ltp"], o)
+    l = min(dhan_q["low"] if dhan_q["low"] > 0 else dhan_q["ltp"], dhan_q["ltp"], o)
+    c = dhan_q["ltp"]
 
     if last_date == today_date:
         df.iloc[-1, df.columns.get_loc("Open")] = o
@@ -838,16 +508,10 @@ def compute_daily_swing_indicators(df: pd.DataFrame) -> pd.DataFrame:
     df["EMA21"] = c.ewm(span=21, adjust=False).mean()
     df["EMA55"] = c.ewm(span=55, adjust=False).mean()
 
-    # Dual Bollinger Bands (BB 38 & BB 61) for Institutional S/D Zones
     df["BB_SMA_38"] = c.rolling(38).mean()
     std_38 = c.rolling(38).std(ddof=0)
     df["BB_UP_38"] = df["BB_SMA_38"] + (2.0 * std_38)
     df["BB_LO_38"] = df["BB_SMA_38"] - (2.0 * std_38)
-
-    df["BB_SMA_61"] = c.rolling(61).mean()
-    std_61 = c.rolling(61).std(ddof=0)
-    df["BB_UP_61"] = df["BB_SMA_61"] + (2.0 * std_61)
-    df["BB_LO_61"] = df["BB_SMA_61"] - (2.0 * std_61)
 
     delta = c.diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
@@ -859,22 +523,9 @@ def compute_daily_swing_indicators(df: pd.DataFrame) -> pd.DataFrame:
     vol_sma20 = df["Volume"].rolling(20).mean().replace(0, np.nan)
     df["RVOL"] = (df["Volume"] / vol_sma20).fillna(1.0)
 
+    # Candle Anatomy & Momentum Confirmation (Eliminates Falling Knife / Dead Chop Signals)
     bar_range = (h - l).replace(0, np.nan)
     close_pos = ((c - l) / bar_range).fillna(0.5)
-    upper_wick = ((h - c) / bar_range).fillna(0.5)
-    not_overextended = (h - l) <= (2.2 * df["ATR"])
-
-    # Block shorting into Dual-BB Demand Bounce; block buying into Dual-BB Supply Rejection
-    demand_bounce = (
-        ((l <= df["BB_LO_38"] * 1.006) | (l <= df["BB_LO_61"] * 1.006))
-        & (c > o)
-        & (close_pos >= 0.55)
-    )
-    supply_rejection = (
-        ((h >= df["BB_UP_38"] * 0.994) | (h >= df["BB_UP_61"] * 0.994))
-        & (c < o)
-        & (upper_wick >= 0.55)
-    )
 
     df["BUY_Signal"] = (
         (c >= df["EMA21"] * 0.995)
@@ -883,8 +534,6 @@ def compute_daily_swing_indicators(df: pd.DataFrame) -> pd.DataFrame:
         & (df["RSI"] >= 46)
         & (df["RSI"] <= 68)
         & (df["ADX"] >= 16)
-        & not_overextended
-        & (~supply_rejection)
         & ((c > o) | (close_pos >= 0.55))
         & ((c >= df["EMA9"]) | (c > h.shift(1)))
     )
@@ -895,8 +544,6 @@ def compute_daily_swing_indicators(df: pd.DataFrame) -> pd.DataFrame:
         & (df["RSI"] >= 30)
         & (df["RSI"] <= 53)
         & (df["ADX"] >= 16)
-        & not_overextended
-        & (~demand_bounce)
         & ((c < o) | (close_pos <= 0.45))
         & ((c <= df["EMA9"]) | (c < l.shift(1)))
     )
@@ -918,6 +565,7 @@ def compute_intraday_15m_indicators(df: pd.DataFrame, is_index: bool = False, dh
         vol_clean = df["Volume"].replace(0, 1)
         dates = pd.Series(df.index.date, index=df.index)
         df["TREND_ANCHOR"] = (tp * vol_clean).groupby(dates).cumsum() / vol_clean.groupby(dates).cumsum()
+        # Anchor the latest session bar to Dhan's exact NSE Exchange ATP/VWAP when available
         if dhan_vwap > 0:
             df.iloc[-1, df.columns.get_loc("TREND_ANCHOR")] = dhan_vwap
 
@@ -933,6 +581,7 @@ def compute_intraday_15m_indicators(df: pd.DataFrame, is_index: bool = False, dh
 
     df["ATR"], df["ADX"] = compute_wilder_atr_and_adx(df, 14)
 
+    # Time-of-Day (ToD) Normalized RVOL: Compares 10:15 AM bar strictly against historical 10:15 AM bars!
     tod_groups = df["Volume"].groupby(df.index.time)
     tod_mean = tod_groups.transform(lambda x: x.rolling(10, min_periods=3).mean()).replace(0, np.nan)
     fallback_mean = df["Volume"].rolling(20).mean().replace(0, np.nan)
@@ -940,7 +589,6 @@ def compute_intraday_15m_indicators(df: pd.DataFrame, is_index: bool = False, dh
 
     bar_range = (h - l).replace(0, np.nan)
     close_pos = ((c - l) / bar_range).fillna(0.5)
-    not_overextended = ((h - l) <= (2.2 * df["ATR"])) & ((c - df["TREND_ANCHOR"]).abs() <= (1.8 * df["ATR"]))
 
     df["BUY_Signal"] = (
         (c >= df["TREND_ANCHOR"])
@@ -949,7 +597,6 @@ def compute_intraday_15m_indicators(df: pd.DataFrame, is_index: bool = False, dh
         & (df["RSI"] >= 48)
         & (df["RSI"] <= 72)
         & (df["ADX"] >= 16)
-        & not_overextended
         & ((c > o) | (close_pos >= 0.55))
     )
     df["SHORT_Signal"] = (
@@ -959,14 +606,13 @@ def compute_intraday_15m_indicators(df: pd.DataFrame, is_index: bool = False, dh
         & (df["RSI"] >= 28)
         & (df["RSI"] <= 52)
         & (df["ADX"] >= 16)
-        & not_overextended
         & ((c < o) | (close_pos <= 0.45))
     )
     return df
 
 
-def _stop_exit_r(side: str, open_j: float, stop_px: float, entry: float, risk: float, t1_reached: bool, t1_r: float) -> float:
-    """Gap-aware stop fill: if the bar opens beyond the stop, exit at open_j rather than stop_px."""
+def _stop_exit_r(side, open_j, stop_px, entry, risk, t1_reached, t1_r):
+    """R of a stop exit with a GAP-AWARE fill: if the bar opens beyond the stop, the fill is the open (worse), not the stop."""
     if not np.isfinite(open_j):
         open_j = stop_px
     fill = min(open_j, stop_px) if side == "BUY" else max(open_j, stop_px)
@@ -977,6 +623,12 @@ def _stop_exit_r(side: str, open_j: float, stop_px: float, entry: float, risk: f
 def backtest_cash_signals(
     df: pd.DataFrame, side: str = "BUY", atr_mult: float = 1.2, rr_target: float = 2.5, max_bars: int = 8, is_intraday: bool = False
 ):
+    """
+    Institutional Backtest Engine:
+    - Enforces identical percentage risk bounds ([1.2%-3.0%] intra / [1.5%-5.5%] swing) as live execution.
+    - Resolves dual SL+Target same-bar collisions using bar Open proximity.
+    - Applies exponential recency weighting (recent setups carry higher weight than 3-year-old setups).
+    """
     sig_col = "BUY_Signal" if side == "BUY" else "SHORT_Signal"
     opens, closes, highs, lows, atrs, sigs = (
         df["Open"].values,
@@ -1032,7 +684,8 @@ def backtest_cash_signals(
                 hit_sl = lows[j] <= curr_sl
                 hit_tgt = highs[j] >= tgt
                 if hit_sl and hit_tgt:
-                    if abs(opens[j] - curr_sl) <= abs(tgt - opens[j]):
+                    # Resolve same-bar collision via Open proximity
+                    if abs(opens[j] - curr_sl) <= abs( tgt - opens[j]):
                         trade_r = _stop_exit_r(side, opens[j], curr_sl, entry, risk, t1_reached, t1_r_lock)
                     else:
                         trade_r = 0.5 * t1_r_lock + 0.5 * full_r_lock
@@ -1085,6 +738,7 @@ def backtest_cash_signals(
         return 0, -1.0, 0.0, 9.9
 
     arr_r = np.array(trade_results, dtype=float)
+    # Exponential Recency Weighting: Recent regime setups weigh more than oldest setups
     weights = np.exp(np.linspace(-1.0, 0.0, total_trades))
     weights /= weights.sum()
 
@@ -1105,20 +759,12 @@ def build_stock_trade_row(
     win_pct: float,
     horizon_tag: str,
     rs_bonus: float = 0.0,
-    live_ltp: float = 0.0,
 ):
     latest = df.iloc[-1]
-    raw_close = float(live_ltp) if live_ltp > 0 else float(latest["Close"])
+    entry = round(float(latest["Close"]), 1)
     atr = float(latest["ATR"])
-    if raw_close <= 10.0 or np.isnan(atr) or atr <= 0:
+    if entry <= 10.0 or np.isnan(atr) or atr <= 0:
         return None
-
-    # Anti-Chasing Pullback Entry: If trigger candle expanded >1.2x ATR, set limit entry on minor 0.12*ATR dip
-    bar_span = float(latest["High"]) - float(latest["Low"])
-    if bar_span > 1.2 * atr:
-        entry = round(raw_close - (0.12 * atr) if side == "BUY" else raw_close + (0.12 * atr), 1)
-    else:
-        entry = round(raw_close, 1)
 
     atr_mult = INTRA_ATR_SL_MULT if is_intraday else SWING_ATR_SL_MULT
     t1_rr = INTRA_T1_RR if is_intraday else SWING_T1_RR
@@ -1177,7 +823,7 @@ def build_stock_trade_row(
 
 
 # ==============================================================================
-# 📱 6. UNIFIED SINGLE-MESSAGE FORMATTER
+# 📱 6. UNIFIED SINGLE-MESSAGE FORMATTER (SIMPLE, CLEAN & ACTIONABLE)
 # ==============================================================================
 def format_stock_table_block(rows):
     stk_hdr = (
@@ -1185,7 +831,7 @@ def format_stock_table_block(rows):
         f"{'SL':>6}|{'T1-50%':>6}|{'Target':>6}|{'Flow':>7}|{'ExpR':>5}|{'Win%':>5}|{'Score':>5}"
     )
     stk_sep = "-" * len(stk_hdr)
-    block = ["<pre>", html.escape(stk_hdr), html.escape(stk_sep)]
+    block = ["<pre>", stk_hdr, stk_sep]
     for r in rows:
         row_str = (
             f"{r['Symbol']:<11}|"
@@ -1206,12 +852,10 @@ def format_stock_table_block(rows):
     return "\n".join(block)
 
 
-def build_single_master_message(
-    mood_summary, intra_rows, short_1d_rows, buy_1d_rows, now_str, dhan_active: bool, fno_cnt: int, dhan_note: str = ""
-):
-    feed_badge = f"Dhan+NSE ({fno_cnt} OI) ⚡" if dhan_active else f"YF + NSE ({dhan_note})"
+def build_single_master_message(mood_summary, intra_rows, short_1d_rows, buy_1d_rows, now_str, dhan_active: bool, market_open: bool = True):
+    feed_badge = "Dhan HQ v2 Live ⚡" if dhan_active else "YF Feed"
     lines = [
-        f"<b>🎯 MASTER STOCK SCANNER ({html.escape(feed_badge)})</b>",
+        f"<b>🎯 MASTER STOCK SCANNER ({feed_badge})</b>",
         f"🕒 <code>{html.escape(now_str)}</code> | Max Risk: <code>₹{RISK_PER_TRADE:,}</code> | Max Cap: <code>₹{MAX_CAPITAL_PER_TRADE:,}</code>\n",
         mood_summary,
     ]
@@ -1246,7 +890,7 @@ def build_single_master_message(
         if len(top_three) == 3:
             break
 
-    if top_three:
+    if top_three and market_open:
         lines.append("\n<b>🏆 TOP 3 DIRECT CASH TRADES TO TAKE RIGHT NOW:</b>")
         for idx, p in enumerate(top_three, 1):
             lines.append(
@@ -1257,7 +901,9 @@ def build_single_master_message(
                 f"| Flow: <code>{html.escape(p['Flow'].strip())}</code> | <b>Score: {p['Score']:.1f}</b>"
             )
 
-    lines.append("\n💡 <i>15M Cap uses 2x MIS Margin | Gap-Aware SE Backtest + Dual-BB S/D Filtered</i>")
+    if not market_open and (intra_rows or short_1d_rows or buy_1d_rows):
+        lines.append("\n⚠️ <i>Market closed: rows are for planning only (prices are the last close, not tradable now).</i>")
+    lines.append("\n💡 <i>15M Cap uses 2x MIS Margin | 1D Shorts = Trade via Intraday MIS or F&amp;O Puts</i>")
     return "\n".join(lines)
 
 
@@ -1282,14 +928,47 @@ def send_telegram_alert(html_text: str):
 # ==============================================================================
 # 🚀 7. MAIN EXECUTION ENGINE
 # ==============================================================================
+def _flow_change_pct(spot, prev_close, fallback_pct):
+    """% change vs the PREVIOUS CLOSE: the reference period NSE's OI change is measured against.
+    Open-based change misclassifies gap days (e.g. +1% from a gap-down open but -2% vs prev close).
+    Falls back to the supplied open-based change when either price is missing."""
+    if spot and prev_close and spot > 0 and prev_close > 0:
+        return (spot - prev_close) / prev_close * 100.0
+    return fallback_pct
+
+
+def _new_tel():
+    keys = ("scanned", "signal", "blocked", "no_boost", "laggard", "bt_few", "bt_fail", "passed")
+    return {k: dict.fromkeys(keys, 0) for k in ("intra", "sw_buy", "sw_short")}
+
+
+def _telemetry_text(tel, skipped_idx, n_idx_used, n_idx_total, ran):
+    """Where did each scanned name drop out? One line per scan type (also printed to the run log)."""
+    def one(k, label):
+        t = tel[k]
+        if not ran[k]:
+            return f"{label}: not scanned (" + ("market closed" if k == "intra" else "before 15:10 IST") + ")"
+        extra = f" | {t['laggard']} rel-strength" if k != "intra" else ""
+        return (f"{label}: {t['scanned']} scanned | {t['signal']} with signal | {t['blocked']} flow-blocked | "
+                f"{t['no_boost']} no flow boost{extra} | {t['bt_few']} too few trades | "
+                f"{t['bt_fail']} failed ExpR-SE gate | {t['passed']} passed")
+    lines = [one("intra", "Intraday"), one("sw_buy", "Swing BUY"), one("sw_short", "Swing SHORT"),
+             f"Indices used: {n_idx_used}/{n_idx_total}" + (" | skipped: " + "; ".join(skipped_idx) if skipped_idx else "")]
+    return lines
+
+
 def main():
     ist = pytz.timezone("Asia/Kolkata")
     now_ist = datetime.now(ist)
     now_str = now_ist.strftime("%d-%b %I:%M %p IST")
     current_minutes = now_ist.hour * 60 + now_ist.minute
-    mkt_open = is_market_open_now()
-
+    market_open_now = now_ist.weekday() < 5 and now_ist.date() not in NSE_HOLIDAYS_2026 and (9 * 60 + 15) <= current_minutes < (15 * 60 + 30)
+    run_intraday = market_open_now or INTRADAY_WHEN_CLOSED
+    if not run_intraday:
+        print('Market closed: intraday scan skipped (those rows would use stale prices).')
     run_swing = (not SWING_LATE_SCAN_ONLY) or FORCE_RUN or current_minutes >= (SWING_SCAN_FROM[0] * 60 + SWING_SCAN_FROM[1])
+    if not run_swing:
+        print('Swing scan deferred: daily signals are evaluated from 15:10 IST, once the daily candle is nearly complete.')
 
     if not FORCE_RUN:
         if (
@@ -1303,34 +982,29 @@ def main():
 
     clean_syms = [tk.replace(".NS", "") for tk in STOCK_UNIVERSE]
     dhan = DhanDataEngine(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
-
-    # Concurrent Dual-Source Telemetry Ingestion (Dhan HQ v2 + NSE OI Spurts in parallel)
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        fut_dhan = pool.submit(dhan.fetch_unified_market_snapshot, clean_syms)
-        fut_nse  = pool.submit(fetch_nse_oi_spurts_map)
-        dhan_eq_quotes, dhan_idx_quotes, dhan_fno_quotes = fut_dhan.result()
-        nse_oi_map = fut_nse.result()
-
-    # Active-Active Dual-Source OI Fusion & Failover
-    oi_spurts_map, oi_src_note = fuse_dhan_and_nse_oi(dhan_fno_quotes, nse_oi_map, now_ist, mkt_open)
+    dhan_eq_quotes, dhan_idx_quotes = dhan.fetch_batch_live_quotes(clean_syms)
+    oi_spurts_map = fetch_nse_oi_spurts_map()
 
     all_tickers = list(INDEX_UNIVERSE.keys()) + STOCK_UNIVERSE
     raw_15m = yf.download(all_tickers, period="60d", interval="15m", group_by="ticker", progress=False)
     raw_1d  = yf.download(all_tickers, period="5y", interval="1d", group_by="ticker", progress=False)
 
     intraday_chg_map = {}
+    skipped_idx = []
     idx_badges = []
     bear_count = 0
     nifty_5d_ret = 0.0
 
-    # 1. TRUE MACRO REGIME CHECK (Protected against after-hours ohlc.close == ltp zero-change resets)
+    # 1. TRUE MACRO REGIME CHECK (Fuses Dhan Live Index Quote + Daily EMA21 + OI Flow)
     for tk, idx_name in INDEX_UNIVERSE.items():
         df15 = get_closed_bar_slice(extract_ticker_df(raw_15m, tk), is_intraday=True)
         df1d = patch_daily_df_with_dhan_quote(
             get_closed_bar_slice(extract_ticker_df(raw_1d, tk), is_intraday=False),
             dhan_idx_quotes.get(idx_name, {}),
         )
-        if len(df1d) < 65:
+        if len(df1d) < 60:
+            skipped_idx.append(f"{idx_name} ({len(df1d)} daily bars from Yahoo/Dhan)")
+            print(f"Index {idx_name} skipped: only {len(df1d)} daily bars (need 60). Check the Yahoo ticker {tk}.")
             continue
         df1d = compute_daily_swing_indicators(df1d)
         last1d = df1d.iloc[-1]
@@ -1340,29 +1014,30 @@ def main():
             nifty_5d_ret = ((float(last1d["Close"]) - float(df1d["Close"].iloc[-6])) / float(df1d["Close"].iloc[-6])) * 100.0
 
         idx_q = dhan_idx_quotes.get(idx_name, {})
-        spot = float(idx_q.get("ltp", 0.0) or float(last1d["Close"]))
-        dhan_prev_c = float(idx_q.get("prev_close", 0.0) or 0.0)
-        # After market hours, Dhan sets ohlc.close == last_price; fall back to true prior daily candle close
-        prev_c = dhan_prev_c if (dhan_prev_c > 0 and abs(spot - dhan_prev_c) > 1e-3) else float(prev1d["Close"])
-        price_chg_pct = ((spot - prev_c) / prev_c) * 100.0 if prev_c > 0 else 0.0
+        if idx_q.get("ltp", 0) > 0 and idx_q.get("open", 0) > 0:
+            spot = idx_q["ltp"]
+            price_chg_pct = ((spot - idx_q["open"]) / idx_q["open"]) * 100.0
+        elif len(df15) >= 20:
+            last15 = df15.iloc[-1]
+            today_bars = df15[df15.index.date == last15.name.date()]
+            day_open = float(today_bars["Open"].iloc[0]) if not today_bars.empty else float(last15["Open"])
+            spot = float(last15["Close"])
+            price_chg_pct = ((spot - day_open) / day_open) * 100.0
+        else:
+            spot = float(last1d["Close"])
+            price_chg_pct = ((spot - float(prev1d["Close"])) / float(prev1d["Close"])) * 100.0
 
         intraday_chg_map[idx_name] = price_chg_pct
         oi_chg_pct = oi_spurts_map.get(idx_name, 0.0)
+        idx_flow_chg = _flow_change_pct(spot, float(prev1d["Close"]), price_chg_pct)   # OI is measured vs prev close
 
-        is_bearish = (price_chg_pct < 0 and oi_chg_pct >= 1.5) or (spot < float(last1d["EMA21"]))
-        if abs(oi_chg_pct) >= 1.0:
-            if oi_chg_pct >= 1.0:
-                buildup_code = "SB" if (price_chg_pct < 0 or is_bearish) else "LB"
-            else:
-                buildup_code = "LU" if (price_chg_pct < 0 or is_bearish) else "SC"
-            flow_lbl = f"{buildup_code} {oi_chg_pct:+.0f}%"
-        else:
-            flow_lbl = f"{price_chg_pct:+.1f}%"
-
+        is_bearish = (idx_flow_chg < 0 and oi_chg_pct >= 2.0) or (spot < float(last1d["EMA21"]))
         if is_bearish:
             bear_count += 1
+            flow_lbl = f"SB {oi_chg_pct:+.0f}%" if (idx_flow_chg < 0 and oi_chg_pct >= 1.0) else f"{idx_flow_chg:+.1f}%"
             idx_badges.append(f"<code>{idx_name}: {spot:,.0f} (BEAR 🔴 | {flow_lbl})</code>")
         else:
+            flow_lbl = f"LB {oi_chg_pct:+.0f}%" if (idx_flow_chg >= 0 and oi_chg_pct >= 1.0) else f"{idx_flow_chg:+.1f}%"
             idx_badges.append(f"<code>{idx_name}: {spot:,.0f} (BULL 🟢 | {flow_lbl})</code>")
 
     overall_mood = "BEARISH 🔴 (Focus on SHORTS / PUTS)" if bear_count >= 2 else "BULLISH 🟢 (Focus on BUYS / CALLS)"
@@ -1374,6 +1049,7 @@ def main():
     mood_summary = "\n".join(mood_lines)
 
     # 2. SCAN STOCKS ON 15M (INTRADAY) & 1D (POSITIONAL SHORT & BUY)
+    TEL = _new_tel()
     intra_stk_cands = []
     swing_short_cands = []
     swing_buy_cands = []
@@ -1383,29 +1059,18 @@ def main():
         sym = tk.replace(".NS", "")
         dhan_q = dhan_eq_quotes.get(sym, {})
         ob_ratio = dhan_q.get("ob_ratio", 1.0)
-        basis_pct = dhan_q.get("basis_pct", 0.0)
         dhan_vwap = dhan_q.get("vwap", 0.0)
-        live_ltp = dhan_q.get("ltp", 0.0)
-
-        df1d_raw = extract_ticker_df(raw_1d, tk)
-        df1d = patch_daily_df_with_dhan_quote(get_closed_bar_slice(df1d_raw, is_intraday=False), dhan_q)
-        true_prev_1d_close = float(df1d["Close"].iloc[-2]) if len(df1d) >= 2 else 0.0
 
         # --- A. 15M INTRADAY SCAN ---
         df15_raw = extract_ticker_df(raw_15m, tk)
         df15 = get_closed_bar_slice(df15_raw, is_intraday=True)
-        if len(df15) >= 80:
+        if run_intraday and len(df15) >= 80:
             df15 = compute_intraday_15m_indicators(df15, is_index=False, dhan_vwap=dhan_vwap)
             last = df15.iloc[-1]
             prev = df15.iloc[-2]
 
-            dhan_prev_c = float(dhan_q.get("prev_close", 0.0) or 0.0)
-            if live_ltp > 0 and dhan_prev_c > 0 and abs(live_ltp - dhan_prev_c) > 1e-3:
-                price_chg_pct = ((live_ltp - dhan_prev_c) / dhan_prev_c) * 100.0
-            elif live_ltp > 0 and true_prev_1d_close > 0:
-                price_chg_pct = ((live_ltp - true_prev_1d_close) / true_prev_1d_close) * 100.0
-            elif live_ltp > 0 and dhan_q.get("open", 0) > 0:
-                price_chg_pct = ((live_ltp - dhan_q["open"]) / dhan_q["open"]) * 100.0
+            if dhan_q.get("ltp", 0) > 0 and dhan_q.get("open", 0) > 0:
+                price_chg_pct = ((dhan_q["ltp"] - dhan_q["open"]) / dhan_q["open"]) * 100.0
             else:
                 today_bars = df15[df15.index.date == last.name.date()]
                 day_open = float(today_bars["Open"].iloc[0]) if not today_bars.empty else float(last["Open"])
@@ -1415,38 +1080,42 @@ def main():
             oi_chg_pct = oi_spurts_map.get(sym, 0.0)
             rvol = float(last.get("RVOL", 1.0))
 
-            spot_15 = live_ltp if live_ltp > 0 else float(last["Close"])
+            spot_15 = dhan_q["ltp"] if dhan_q.get("ltp", 0) > 0 else float(last["Close"])
             side = "BUY" if spot_15 >= float(last["TREND_ANCHOR"]) else "SHORT"
             sig_col = "BUY_Signal" if side == "BUY" else "SHORT_Signal"
-            is_blocked, is_boosted, flow_tag = classify_hybrid_flow(
-                price_chg_pct, oi_chg_pct, rvol, side, ob_ratio, basis_pct, mkt_open
-            )
+            _prior = df15[df15.index.date < last.name.date()]
+            _prev_close = float(_prior["Close"].iloc[-1]) if (not _prior.empty and last.name.date() == now_ist.date()) else 0.0
+            flow_chg_pct = _flow_change_pct(spot_15, _prev_close, price_chg_pct)   # momentum (rs_alpha) stays open-based
+            is_blocked, is_boosted, flow_tag = classify_hybrid_flow(flow_chg_pct, oi_chg_pct, rvol, side, ob_ratio)
 
+            _sig = bool(last[sig_col]) or bool(prev[sig_col])
+            _t = TEL["intra"]; _t["scanned"] += 1; _t["signal"] += int(_sig); _t["blocked"] += int(_sig and is_blocked); _t["no_boost"] += int(_sig and not is_blocked and not is_boosted)
             if not is_blocked and is_boosted and (bool(last[sig_col]) or bool(prev[sig_col])):
+                # Upgrade candidate to exact Dhan 15m Chart bars if Dhan API is active
                 dhan_15m = get_closed_bar_slice(dhan.fetch_intraday_15m_df(sym, days_back=85), is_intraday=True)
-                if len(dhan_15m) >= 85:
+                if len(dhan_15m) >= 80:
                     df15 = compute_intraday_15m_indicators(dhan_15m, is_index=False, dhan_vwap=dhan_vwap)
 
-                # Verify signal still holds on the upgraded dataframe
-                if bool(df15.iloc[-1][sig_col]) or bool(df15.iloc[-2][sig_col]):
-                    tot, exp_r, wp, se = backtest_cash_signals(df15, side, INTRA_ATR_SL_MULT, INTRA_RR, INTRA_MAX_BARS, True)
-                    if tot >= INTRA_MIN_SETUPS and (exp_r - BT_SE_K * se) >= INTRA_MIN_EXP_R:
-                        rs_alpha = (price_chg_pct - nifty_intra_chg) if side == "BUY" else (nifty_intra_chg - price_chg_pct)
-                        rs_bonus = float(np.clip(rs_alpha * 1.5, -3.0, 5.0))
-                        row = build_stock_trade_row(
-                            sym, df15, side, True, flow_tag, is_boosted, exp_r, wp, "15M MIS", rs_bonus, live_ltp
-                        )
-                        if row:
-                            intra_stk_cands.append((row["FlowBoost"], row["Score"], row))
+                tot, exp_r, wp, se = backtest_cash_signals(df15, side, INTRA_ATR_SL_MULT, INTRA_RR, INTRA_MAX_BARS, True)
+                _few = tot < INTRA_MIN_SETUPS; _ok = (not _few) and exp_r - BT_SE_K * se >= INTRA_MIN_EXP_R
+                TEL["intra"]["bt_few"] += int(_few); TEL["intra"]["bt_fail"] += int((not _few) and not _ok); TEL["intra"]["passed"] += int(_ok)
+                if _ok:
+                    rs_alpha = (price_chg_pct - nifty_intra_chg) if side == "BUY" else (nifty_intra_chg - price_chg_pct)
+                    rs_bonus = float(np.clip(rs_alpha * 1.5, -3.0, 5.0))
+                    row = build_stock_trade_row(sym, df15, side, True, flow_tag, is_boosted, exp_r, wp, "15M MIS", rs_bonus)
+                    if row:
+                        intra_stk_cands.append((row["FlowBoost"], row["Score"], row))
 
-        # --- B. 1D POSITIONAL SWING SCAN (Patched with Live Dhan OHLCV + Futures Basis) ---
+        # --- B. 1D POSITIONAL SWING SCAN (Patched with Live Dhan OHLCV) ---
+        df1d_raw = extract_ticker_df(raw_1d, tk)
+        df1d = patch_daily_df_with_dhan_quote(get_closed_bar_slice(df1d_raw, is_intraday=False), dhan_q)
         if run_swing and len(df1d) >= 200:
             df1d = compute_daily_swing_indicators(df1d)
             last = df1d.iloc[-1]
             prev = df1d.iloc[-2]
 
             daily_chg = ((float(last["Close"]) - float(prev["Close"])) / float(prev["Close"])) * 100.0
-            price_chg_pct = daily_chg
+            price_chg_pct = intraday_chg_map.get(sym, daily_chg)
             oi_chg_pct = oi_spurts_map.get(sym, 0.0)
             rvol = float(last.get("RVOL", 1.0))
 
@@ -1455,30 +1124,31 @@ def main():
 
             if float(last["Close"]) >= float(last["EMA21"]):
                 side = "BUY"
-                is_blocked, is_boosted, flow_tag = classify_hybrid_flow(
-                    price_chg_pct, oi_chg_pct, rvol, side, ob_ratio, basis_pct, mkt_open
-                )
-                if not is_blocked and is_boosted and rs_5d_diff >= -2.5 and bool(last["BUY_Signal"]):
+                is_blocked, is_boosted, flow_tag = classify_hybrid_flow(daily_chg, oi_chg_pct, rvol, side, ob_ratio)
+                # Relative Strength Guard: Avoid buying laggards underperforming NIFTY by >2.5% over 5 days
+                _sig = bool(last["BUY_Signal"]) or bool(prev["BUY_Signal"])
+                _t = TEL["sw_buy"]; _t["scanned"] += 1; _t["signal"] += int(_sig); _t["blocked"] += int(_sig and is_blocked); _t["no_boost"] += int(_sig and not is_blocked and not is_boosted); _t["laggard"] += int(_sig and not is_blocked and is_boosted and rs_5d_diff < -2.5)
+                if not is_blocked and is_boosted and rs_5d_diff >= -2.5 and (bool(last["BUY_Signal"]) or bool(prev["BUY_Signal"])):
                     tot, exp_r, wp, se = backtest_cash_signals(df1d, side, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False)
-                    if tot >= SWING_MIN_SETUPS and (exp_r - BT_SE_K * se) >= SWING_MIN_EXP_R:
+                    _few = tot < SWING_MIN_SETUPS; _ok = (not _few) and exp_r - BT_SE_K * se >= SWING_MIN_EXP_R
+                    TEL["sw_buy"]["bt_few"] += int(_few); TEL["sw_buy"]["bt_fail"] += int((not _few) and not _ok); TEL["sw_buy"]["passed"] += int(_ok)
+                    if _ok:
                         rs_bonus = float(np.clip(rs_5d_diff * 0.8, -2.0, 5.0))
-                        row = build_stock_trade_row(
-                            sym, df1d, side, False, flow_tag, is_boosted, exp_r, wp, "3-5D CNC", rs_bonus, live_ltp
-                        )
+                        row = build_stock_trade_row(sym, df1d, side, False, flow_tag, is_boosted, exp_r, wp, "3-5D CNC", rs_bonus)
                         if row:
                             swing_buy_cands.append((row["FlowBoost"], row["Score"], row))
             else:
                 side = "SHORT"
-                is_blocked, is_boosted, flow_tag = classify_hybrid_flow(
-                    price_chg_pct, oi_chg_pct, rvol, side, ob_ratio, basis_pct, mkt_open
-                )
-                if not is_blocked and is_boosted and rs_5d_diff <= 2.5 and bool(last["SHORT_Signal"]):
+                is_blocked, is_boosted, flow_tag = classify_hybrid_flow(daily_chg, oi_chg_pct, rvol, side, ob_ratio)
+                _sig = bool(last["SHORT_Signal"]) or bool(prev["SHORT_Signal"])
+                _t = TEL["sw_short"]; _t["scanned"] += 1; _t["signal"] += int(_sig); _t["blocked"] += int(_sig and is_blocked); _t["no_boost"] += int(_sig and not is_blocked and not is_boosted); _t["laggard"] += int(_sig and not is_blocked and is_boosted and rs_5d_diff > 2.5)
+                if not is_blocked and is_boosted and rs_5d_diff <= 2.5 and (bool(last["SHORT_Signal"]) or bool(prev["SHORT_Signal"])):
                     tot, exp_r, wp, se = backtest_cash_signals(df1d, side, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False)
-                    if tot >= SWING_MIN_SETUPS and (exp_r - BT_SE_K * se) >= SWING_MIN_EXP_R:
+                    _few = tot < SWING_MIN_SETUPS; _ok = (not _few) and exp_r - BT_SE_K * se >= SWING_MIN_EXP_R
+                    TEL["sw_short"]["bt_few"] += int(_few); TEL["sw_short"]["bt_fail"] += int((not _few) and not _ok); TEL["sw_short"]["passed"] += int(_ok)
+                    if _ok:
                         rs_bonus = float(np.clip(-rs_5d_diff * 0.8, -2.0, 5.0))
-                        row = build_stock_trade_row(
-                            sym, df1d, side, False, flow_tag, is_boosted, exp_r, wp, "1D Watch", rs_bonus, live_ltp
-                        )
+                        row = build_stock_trade_row(sym, df1d, side, False, flow_tag, is_boosted, exp_r, wp, "1D Watch", rs_bonus)
                         if row:
                             swing_short_cands.append((row["FlowBoost"], row["Score"], row))
 
@@ -1493,9 +1163,12 @@ def main():
     short_1d_rows = [x[2] for x in swing_short_cands[:TOP_N_PER_SECTION]]
     buy_1d_rows   = [x[2] for x in swing_buy_cands[:TOP_N_PER_SECTION]]
 
-    msg = build_single_master_message(
-        mood_summary, intra_rows, short_1d_rows, buy_1d_rows, now_str, bool(dhan_eq_quotes), len(oi_spurts_map), dhan.status_note
-    )
+    msg = build_single_master_message(mood_summary, intra_rows, short_1d_rows, buy_1d_rows, now_str, bool(dhan_eq_quotes), market_open=market_open_now)
+    tel_lines = _telemetry_text(TEL, skipped_idx, len(idx_badges), len(INDEX_UNIVERSE), {"intra": run_intraday, "sw_buy": run_swing, "sw_short": run_swing})
+    print("SCAN STATS | " + " || ".join(tel_lines))
+    tel_msg = "\n\n<b>📊 Scan stats</b>\n<code>" + html.escape("\n".join(tel_lines)) + "</code>"
+    if len(msg) + len(tel_msg) < 3900:
+        msg += tel_msg
     send_telegram_alert(msg)
 
 
