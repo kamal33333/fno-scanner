@@ -413,6 +413,8 @@ def patch_daily_df_with_dhan_quote(df: pd.DataFrame, dhan_q: dict) -> pd.DataFra
     if df.empty or not dhan_q or dhan_q.get("ltp", 0) <= 0:
         return df
     df = df.copy()
+    # yfinance daily Volume is int64; assigning a pace-adjusted (float) volume into it raises TypeError on pandas>=3
+    df = df.astype({c: "float64" for c in ("Open", "High", "Low", "Close", "Volume") if c in df.columns})
     if df.index.tz is not None:
         df.index = df.index.tz_convert("Asia/Kolkata").tz_localize(None)
 
