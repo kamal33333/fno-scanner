@@ -4,10 +4,12 @@ import re
 import io
 import sys
 import time
+import json
 import html
 import warnings
 import calendar
 from datetime import datetime, date, timedelta
+from concurrent.futures import ThreadPoolExecutor
 
 warnings.filterwarnings("ignore")
 
@@ -35,6 +37,7 @@ RAW_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 RAW_CHATID = os.environ.get("TELEGRAM_CHAT_ID", "").strip().strip('"').strip("'")
 EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "manual")
 FORCE_RUN  = "--force" in sys.argv
+DRY_RUN    = "--dry-run" in sys.argv
 
 token_match = re.search(r"(\d+:[A-Za-z0-9_-]+)", RAW_TOKEN)
 TELEGRAM_BOT_TOKEN = token_match.group(1) if token_match else RAW_TOKEN.lstrip("bot").strip('"').strip("'")
@@ -42,6 +45,49 @@ TELEGRAM_CHAT_ID   = RAW_CHATID
 
 DHAN_CLIENT_ID    = os.environ.get("DHAN_CLIENT_ID", "").strip().strip('"').strip("'")
 DHAN_ACCESS_TOKEN = os.environ.get("DHAN_ACCESS_TOKEN", "").strip().strip('"').strip("'")
+
+SERVER_SCANNER_DIR = "/home/ubuntu/scanners"
+if os.path.isdir(SERVER_SCANNER_DIR):
+    OI_BASELINE_CACHE_FILE = os.path.join(SERVER_SCANNER_DIR, "dhan_oi_baseline.json")
+else:
+    OI_BASELINE_CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dhan_oi_baseline.json")
+
+SYMBOL_ALIAS_MAP = {
+    "M_M": "M&M",
+    "M&M": "M&M",
+    "M_MFIN": "M&MFIN",
+    "M&MFIN": "M&MFIN",
+    "BAJAJ_AUTO": "BAJAJ-AUTO",
+    "BAJAJ-AUTO": "BAJAJ-AUTO",
+    "ARE_M": "ARE&M",
+    "ARE&M": "ARE&M",
+    "NAM_INDIA": "NAM-INDIA",
+    "NAM-INDIA": "NAM-INDIA",
+    "MCDOWELL_N": "UNITDSPR",
+    "MCDOWELL-N": "UNITDSPR",
+    "L_TFH": "LTF",
+    "L&TFH": "LTF",
+    "NIFTY 50": "NIFTY",
+    "NIFTY BANK": "BANKNIFTY",
+    "NIFTY FIN SERVICE": "FINNIFTY",
+    "NIFTY MID SELECT": "MIDCPNIFTY",
+}
+
+
+def normalize_nse_symbol(sym: str) -> str:
+    clean = str(sym or "").strip().upper()
+    return SYMBOL_ALIAS_MAP.get(clean, clean)
+
+
+def resolve_true_prev_close(spot: float, dhan_prev_c: float, yf_prev_close: float) -> float:
+    """
+    Guards against Dhan's post-market reset where ohlc.close == last_price (0.0% change).
+    Falls back to daily historical close (prev1d['Close']) whenever abs(spot - dhan_prev_c) <= 1e-3.
+    """
+    if dhan_prev_c is None or dhan_prev_c <= 0 or abs(spot - dhan_prev_c) <= 1e-3:
+        return float(yf_prev_close) if (yf_prev_close and yf_prev_close > 0) else float(spot)
+    return float(dhan_prev_c)
+
 
 # ==============================================================================
 # ⚖️ 2. OFFICIAL NSE HOLIDAYS 2026 & INSTITUTIONAL PARAMETERS
@@ -235,6 +281,7 @@ class DhanOptionEngine:
         self.base_url = "https://api.dhan.co/v2"
         self.enabled = bool(self.client_id and self.access_token)
         self.eq_sec_map = {}
+        self.fut_sec_map = {}
         self.lot_map = {}
         self.expiry_cache = {}
         self.chain_cache = {}
@@ -329,7 +376,8 @@ class DhanOptionEngine:
             eq_df = df[(df["SEM_EXM_EXCH_ID"] == "NSE") & (df["SEM_INSTRUMENT_NAME"] == "EQUITY")]
             for sym, sec_id in zip(eq_df["SEM_TRADING_SYMBOL"], eq_df["SEM_SMST_SECURITY_ID"]):
                 if pd.notna(sec_id):
-                    self.eq_sec_map[str(sym).strip().upper()] = int(sec_id)
+                    norm_s = normalize_nse_symbol(str(sym))
+                    self.eq_sec_map[norm_s] = int(sec_id)
 
             fno_df = df[df["SEM_INSTRUMENT_NAME"].isin(["FUTSTK", "FUTIDX", "OPTSTK", "OPTIDX"])].copy()
             if not fno_df.empty and "SEM_EXPIRY_DATE" in fno_df.columns:
@@ -340,15 +388,25 @@ class DhanOptionEngine:
             target_symbols = {m["nse"] for m in FNO_UNIVERSE.values()}
             for _, row in fno_df.iterrows():
                 lot_val = pd.to_numeric(row.get("SEM_LOT_UNITS"), errors="coerce")
-                if pd.isna(lot_val) or lot_val <= 0:
-                    continue
+                sec_id_val = pd.to_numeric(row.get("SEM_SMST_SECURITY_ID"), errors="coerce")
+                inst_name = str(row.get("SEM_INSTRUMENT_NAME", "")).strip().upper()
+                exch_id = str(row.get("SEM_EXM_EXCH_ID", "NSE")).strip().upper()
+
                 raw_tsym = str(row.get("SEM_TRADING_SYMBOL", "")).strip().upper()
-                base_sym = re.split(r"[-_\s]", raw_tsym)[0]
+                base_sym = normalize_nse_symbol(re.split(r"[-_\s]", raw_tsym)[0])
                 if base_sym not in target_symbols:
                     custom_sym = str(row.get("SEM_CUSTOM_SYMBOL", "")).strip().upper()
-                    base_sym = custom_sym.split()[0] if custom_sym else ""
-                if base_sym in target_symbols and base_sym not in self.lot_map:
+                    base_sym = normalize_nse_symbol(custom_sym.split()[0] if custom_sym else "")
+
+                if base_sym not in target_symbols:
+                    continue
+
+                if pd.notna(lot_val) and lot_val > 0 and base_sym not in self.lot_map:
                     self.lot_map[base_sym] = int(round(float(lot_val)))
+
+                if inst_name in ("FUTIDX", "FUTSTK") and exch_id == "NSE" and pd.notna(sec_id_val):
+                    if base_sym not in self.fut_sec_map:
+                        self.fut_sec_map[base_sym] = int(sec_id_val)
 
             updated_count = 0
             for tk, meta in FNO_UNIVERSE.items():
@@ -356,9 +414,90 @@ class DhanOptionEngine:
                 if nse_sym in self.lot_map and self.lot_map[nse_sym] > 0:
                     meta["lot"] = self.lot_map[nse_sym]
                     updated_count += 1
-            print(f"✅ Public Dhan Scrip Master Synced: {updated_count}/{len(FNO_UNIVERSE)} Live Lot Sizes Verified!")
+            print(
+                f"✅ Public Dhan Scrip Master Synced: {updated_count}/{len(FNO_UNIVERSE)} Live Lot Sizes "
+                f"& {len(self.fut_sec_map)} Active Futures IDs Verified!"
+            )
         except Exception as e:
             print(f"⚠️ Public Scrip Master lot-sync warning: {e}")
+
+    def fetch_dhan_futures_and_spot_snapshot(self) -> tuple[dict, dict]:
+        """
+        Fetches active near-month NSE_FNO futures OI and underlying spot/prev_close via Dhan /v2/marketfeed/quote.
+        Returns: (dhan_curr_oi_map, dhan_spot_snapshot_map)
+        """
+        if not self.enabled or not self.fut_sec_map:
+            return {}, {}
+
+        inv_fut_map = {sec_id: sym for sym, sec_id in self.fut_sec_map.items()}
+        inv_spot_map = {}
+        idx_ids, eq_ids = [], []
+
+        for meta in FNO_UNIVERSE.values():
+            sym = meta["nse"]
+            if meta["is_idx"] and meta.get("dhan_id"):
+                sid = int(meta["dhan_id"])
+                idx_ids.append(sid)
+                inv_spot_map[("IDX_I", sid)] = sym
+            elif sym in self.eq_sec_map:
+                sid = int(self.eq_sec_map[sym])
+                eq_ids.append(sid)
+                inv_spot_map[("NSE_EQ", sid)] = sym
+
+        payload = {"NSE_FNO": list(inv_fut_map.keys())}
+        if idx_ids:
+            payload["IDX_I"] = idx_ids
+        if eq_ids:
+            payload["NSE_EQ"] = eq_ids
+
+        curr_oi_map = {}
+        spot_snap_map = {}
+
+        for attempt in (1, 2):
+            self._throttle()
+            try:
+                resp = self.session.post(f"{self.base_url}/marketfeed/quote", json=payload, timeout=12)
+            except Exception:
+                self.last_call_end = time.time()
+                return {}, {}
+            self.last_call_end = time.time()
+            if resp.status_code == 401 and attempt == 1 and self._try_self_heal_401():
+                continue
+            if resp.status_code == 429:
+                self._on_429("QuoteSnapshot")
+                if attempt == 1:
+                    continue
+            break
+
+        if resp.status_code == 200:
+            data = (resp.json() or {}).get("data", {})
+            fno_node = data.get("NSE_FNO", {})
+            for sec_str, q in fno_node.items():
+                try:
+                    sid = int(sec_str)
+                    sym = inv_fut_map.get(sid)
+                    if sym and isinstance(q, dict):
+                        oi_val = float(q.get("oi") or q.get("open_interest") or 0.0)
+                        if oi_val > 0:
+                            curr_oi_map[sym] = oi_val
+                except Exception:
+                    continue
+
+            for seg_key in ("IDX_I", "NSE_EQ"):
+                seg_node = data.get(seg_key, {})
+                for sec_str, q in seg_node.items():
+                    try:
+                        sid = int(sec_str)
+                        sym = inv_spot_map.get((seg_key, sid))
+                        if sym and isinstance(q, dict):
+                            ltp = float(q.get("last_price") or 0.0)
+                            ohlc = q.get("ohlc") or {}
+                            prev_c = float(ohlc.get("close") or q.get("previous_close") or 0.0)
+                            if ltp > 0:
+                                spot_snap_map[sym] = {"ltp": ltp, "prev_close": prev_c}
+                    except Exception:
+                        continue
+        return curr_oi_map, spot_snap_map
 
     def _fetch_expiry_list(self, sec_id: int, seg: str, cache_key: str) -> list:
         if cache_key in self.expiry_cache:
@@ -435,7 +574,6 @@ class DhanOptionEngine:
                 k_val = float(k_str)
             except Exception:
                 continue
-            # Filter to active strikes within +/- 15% of spot to avoid deep illiquid noise
             if abs(k_val - und_ltp) / max(und_ltp, 1.0) > 0.15:
                 continue
             ce_leg = node.get("ce") or {}
@@ -457,15 +595,12 @@ class DhanOptionEngine:
         tot_pe = float(p_arr.sum())
         pcr = round(tot_pe / tot_ce, 2) if tot_ce > 0 else 1.0
 
-        # Call OI Supply Wall (at or above spot) & Put OI Demand Wall (at or below spot)
         up_mask = k_arr >= und_ltp * 0.995
         dn_mask = k_arr <= und_ltp * 1.005
         call_wall = float(k_arr[up_mask][np.argmax(c_arr[up_mask])]) if np.any(up_mask) and c_arr[up_mask].max() > 0 else und_ltp * 1.05
         put_wall = float(k_arr[dn_mask][np.argmax(p_arr[dn_mask])]) if np.any(dn_mask) and p_arr[dn_mask].max() > 0 else und_ltp * 0.95
 
-        # Vectorized Max Pain calculation
-        # For candidate settlement S: Call payout = max(0, S - K) * CE_OI; Put payout = max(0, K - S) * PE_OI
-        diff = k_arr[:, None] - k_arr[None, :]  # shape (N_settlement, N_strike)
+        diff = k_arr[:, None] - k_arr[None, :]
         call_pain = np.maximum(0.0, diff) @ c_arr
         put_pain = np.maximum(0.0, -diff) @ p_arr
         total_pain = call_pain + put_pain
@@ -554,7 +689,7 @@ class DhanOptionEngine:
 
 
 # ==============================================================================
-# 🕸️ 5. LIVE OI SPURTS & INSTITUTIONAL SUPPLY/DEMAND ZONE INDICATORS
+# 🕸️ 5. DUAL-SOURCE OI FUSION ENGINE (DHAN + NSE OI SPURTS + BASELINE CACHE)
 # ==============================================================================
 def fetch_nse_oi_spurts_map() -> dict:
     base_url = "https://www.nseindia.com"
@@ -576,7 +711,8 @@ def fetch_nse_oi_spurts_map() -> dict:
         if resp.status_code == 200:
             data = resp.json().get("data", [])
             for item in data:
-                sym = str(item.get("symbol", "")).strip().upper()
+                raw_sym = str(item.get("symbol", "")).strip().upper()
+                sym = normalize_nse_symbol(raw_sym)
                 oi_pct = pd.to_numeric(item.get("avgInOI", 0.0), errors="coerce")
                 if sym and not np.isnan(oi_pct):
                     oi_map[sym] = float(oi_pct)
@@ -584,6 +720,97 @@ def fetch_nse_oi_spurts_map() -> dict:
     except Exception as e:
         print(f"⚠️ NSE OI Spurts warning: {e}")
     return oi_map
+
+
+def _load_oi_baseline_cache() -> tuple[dict, dict]:
+    """
+    Loads /home/ubuntu/scanners/dhan_oi_baseline.json compatibly across both flat and nested schemas.
+    Returns (raw_json_container, baseline_float_dict).
+    """
+    if not os.path.exists(OI_BASELINE_CACHE_FILE):
+        return {}, {}
+    try:
+        with open(OI_BASELINE_CACHE_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return {}, {}
+        target_node = raw.get("baseline") if isinstance(raw.get("baseline"), dict) else raw
+        parsed = {}
+        for k, v in target_node.items():
+            norm_k = normalize_nse_symbol(k)
+            if isinstance(v, (int, float)) and v > 0:
+                parsed[norm_k] = float(v)
+            elif isinstance(v, dict):
+                b_val = v.get("baseline_oi") or v.get("prev_oi") or v.get("oi")
+                if isinstance(b_val, (int, float)) and b_val > 0:
+                    parsed[norm_k] = float(b_val)
+        return raw, parsed
+    except Exception as e:
+        print(f"⚠️ OI Baseline cache read warning: {e}")
+        return {}, {}
+
+
+def _save_oi_baseline_cache(raw_container: dict, baseline_map: dict):
+    try:
+        if isinstance(raw_container, dict) and isinstance(raw_container.get("baseline"), dict):
+            for sym, val in baseline_map.items():
+                raw_container["baseline"][sym] = round(float(val), 2)
+            out_data = raw_container
+        else:
+            out_data = dict(raw_container) if isinstance(raw_container, dict) else {}
+            for sym, val in baseline_map.items():
+                if isinstance(out_data.get(sym), dict):
+                    out_data[sym]["baseline_oi"] = round(float(val), 2)
+                else:
+                    out_data[sym] = round(float(val), 2)
+        with open(OI_BASELINE_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(out_data, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ OI Baseline cache write warning: {e}")
+
+
+def fuse_dhan_and_nse_oi(dhan_engine: DhanOptionEngine) -> tuple[dict, dict, str]:
+    """
+    Parallel Dual-Source OI Failover Engine:
+    1. Fetches NSE OI Spurts and Dhan /v2/marketfeed/quote (futures OI + spot snapshot) concurrently.
+    2. Computes %chng in OI using Dhan live futures OI vs dhan_oi_baseline.json when available.
+    3. Auto-seeds missing baseline entries from NSE OI Spurts and fails over seamlessly.
+    """
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        fut_nse = pool.submit(fetch_nse_oi_spurts_map)
+        fut_dhan = pool.submit(dhan_engine.fetch_dhan_futures_and_spot_snapshot)
+        nse_oi_map = fut_nse.result()
+        dhan_curr_oi, dhan_spot_snap = fut_dhan.result()
+
+    raw_cache, baseline_map = _load_oi_baseline_cache()
+    cache_dirty = False
+    fused_oi_map = dict(nse_oi_map)
+    dhan_computed_cnt = 0
+
+    for sym, curr_oi in dhan_curr_oi.items():
+        norm_sym = normalize_nse_symbol(sym)
+        base_oi = baseline_map.get(norm_sym, 0.0)
+        nse_pct = nse_oi_map.get(norm_sym)
+
+        if base_oi > 0:
+            dhan_pct = ((curr_oi - base_oi) / base_oi) * 100.0
+            if abs(dhan_pct) >= 0.05 or nse_pct is None:
+                fused_oi_map[norm_sym] = round(dhan_pct, 2)
+                dhan_computed_cnt += 1
+            elif nse_pct is not None:
+                fused_oi_map[norm_sym] = round(float(nse_pct), 2)
+        elif nse_pct is not None and (1.0 + (nse_pct / 100.0)) > 0.1:
+            seeded_base = curr_oi / (1.0 + (nse_pct / 100.0))
+            baseline_map[norm_sym] = seeded_base
+            fused_oi_map[norm_sym] = round(float(nse_pct), 2)
+            cache_dirty = True
+
+    if cache_dirty:
+        _save_oi_baseline_cache(raw_cache, baseline_map)
+
+    status_tag = f"Dual-OI ({ len(fused_oi_map) } | Dhan:{ dhan_computed_cnt } NSE:{ len(nse_oi_map) })"
+    print(f"✅ Dual-Source OI Fusion Complete: {status_tag}")
+    return fused_oi_map, dhan_spot_snap, status_tag
 
 
 def classify_institutional_oi(price_chg_pct: float, oi_chg_pct: float, opt_type: str):
@@ -716,7 +943,6 @@ def compute_daily_indicators(df):
     df["EMA21"] = c.ewm(span=21, adjust=False).mean()
     df["EMA55"] = c.ewm(span=55, adjust=False).mean()
 
-    # Dual Bollinger Bands matching BANKNIFTY institutional chart (BB 38 & BB 61)
     df["BB_SMA_38"] = c.rolling(38).mean()
     std_38 = c.rolling(38).std(ddof=0)
     df["BB_UP_38"] = df["BB_SMA_38"] + (2.0 * std_38)
@@ -727,14 +953,12 @@ def compute_daily_indicators(df):
     df["BB_UP_61"] = df["BB_SMA_61"] + (2.0 * std_61)
     df["BB_LO_61"] = df["BB_SMA_61"] - (2.0 * std_61)
 
-    # RSI 14 & RSI SMA 14
     delta = c.diff()
     gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
     df["RSI"] = (100 - (100 / (1 + (gain / loss.replace(0, np.nan))))).fillna(50.0)
     df["RSI_SMA"] = df["RSI"].rolling(14).mean().fillna(50.0)
 
-    # ATR, HV20, and 252-day Volatility Percentile (IVP Proxy)
     tr = pd.concat(
         [h - l, (h - c.shift()).abs(), (l - c.shift()).abs()],
         axis=1,
@@ -746,11 +970,9 @@ def compute_daily_indicators(df):
     hv_max = df["HV20"].rolling(252, min_periods=40).max()
     df["IVP_PROXY"] = (((df["HV20"] - hv_min) / (hv_max - hv_min).replace(0, np.nan)) * 100.0).fillna(50.0)
 
-    # Relative Volume (RVOL)
     vol_sma20 = df["Volume"].rolling(20).mean().replace(0, np.nan)
     df["RVOL"] = (df["Volume"] / vol_sma20).fillna(1.0)
 
-    # Institutional Demand & Supply Zone Guards (BankNifty Lower-BB Hammer Rejection Fix)
     bar_range = (h - l).replace(0, np.nan)
     lower_wick_ratio = ((c - l) / bar_range).fillna(0.5)
     upper_wick_ratio = ((h - c) / bar_range).fillna(0.5)
@@ -788,7 +1010,7 @@ def compute_daily_indicators(df):
 def compute_intraday_15m_indicators(df, is_index=False):
     """
     Upgraded 15M Intraday Engine with VWAP Anchor, Dual BB (38 & 61),
-    RSI vs RSI-SMA14, RVOL, and Demand/Supply Zone Rejection Guards.
+    RSI vs RSI-SMA14, RVOL, Live 500-Bar Rolling IVP_PROXY, and S/D Zone Rejection Guards.
     """
     df = df.copy()
     if df.index.tz is not None:
@@ -834,7 +1056,10 @@ def compute_intraday_15m_indicators(df, is_index=False):
     ).max(axis=1)
     df["ATR"] = tr.rolling(14).mean()
     df["HV20"] = np.log(c / c.shift(1)).rolling(50).std() * np.sqrt(252 * 25)
-    df["IVP_PROXY"] = 50.0
+
+    hv_min = df["HV20"].rolling(500, min_periods=40).min()
+    hv_max = df["HV20"].rolling(500, min_periods=40).max()
+    df["IVP_PROXY"] = (((df["HV20"] - hv_min) / (hv_max - hv_min).replace(0, np.nan)) * 100.0).fillna(50.0)
 
     bar_range = (h - l).replace(0, np.nan)
     lower_wick_ratio = ((c - l) / bar_range).fillna(0.5)
@@ -1088,13 +1313,11 @@ def build_option_trade_row(
         und_rr_mult  = INTRA_UND_RR if is_intraday else SWING_UND_RR
         und_target_dist = atr * und_atr_mult * und_rr_mult
 
-        # Block buying CE right into a Call OI Supply Wall when PCR is weak (< 0.78)
         if opt_type == "CE":
             if pcr < MIN_BULL_PCR and not is_oi_boosted:
                 return None
             if call_wall > und_ltp and (call_wall - und_ltp) < (0.45 * und_target_dist) and pcr < 0.95:
                 return None
-        # Block buying PE right into a Put OI Demand Floor when PCR is bullish (> 1.28)
         else:
             if pcr > MAX_BEAR_PCR and not is_oi_boosted:
                 return None
@@ -1165,7 +1388,6 @@ def build_option_trade_row(
     final_win = ex["win"] if ex["n"] >= 8 else win_pct
     sample_n  = ex["n"] if ex["n"] >= 8 else total_trades
 
-    # Bayesian Wilson-style sample shrinkage toward 46% prior
     shrunk_win = ((final_win * sample_n) + (46.0 * 8.0)) / (sample_n + 8.0)
 
     qty = num_lots * lot_size
@@ -1196,12 +1418,12 @@ def build_option_trade_row(
     }
 
 
-def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine: DhanOptionEngine, oi_count: int):
+def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine: DhanOptionEngine, oi_status_str: str):
     lot_sync_cnt = len(dhan_engine.lot_map) if dhan_engine else 0
     if dhan_engine and dhan_engine.enabled and dhan_engine.live_quotes_fetched > 0:
-        feed_str = f"Dhan Live ({dhan_engine.live_quotes_fetched}) + {lot_sync_cnt} Lots Synced"
+        feed_str = f"Dhan Chain ({dhan_engine.live_quotes_fetched}) + {lot_sync_cnt} Lots + {oi_status_str}"
     else:
-        feed_str = f"Dhan Lot Master ({lot_sync_cnt}) + NSE OI ({oi_count})"
+        feed_str = f"Lots ({lot_sync_cnt}) + {oi_status_str}"
 
     col_hdr = (
         f"{'Contract':<19}|{'Exp':>5}|{'Entry':>6}|{'Qty':>4}|{'Cap(₹)':>6}|"
@@ -1283,13 +1505,13 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
             )
 
     lines.append(
-        "\n💡 <i>* = Live Dhan Chain (PCR/Walls/IV Guard) | Dual-BB 38/61 + T1 Executed-Geometry Filtered</i>"
+        "\n💡 <i>* = Live Dhan Chain (PCR/Walls/IV Guard) | Dual-Source OI + Dual-BB 38/61 + T1 Filtered</i>"
     )
     return "\n".join(lines)
 
 
 def send_telegram_alert(html_text):
-    if not TELEGRAM_BOT_TOKEN or ":" not in TELEGRAM_BOT_TOKEN:
+    if DRY_RUN or not TELEGRAM_BOT_TOKEN or ":" not in TELEGRAM_BOT_TOKEN:
         print(html_text)
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -1325,7 +1547,7 @@ def main():
     now_str = now_ist.strftime("%d-%b %I:%M %p IST")
     current_minutes = now_ist.hour * 60 + now_ist.minute
 
-    if EVENT_NAME == "schedule" and not FORCE_RUN:
+    if EVENT_NAME == "schedule" and not FORCE_RUN and not DRY_RUN:
         if (
             now_ist.weekday() >= 5
             or now_ist.date() in NSE_HOLIDAYS_2026
@@ -1337,13 +1559,22 @@ def main():
 
     tickers = list(FNO_UNIVERSE.keys())
     india_vix = get_live_vix()
-    oi_spurts_map = fetch_nse_oi_spurts_map()
     dhan_engine = DhanOptionEngine(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
+    oi_spurts_map, dhan_spot_snap, oi_status_str = fuse_dhan_and_nse_oi(dhan_engine)
 
     messages_sent = 0
 
-    # 1. INTRADAY 15M SCALPS (FRESH CLOSED CANDLE ONLY + T1 ENABLED)
+    # Download 15m and 1d datasets once so 15m scalps can anchor true prev_close against 1d history
     raw_15m = yf.download(tickers, period="60d", interval="15m", group_by="ticker", progress=False)
+    raw_1d = yf.download(tickers, period="5y", interval="1d", group_by="ticker", progress=False)
+
+    # Pre-cache daily closed slices for true prev_close anchoring
+    daily_slices = {}
+    for tk in tickers:
+        df1d_raw = extract_ticker_df(raw_1d, tk)
+        daily_slices[tk] = get_closed_bar_slice(df1d_raw, is_intraday=False)
+
+    # 1. INTRADAY 15M SCALPS (FRESH CLOSED CANDLE ONLY + T1 ENABLED)
     intra_idx, intra_stk = [], []
 
     for tk, meta in FNO_UNIVERSE.items():
@@ -1354,15 +1585,22 @@ def main():
         df15 = compute_intraday_15m_indicators(df15, is_index=meta["is_idx"])
         last = df15.iloc[-1]
 
+        nse_sym = normalize_nse_symbol(meta["nse"])
+        spot_close = float(last["Close"])
+
+        df1d_ref = daily_slices.get(tk)
+        yf_prev_c = float(df1d_ref["Close"].iloc[-2]) if (df1d_ref is not None and len(df1d_ref) >= 2) else 0.0
+        dhan_prev_c = dhan_spot_snap.get(nse_sym, {}).get("prev_close", 0.0)
+
         today_bars = df15[df15.index.date == last.name.date()]
         day_open = float(today_bars["Open"].iloc[0]) if not today_bars.empty else float(last["Open"])
-        price_chg_pct = ((float(last["Close"]) - day_open) / day_open) * 100.0
-        oi_chg_pct = oi_spurts_map.get(meta["nse"], 0.0)
+        true_anchor = resolve_true_prev_close(spot_close, dhan_prev_c, yf_prev_c if yf_prev_c > 0 else day_open)
+        price_chg_pct = ((spot_close - true_anchor) / true_anchor) * 100.0 if true_anchor > 0 else 0.0
+        oi_chg_pct = oi_spurts_map.get(nse_sym, 0.0)
 
-        opt_type = "CE" if float(last["Close"]) >= float(last["TREND_ANCHOR"]) else "PE"
+        opt_type = "CE" if spot_close >= float(last["TREND_ANCHOR"]) else "PE"
         sig_col = "CE_Signal" if opt_type == "CE" else "PE_Signal"
 
-        # Eliminate 30-min stale lag: require signal on the freshly closed bar
         if not bool(last[sig_col]):
             continue
 
@@ -1401,28 +1639,32 @@ def main():
 
     if intra_idx_rows or intra_stk_rows:
         msg = format_combined_table(
-            intra_idx_rows, intra_stk_rows, "15M INTRADAY F&O SCALPS (LOCKED 1:1.75 RR)", now_str, dhan_engine, len(oi_spurts_map)
+            intra_idx_rows, intra_stk_rows, "15M INTRADAY F&O SCALPS (LOCKED 1:1.75 RR)", now_str, dhan_engine, oi_status_str
         )
         send_telegram_alert(msg)
         messages_sent += 1
 
     # 2. POSITIONAL 3-5D SWINGS (DUAL-BB 38/61 + T1 ENABLED)
-    raw_1d = yf.download(tickers, period="5y", interval="1d", group_by="ticker", progress=False)
     swing_idx, swing_stk = [], []
 
     for tk, meta in FNO_UNIVERSE.items():
-        df1d_raw = extract_ticker_df(raw_1d, tk)
-        df1d = get_closed_bar_slice(df1d_raw, is_intraday=False)
-        if len(df1d) < 200:
+        df1d = daily_slices.get(tk)
+        if df1d is None or len(df1d) < 200:
             continue
         df1d = compute_daily_indicators(df1d)
         last = df1d.iloc[-1]
         prev = df1d.iloc[-2]
 
-        price_chg_pct = ((float(last["Close"]) - float(prev["Close"])) / float(prev["Close"])) * 100.0
-        oi_chg_pct = oi_spurts_map.get(meta["nse"], 0.0)
+        nse_sym = normalize_nse_symbol(meta["nse"])
+        spot_close = float(last["Close"])
+        yf_prev_c = float(prev["Close"])
+        dhan_prev_c = dhan_spot_snap.get(nse_sym, {}).get("prev_close", 0.0)
+        true_prev_c = resolve_true_prev_close(spot_close, dhan_prev_c, yf_prev_c)
 
-        opt_type = "CE" if float(last["Close"]) >= float(last["EMA21"]) else "PE"
+        price_chg_pct = ((spot_close - true_prev_c) / true_prev_c) * 100.0 if true_prev_c > 0 else 0.0
+        oi_chg_pct = oi_spurts_map.get(nse_sym, 0.0)
+
+        opt_type = "CE" if spot_close >= float(last["EMA21"]) else "PE"
         sig_col = "CE_Signal" if opt_type == "CE" else "PE_Signal"
 
         if not bool(last[sig_col]):
@@ -1463,7 +1705,7 @@ def main():
 
     if swing_idx_rows or swing_stk_rows:
         msg = format_combined_table(
-            swing_idx_rows, swing_stk_rows, "3-5D POSITIONAL F&O (15+ DTE FAR EXPIRY | 1:2.5 RR)", now_str, dhan_engine, len(oi_spurts_map)
+            swing_idx_rows, swing_stk_rows, "3-5D POSITIONAL F&O (15+ DTE FAR EXPIRY | 1:2.5 RR)", now_str, dhan_engine, oi_status_str
         )
         send_telegram_alert(msg)
         messages_sent += 1
@@ -1471,7 +1713,7 @@ def main():
     if messages_sent == 0:
         fallback_msg = (
             f"<b>ℹ️ F&amp;O OPTIONS SCANNER ({html.escape(now_str)})</b>\n"
-            f"Scanner ran cleanly (Scraped {len(oi_spurts_map)} NSE OI records), "
+            f"Scanner ran cleanly ({html.escape(oi_status_str)}), "
             f"but no setups passed the Institutional S/D Zone, Vega Guard &amp; Executed-Geometry filters."
         )
         send_telegram_alert(fallback_msg)
