@@ -1997,5 +1997,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-options_scanner_2-v2.py
-Displaying options_scanner_2-v2.py.
