@@ -37,8 +37,9 @@ except ImportError:
 RAW_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 RAW_CHATID = os.environ.get("TELEGRAM_CHAT_ID", "").strip().strip('"').strip("'")
 EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "manual")
-FORCE_RUN  = "--force" in sys.argv
-DRY_RUN    = "--dry-run" in sys.argv
+FORCE_RUN       = "--force" in sys.argv
+DRY_RUN         = "--dry-run" in sys.argv
+INDEX_ONLY_MODE = ("--index-only" in sys.argv) or (os.environ.get("INDEX_ONLY_MODE", "0") == "1")
 
 token_match = re.search(r"(\d+:[A-Za-z0-9_-]+)", RAW_TOKEN)
 TELEGRAM_BOT_TOKEN = token_match.group(1) if token_match else RAW_TOKEN.lstrip("bot").strip('"').strip("'")
@@ -100,13 +101,9 @@ SYMBOL_ALIAS_MAP = {
     "L_TFH": "LTF",
     "L&TFH": "LTF",
     "NIFTY 50": "NIFTY",
-    "NIFTY": "NIFTY",
     "NIFTY BANK": "BANKNIFTY",
-    "BANKNIFTY": "BANKNIFTY",
     "NIFTY FIN SERVICE": "FINNIFTY",
-    "FINNIFTY": "FINNIFTY",
     "NIFTY MID SELECT": "MIDCPNIFTY",
-    "MIDCPNIFTY": "MIDCPNIFTY",
 }
 
 
@@ -191,8 +188,23 @@ INDEX_HRHR_OTM_STEPS       = 1    # 1-step OTM strike in trend direction for hig
 # --- Institutional Volatility & Microstructure Guards ---
 MAX_SAFE_IVP           = 75.0     # NYKAA/BDL Guard: Block naked buying above 75 IVP without strong RVOL/OI
 MAX_IV_HV_RATIO        = 1.38     # Reject overpriced ATM options where Live IV > 1.38x HV20
-MIN_BULL_PCR           = 0.78     # Minimum chain PCR required for unboosted Long Call (CE) setups
-MAX_BEAR_PCR           = 1.28     # Maximum chain PCR allowed for unboosted Long Put (PE) setups
+MIN_BULL_PCR           = 0.82     # Minimum chain PCR required for Long Call (CE) setups
+MAX_BEAR_PCR           = 1.22     # Maximum chain PCR allowed for Long Put (PE) setups
+
+# --- Stock-Option Anti-Loophole Guards (v2 Upgrade) ---
+REQUIRE_LIVE_CHAIN_FOR_STOCKS = True  # Loophole 1 Fix: Block stock options when Dhan live chain (*) is missing
+REQUIRE_MTF_ALIGNMENT_15M     = True  # Loophole 2 Fix: 15M stock scalps must align with 1D EMA21/55 & daily change
+REQUIRE_OI_BOOST_FOR_STOCKS   = True  # Loophole 3 Fix: Require institutional LB/SB (>= 2.5% OI) for stock options
+MIN_STOCK_RVOL_15M            = 1.20  # Loophole 3 Fix: Minimum 15M time-of-day RVOL for stock options
+MIN_STOCK_RVOL_1D             = 1.15  # Loophole 3 Fix: Minimum 1D RVOL for stock options
+MIN_STOCK_ADX                 = 18.0  # Loophole 3 Fix: Minimum Wilder ADX(14) trend strength for stock options
+STOCK_INTRA_ATR_SL_MULT       = 1.15  # Loophole 4 Fix: Wider 1.15x ATR underlying stop on 15M stocks
+STOCK_SWING_ATR_SL_MULT       = 1.20  # Loophole 4 Fix: Wider 1.20x ATR underlying stop on 1D stocks
+STOCK_INTRA_MIN_SL_PCT        = 0.15  # Loophole 4 Fix: 15% min option SL on 15M stocks (prevents noise stop-outs)
+STOCK_INTRA_MAX_SL_PCT        = 0.22  # Loophole 4 Fix: 22% max option SL on 15M stocks
+STOCK_SWING_MIN_SL_PCT        = 0.18  # Loophole 4 Fix: 18% min option SL on 1D stocks
+STOCK_SWING_MAX_SL_PCT        = 0.24  # Loophole 4 Fix: 24% max option SL on 1D stocks
+STOCK_PULLBACK_ENTRY_DISC     = 0.97  # Loophole 4 Fix: 3% limit-entry discount when trigger bar span > 1.25x ATR
 
 RISK_FREE_RATE         = 0.068
 
@@ -906,7 +918,18 @@ def fuse_dhan_and_nse_oi(dhan_engine: DhanOptionEngine) -> tuple[dict, dict, str
     return fused_oi_map, dhan_spot_snap, status_tag
 
 
-def classify_institutional_oi(price_chg_pct: float, oi_chg_pct: float, opt_type: str):
+def classify_institutional_oi(price_chg_pct: float, oi_chg_pct: float, opt_type: str, is_idx: bool = False):
+    """
+    Classifies institutional derivatives flow:
+    - For Stock Options (is_idx=False): Blocks counter-trend daily price action (e.g. buying PE on a green day)
+      and only grants is_boosted=True on genuine Long Buildup (LB >= +2.5% OI) or Short Buildup (SB >= +2.5% OI).
+    """
+    if not is_idx:
+        if opt_type == "CE" and price_chg_pct < 0.15:
+            return True, False, f"PX{price_chg_pct:+4.1f}%"
+        if opt_type == "PE" and price_chg_pct > -0.15:
+            return True, False, f"PX{price_chg_pct:+4.1f}%"
+
     if abs(oi_chg_pct) < 0.5:
         return False, False, "   --  "
 
@@ -924,12 +947,13 @@ def classify_institutional_oi(price_chg_pct: float, oi_chg_pct: float, opt_type:
     if price_chg_pct >= 0.2 and oi_chg_pct <= -2.0:
         if opt_type == "PE":
             return True, False, f"SC{sign_str:>5}"
-        return False, True, f"SC{sign_str:>5}"
+        # On stocks, Short Covering (SC) is position exiting, not fresh institutional long buildup
+        return False, (True if is_idx else False), f"SC{sign_str:>5}"
 
     if price_chg_pct <= -0.2 and oi_chg_pct <= -2.0:
         if opt_type == "CE":
             return True, False, f"LU{sign_str:>5}"
-        return False, True, f"LU{sign_str:>5}"
+        return False, (True if is_idx else False), f"LU{sign_str:>5}"
 
     return False, False, f"OI{sign_str:>5}"
 
@@ -1022,10 +1046,28 @@ def get_dynamic_strike_step(spot: float, meta: dict) -> float:
     return 100.0
 
 
+def compute_wilder_atr_and_adx(df: pd.DataFrame, period: int = 14):
+    h, l, c = df["High"], df["Low"], df["Close"]
+    prev_c = c.shift(1)
+    tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+
+    up_move = h.diff()
+    down_move = -l.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    plus_di = 100.0 * pd.Series(plus_dm, index=df.index).ewm(alpha=1.0 / period, adjust=False).mean() / atr.replace(0, np.nan)
+    minus_di = 100.0 * pd.Series(minus_dm, index=df.index).ewm(alpha=1.0 / period, adjust=False).mean() / atr.replace(0, np.nan)
+    dx = (100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0.0)
+    adx = dx.ewm(alpha=1.0 / period, adjust=False).mean().fillna(20.0)
+    return atr, adx
+
+
 def compute_daily_indicators(df):
     """
-    Upgraded with Dual Bollinger Bands (BB 38 & BB 61), RSI 14 vs RSI-SMA 14,
-    RVOL, IVP Proxy, and Institutional Demand/Supply Rejection Guards.
+    Upgraded with Wilder ATR/ADX(14), Dual Bollinger Bands (BB 38 & BB 61),
+    RSI 14 vs RSI-SMA 14, RVOL, IVP Proxy, and Institutional Demand/Supply Rejection Guards.
     """
     df = df.copy()
     c = df["Close"]
@@ -1033,6 +1075,7 @@ def compute_daily_indicators(df):
     h = df["High"]
     l = df["Low"]
 
+    df["EMA9"]  = c.ewm(span=9, adjust=False).mean()
     df["EMA21"] = c.ewm(span=21, adjust=False).mean()
     df["EMA55"] = c.ewm(span=55, adjust=False).mean()
 
@@ -1052,11 +1095,7 @@ def compute_daily_indicators(df):
     df["RSI"] = (100 - (100 / (1 + (gain / loss.replace(0, np.nan))))).fillna(50.0)
     df["RSI_SMA"] = df["RSI"].rolling(14).mean().fillna(50.0)
 
-    tr = pd.concat(
-        [h - l, (h - c.shift()).abs(), (l - c.shift()).abs()],
-        axis=1,
-    ).max(axis=1)
-    df["ATR"] = tr.rolling(14).mean()
+    df["ATR"], df["ADX"] = compute_wilder_atr_and_adx(df, 14)
     df["HV20"] = np.log(c / c.shift(1)).rolling(20).std() * np.sqrt(252)
 
     hv_min = df["HV20"].rolling(252, min_periods=40).min()
@@ -1069,6 +1108,7 @@ def compute_daily_indicators(df):
     bar_range = (h - l).replace(0, np.nan)
     lower_wick_ratio = ((c - l) / bar_range).fillna(0.5)
     upper_wick_ratio = ((h - c) / bar_range).fillna(0.5)
+    not_overextended = (h - l) <= (2.2 * df["ATR"])
 
     demand_bounce = (
         ((l <= df["BB_LO_38"] * 1.006) | (l <= df["BB_LO_61"] * 1.006))
@@ -1083,27 +1123,35 @@ def compute_daily_indicators(df):
 
     df["CE_Signal"] = (
         (c >= df["EMA21"] * 0.997)
+        & (df["EMA21"] >= df["EMA55"] * 0.99)
         & (c < df["BB_UP_38"] * 0.995)
         & (df["RSI"] >= 46)
         & (df["RSI"] <= 70)
         & (df["RSI"] >= df["RSI_SMA"] * 0.98)
+        & (df["ADX"] >= 16.0)
+        & not_overextended
         & (~supply_rejection)
+        & ((c > o) | (lower_wick_ratio >= 0.55))
     )
     df["PE_Signal"] = (
         (c <= df["EMA21"] * 1.003)
+        & (df["EMA21"] <= df["EMA55"] * 1.01)
         & (c > df["BB_LO_38"] * 1.005)
         & (df["RSI"] >= 30)
         & (df["RSI"] <= 54)
         & (df["RSI"] <= df["RSI_SMA"] * 1.02)
+        & (df["ADX"] >= 16.0)
+        & not_overextended
         & (~demand_bounce)
+        & ((c < o) | (upper_wick_ratio >= 0.55))
     )
     return df
 
 
 def compute_intraday_15m_indicators(df, is_index=False):
     """
-    Upgraded 15M Intraday Engine with VWAP Anchor, Dual BB (38 & 61),
-    RSI vs RSI-SMA14, RVOL, Live 500-Bar Rolling IVP_PROXY, and S/D Zone Rejection Guards.
+    Upgraded 15M Intraday Engine with VWAP Anchor, Wilder ATR/ADX(14), Time-of-Day RVOL,
+    Dual BB (38 & 61), RSI vs RSI-SMA14, Live 500-Bar Rolling IVP_PROXY, and S/D Zone Rejection Guards.
     """
     df = df.copy()
     if df.index.tz is not None:
@@ -1124,8 +1172,10 @@ def compute_intraday_15m_indicators(df, is_index=False):
         vol_clean = df["Volume"].replace(0, 1)
         dates = pd.Series(df.index.date, index=df.index)
         df["TREND_ANCHOR"] = (tp * vol_clean).groupby(dates).cumsum() / vol_clean.groupby(dates).cumsum()
-        vol_sma20 = df["Volume"].rolling(20).mean().replace(0, np.nan)
-        df["RVOL"] = (df["Volume"] / vol_sma20).fillna(1.0)
+        tod_groups = df["Volume"].groupby(df.index.time)
+        tod_mean = tod_groups.transform(lambda x: x.rolling(10, min_periods=3).mean()).replace(0, np.nan)
+        fallback_mean = df["Volume"].rolling(20).mean().replace(0, np.nan)
+        df["RVOL"] = (df["Volume"] / tod_mean.fillna(fallback_mean)).fillna(1.0)
 
     df["BB_SMA_38"] = c.rolling(38).mean()
     std_38 = c.rolling(38).std(ddof=0)
@@ -1143,11 +1193,7 @@ def compute_intraday_15m_indicators(df, is_index=False):
     df["RSI"] = (100 - (100 / (1 + (gain / loss.replace(0, np.nan))))).fillna(50.0)
     df["RSI_SMA"] = df["RSI"].rolling(14).mean().fillna(50.0)
 
-    tr = pd.concat(
-        [h - l, (h - c.shift()).abs(), (l - c.shift()).abs()],
-        axis=1,
-    ).max(axis=1)
-    df["ATR"] = tr.rolling(14).mean()
+    df["ATR"], df["ADX"] = compute_wilder_atr_and_adx(df, 14)
     df["HV20"] = np.log(c / c.shift(1)).rolling(50).std() * np.sqrt(252 * 25)
 
     hv_min = df["HV20"].rolling(500, min_periods=40).min()
@@ -1157,6 +1203,7 @@ def compute_intraday_15m_indicators(df, is_index=False):
     bar_range = (h - l).replace(0, np.nan)
     lower_wick_ratio = ((c - l) / bar_range).fillna(0.5)
     upper_wick_ratio = ((h - c) / bar_range).fillna(0.5)
+    not_overextended = ((h - l) <= (2.2 * df["ATR"])) & ((c - df["TREND_ANCHOR"]).abs() <= (1.8 * df["ATR"]))
 
     demand_bounce = (
         ((l <= df["BB_LO_38"] * 1.003) | (l <= df["BB_LO_61"] * 1.003))
@@ -1176,7 +1223,10 @@ def compute_intraday_15m_indicators(df, is_index=False):
         & (df["RSI"] >= 48)
         & (df["RSI"] <= 72)
         & (df["RSI"] >= df["RSI_SMA"] * 0.98)
+        & (df["ADX"] >= 16.0)
+        & not_overextended
         & (~supply_rejection)
+        & ((c > o) | (lower_wick_ratio >= 0.55))
     )
     df["PE_Signal"] = (
         (c <= df["TREND_ANCHOR"])
@@ -1185,7 +1235,10 @@ def compute_intraday_15m_indicators(df, is_index=False):
         & (df["RSI"] >= 28)
         & (df["RSI"] <= 52)
         & (df["RSI"] <= df["RSI_SMA"] * 1.02)
+        & (df["ADX"] >= 16.0)
+        & not_overextended
         & (~demand_bounce)
+        & ((c < o) | (upper_wick_ratio >= 0.55))
     )
     return df
 
@@ -1445,6 +1498,9 @@ def build_option_trade_row(
                 if put_wall < und_ltp and (und_ltp - put_wall) < (0.45 * und_target_dist) and pcr > 1.05:
                     return None
     else:
+        # Loophole 1 Fix: Never trade stock options on theoretical Black-Scholes without live Dhan Chain (*)
+        if not meta["is_idx"] and REQUIRE_LIVE_CHAIN_FOR_STOCKS:
+            return None
         dte, exp_tag = get_exchange_accurate_expiry(meta, min_dte=min_dte_req)
         iv = india_vix * 1.12 if meta["is_idx"] else max(hv20 * 1.05, india_vix * 1.35)
         opt_entry, delta, gamma, theta = black_scholes_greeks(
@@ -1458,17 +1514,28 @@ def build_option_trade_row(
     strike_str = f"{int(atm_strike)}" if atm_strike == int(atm_strike) else f"{atm_strike:.1f}"
     lot_size = dhan_engine.lot_map.get(meta["nse"], meta["lot"]) if dhan_engine else meta["lot"]
 
-    atr_mult = INDEX_HRHR_ATR_SL_MULT if force_index_hrhr else (INTRA_ATR_SL_MULT if is_intraday else SWING_ATR_SL_MULT)
-    und_risk = atr * atr_mult
-    raw_opt_sl_dist = delta * und_risk - 0.5 * gamma * (und_risk ** 2)
+    # Loophole 4 Fix: Anti-Chasing Pullback Entry & Realistic Stop-Loss Breathing Room for Stocks
+    bar_span = float(latest["High"]) - float(latest["Low"])
+    if not meta["is_idx"] and bar_span > (1.25 * atr):
+        opt_entry = _tick(opt_entry * STOCK_PULLBACK_ENTRY_DISC)
+    else:
+        opt_entry = _tick(opt_entry)
+
     if force_index_hrhr:
+        atr_mult = INDEX_HRHR_ATR_SL_MULT
         max_pct_sl = INDEX_HRHR_MAX_SL_PCT
         min_pct_sl = INDEX_HRHR_MIN_SL_PCT
+    elif meta["is_idx"]:
+        atr_mult = INTRA_ATR_SL_MULT if is_intraday else SWING_ATR_SL_MULT
+        max_pct_sl = 0.15
+        min_pct_sl = 0.10
     else:
-        max_pct_sl = 0.15 if meta["is_idx"] else (0.18 if is_intraday else 0.20)
-        min_pct_sl = 0.10 if (is_intraday or meta["is_idx"]) else 0.12
+        atr_mult = STOCK_INTRA_ATR_SL_MULT if is_intraday else STOCK_SWING_ATR_SL_MULT
+        max_pct_sl = STOCK_INTRA_MAX_SL_PCT if is_intraday else STOCK_SWING_MAX_SL_PCT
+        min_pct_sl = STOCK_INTRA_MIN_SL_PCT if is_intraday else STOCK_SWING_MIN_SL_PCT
 
-    opt_entry = _tick(opt_entry)
+    und_risk = atr * atr_mult
+    raw_opt_sl_dist = delta * und_risk - 0.5 * gamma * (und_risk ** 2)
     opt_risk = max(round(min(opt_entry * max_pct_sl, max(opt_entry * min_pct_sl, raw_opt_sl_dist)), 1), 0.3)
     opt_sl = _tick(max(0.5, opt_entry - opt_risk))
     actual_risk = max(round(opt_entry - opt_sl, 2), 0.2)
@@ -1643,7 +1710,7 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
             )
 
     lines.append(
-        "\n💡 <i>* = Live Dhan Chain (PCR/Walls/IV Guard) | Dual-Source OI + Dual-BB 38/61 + T1 Filtered</i>"
+        "\n💡 <i>* = Live Dhan Chain Required | MTF 1D Aligned + OI Spurt (>=2.5%) + 15-24% SL Shield</i>"
     )
     return "\n".join(lines)
 
@@ -1706,16 +1773,22 @@ def main():
     raw_15m = yf.download(tickers, period="60d", interval="15m", group_by="ticker", progress=False)
     raw_1d = yf.download(tickers, period="5y", interval="1d", group_by="ticker", progress=False)
 
-    # Pre-cache daily closed slices for true prev_close anchoring
+    # Pre-cache daily closed slices & 1D indicators for Multi-Timeframe (MTF) alignment
     daily_slices = {}
+    daily_ind_map = {}
     for tk in tickers:
         df1d_raw = extract_ticker_df(raw_1d, tk)
-        daily_slices[tk] = get_closed_bar_slice(df1d_raw, is_intraday=False)
+        sliced_1d = get_closed_bar_slice(df1d_raw, is_intraday=False)
+        daily_slices[tk] = sliced_1d
+        if sliced_1d is not None and len(sliced_1d) >= 65:
+            daily_ind_map[tk] = compute_daily_indicators(sliced_1d)
 
-    # 1. INTRADAY 15M SCALPS (FRESH CLOSED CANDLE ONLY + T1 ENABLED)
+    # 1. INTRADAY 15M SCALPS (MTF 1D ALIGNED + LIVE CHAIN + OI BOOST GATED)
     intra_idx, intra_stk = [], []
 
     for tk, meta in FNO_UNIVERSE.items():
+        if INDEX_ONLY_MODE and not meta["is_idx"]:
+            continue
         df15_raw = extract_ticker_df(raw_15m, tk)
         df15 = get_closed_bar_slice(df15_raw, is_intraday=True)
         if len(df15) < 85:
@@ -1728,7 +1801,7 @@ def main():
         live_ltp = float(dhan_snap.get("ltp", 0.0) or 0.0)
         spot_close = live_ltp if live_ltp > 0 else float(last["Close"])
 
-        df1d_ref = daily_slices.get(tk)
+        df1d_ref = daily_ind_map.get(tk)
         yf_prev_c = float(df1d_ref["Close"].iloc[-2]) if (df1d_ref is not None and len(df1d_ref) >= 2) else 0.0
         dhan_prev_c = float(dhan_snap.get("prev_close", 0.0) or 0.0)
 
@@ -1744,11 +1817,35 @@ def main():
         if not bool(last[sig_col]):
             continue
 
-        is_blocked, is_boosted, oi_tag = classify_institutional_oi(price_chg_pct, oi_chg_pct, opt_type)
+        # Loophole 2 Fix: Multi-Timeframe (MTF) 1D Trend Alignment Gate for 15M Stock Options
+        if not meta["is_idx"] and REQUIRE_MTF_ALIGNMENT_15M:
+            if df1d_ref is None or len(df1d_ref) < 65:
+                continue
+            last_1d = df1d_ref.iloc[-1]
+            ema21_1d = float(last_1d["EMA21"])
+            ema55_1d = float(last_1d["EMA55"])
+            if opt_type == "CE":
+                if spot_close < (ema21_1d * 0.997) or ema21_1d < (ema55_1d * 0.99) or price_chg_pct < 0.20:
+                    continue
+            else:
+                if spot_close > (ema21_1d * 1.003) or ema21_1d > (ema55_1d * 1.01) or price_chg_pct > -0.20:
+                    continue
+
+        is_blocked, is_boosted, oi_tag = classify_institutional_oi(
+            price_chg_pct, oi_chg_pct, opt_type, is_idx=meta["is_idx"]
+        )
         if is_blocked:
             continue
 
-        tot, exp_r, wp = backtest_signals(df15, opt_type, INTRA_ATR_SL_MULT, INTRA_UND_RR, INTRA_MAX_BARS, True, t1_on=True)
+        # Loophole 3 Fix: Enforce Institutional OI Spurt + RVOL + ADX on Stock Options
+        if not meta["is_idx"]:
+            if REQUIRE_OI_BOOST_FOR_STOCKS and not is_boosted:
+                continue
+            if float(last.get("RVOL", 1.0)) < MIN_STOCK_RVOL_15M or float(last.get("ADX", 20.0)) < MIN_STOCK_ADX:
+                continue
+
+        atr_sl_m = INTRA_ATR_SL_MULT if meta["is_idx"] else STOCK_INTRA_ATR_SL_MULT
+        tot, exp_r, wp = backtest_signals(df15, opt_type, atr_sl_m, INTRA_UND_RR, INTRA_MAX_BARS, True, t1_on=True)
         q_score = (round(exp_r, 2) * 85.0) + (round(wp, 1) * 1.25)
 
         if meta["is_idx"]:
@@ -1788,10 +1885,11 @@ def main():
     swing_idx, swing_stk = [], []
 
     for tk, meta in FNO_UNIVERSE.items():
-        df1d = daily_slices.get(tk)
+        if INDEX_ONLY_MODE and not meta["is_idx"]:
+            continue
+        df1d = daily_ind_map.get(tk)
         if df1d is None or len(df1d) < 200:
             continue
-        df1d = compute_daily_indicators(df1d)
         last = df1d.iloc[-1]
         prev = df1d.iloc[-2]
 
@@ -1809,7 +1907,9 @@ def main():
         opt_type = "CE" if spot_close >= float(last["EMA21"]) else "PE"
         sig_col = "CE_Signal" if opt_type == "CE" else "PE_Signal"
 
-        is_blocked, is_boosted, oi_tag = classify_institutional_oi(price_chg_pct, oi_chg_pct, opt_type)
+        is_blocked, is_boosted, oi_tag = classify_institutional_oi(
+            price_chg_pct, oi_chg_pct, opt_type, is_idx=meta["is_idx"]
+        )
 
         if meta["is_idx"] and MANDATORY_INDEX_POSITIONAL:
             tot, exp_r, wp = backtest_signals(
@@ -1837,7 +1937,15 @@ def main():
         if not bool(last[sig_col]) or is_blocked:
             continue
 
-        tot, exp_r, wp = backtest_signals(df1d, opt_type, SWING_ATR_SL_MULT, SWING_UND_RR, SWING_MAX_DAYS, False, t1_on=True)
+        # Loophole 3 Fix: Enforce Institutional OI Spurt + RVOL + ADX on 1D Stock Options
+        if not meta["is_idx"]:
+            if REQUIRE_OI_BOOST_FOR_STOCKS and not is_boosted:
+                continue
+            if float(last.get("RVOL", 1.0)) < MIN_STOCK_RVOL_1D or float(last.get("ADX", 20.0)) < MIN_STOCK_ADX:
+                continue
+
+        atr_sl_m = SWING_ATR_SL_MULT if meta["is_idx"] else STOCK_SWING_ATR_SL_MULT
+        tot, exp_r, wp = backtest_signals(df1d, opt_type, atr_sl_m, SWING_UND_RR, SWING_MAX_DAYS, False, t1_on=True)
         q_score = (round(exp_r, 2) * 85.0) + (round(wp, 1) * 1.25)
 
         if meta["is_idx"]:
@@ -1889,3 +1997,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+options_scanner_2-v2.py
+Displaying options_scanner_2-v2.py.
