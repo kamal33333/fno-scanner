@@ -940,8 +940,29 @@ def _flow_change_pct(spot, prev_close, fallback_pct):
 
 
 def _new_tel():
-    keys = ("scanned", "signal", "blocked", "no_boost", "laggard", "bt_few", "bt_fail", "passed")
-    return {k: dict.fromkeys(keys, 0) for k in ("intra", "sw_buy", "sw_short")}
+    keys = ("scanned", "signal", "blocked", "no_boost", "laggard", "bt_few", "bt_fail", "passed",
+            "sh_blk_n", "sh_blk_pass", "sh_nb_n", "sh_nb_pass")      # sh_* = flow-filter shadow check
+    tel = {k: dict.fromkeys(keys, 0) for k in ("intra", "sw_buy", "sw_short")}
+    for t in tel.values():
+        t["near"] = []          # (gap to gate, sym, side, ExpR, SE, N) for names that failed the ExpR-SE gate
+        t["shadow_pass"] = []   # same tuple, for names the FLOW FILTER removed that WOULD have passed the gate
+    return tel
+
+
+def _shadow_eval(tel_t, sym, side, df, atr_mult, rr, max_bars, is_intraday, min_n, floor, reason):
+    """Shadow check of the flow filter: backtest a signal the filter REMOVED against the SAME gate, so we can see
+    whether the filter removes worse setups than it keeps (compare pass rates) or just removes setups."""
+    try:
+        n, e, w, se = backtest_cash_signals(df, side, atr_mult, rr, max_bars, is_intraday)
+    except Exception:
+        return
+    gap = e - BT_SE_K * se - floor
+    ok = n >= min_n and gap >= 0
+    k = "sh_blk" if reason == "blocked" else "sh_nb"
+    tel_t[k + "_n"] += 1
+    tel_t[k + "_pass"] += int(ok)
+    if ok:
+        tel_t["shadow_pass"].append((gap, sym, side, e, se, n))
 
 
 def _telemetry_text(tel, skipped_idx, n_idx_used, n_idx_total, ran):
@@ -956,6 +977,33 @@ def _telemetry_text(tel, skipped_idx, n_idx_used, n_idx_total, ran):
                 f"{t['bt_fail']} failed ExpR-SE gate | {t['passed']} passed")
     lines = [one("intra", "Intraday"), one("sw_buy", "Swing BUY"), one("sw_short", "Swing SHORT"),
              f"Indices used: {n_idx_used}/{n_idx_total}" + (" | skipped: " + "; ".join(skipped_idx) if skipped_idx else "")]
+
+    def near(k, label):
+        t = tel[k]
+        if not ran[k] or not t["near"]:
+            return None
+        best = sorted(t["near"], key=lambda x: -x[0])[:3]            # closest to passing first
+        return (f"{label} near-misses (ExpR+-SE, trades, gap to gate): "
+                + "; ".join(f"{s} {sd} {e:+.2f}+-{se:.2f} n{n} ({g:+.2f})" for g, s, sd, e, se, n in best))
+
+    def shadow(k, label):
+        t = tel[k]
+        rem_n = t["sh_blk_n"] + t["sh_nb_n"]
+        if not ran[k] or rem_n == 0:
+            return None
+        kept_n = t["bt_few"] + t["bt_fail"] + t["passed"]
+        rem_p = t["sh_blk_pass"] + t["sh_nb_pass"]
+        txt = (f"{label} flow-filter check: kept {t['passed']}/{kept_n} passed the gate; removed {rem_p}/{rem_n} would pass "
+               f"(blocked {t['sh_blk_pass']}/{t['sh_blk_n']}, no-boost {t['sh_nb_pass']}/{t['sh_nb_n']})")
+        if t["shadow_pass"]:
+            top = sorted(t["shadow_pass"], key=lambda x: -x[0])[:3]
+            txt += " | e.g. " + ", ".join(f"{sy} {sd} {e:+.2f}+-{se:.2f} n{n}" for g, sy, sd, e, se, n in top)
+        return txt
+
+    for k, label in (("intra", "Intraday"), ("sw_buy", "Swing BUY"), ("sw_short", "Swing SHORT")):
+        for extra in (near(k, label), shadow(k, label)):
+            if extra:
+                lines.append(extra)
     return lines
 
 
@@ -1092,6 +1140,8 @@ def main():
 
             _sig = bool(last[sig_col]) or bool(prev[sig_col])
             _t = TEL["intra"]; _t["scanned"] += 1; _t["signal"] += int(_sig); _t["blocked"] += int(_sig and is_blocked); _t["no_boost"] += int(_sig and not is_blocked and not is_boosted)
+            if _sig and (is_blocked or not is_boosted):
+                _shadow_eval(TEL["intra"], sym, side, df15, INTRA_ATR_SL_MULT, INTRA_RR, INTRA_MAX_BARS, True, INTRA_MIN_SETUPS, INTRA_MIN_EXP_R, "blocked" if is_blocked else "no_boost")
             if not is_blocked and is_boosted and (bool(last[sig_col]) or bool(prev[sig_col])):
                 # Upgrade candidate to exact Dhan 15m Chart bars if Dhan API is active
                 dhan_15m = get_closed_bar_slice(dhan.fetch_intraday_15m_df(sym, days_back=85), is_intraday=True)
@@ -1101,6 +1151,8 @@ def main():
                 tot, exp_r, wp, se = backtest_cash_signals(df15, side, INTRA_ATR_SL_MULT, INTRA_RR, INTRA_MAX_BARS, True)
                 _few = tot < INTRA_MIN_SETUPS; _ok = (not _few) and exp_r - BT_SE_K * se >= INTRA_MIN_EXP_R
                 TEL["intra"]["bt_few"] += int(_few); TEL["intra"]["bt_fail"] += int((not _few) and not _ok); TEL["intra"]["passed"] += int(_ok)
+                if (not _few) and not _ok:
+                    TEL["intra"]["near"].append((exp_r - BT_SE_K * se - INTRA_MIN_EXP_R, sym, side, exp_r, se, tot))
                 if _ok:
                     rs_alpha = (price_chg_pct - nifty_intra_chg) if side == "BUY" else (nifty_intra_chg - price_chg_pct)
                     rs_bonus = float(np.clip(rs_alpha * 1.5, -3.0, 5.0))
@@ -1130,10 +1182,14 @@ def main():
                 # Relative Strength Guard: Avoid buying laggards underperforming NIFTY by >2.5% over 5 days
                 _sig = bool(last["BUY_Signal"]) or bool(prev["BUY_Signal"])
                 _t = TEL["sw_buy"]; _t["scanned"] += 1; _t["signal"] += int(_sig); _t["blocked"] += int(_sig and is_blocked); _t["no_boost"] += int(_sig and not is_blocked and not is_boosted); _t["laggard"] += int(_sig and not is_blocked and is_boosted and rs_5d_diff < -2.5)
+                if _sig and (is_blocked or not is_boosted):
+                    _shadow_eval(TEL["sw_buy"], sym, side, df1d, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False, SWING_MIN_SETUPS, SWING_MIN_EXP_R, "blocked" if is_blocked else "no_boost")
                 if not is_blocked and is_boosted and rs_5d_diff >= -2.5 and (bool(last["BUY_Signal"]) or bool(prev["BUY_Signal"])):
                     tot, exp_r, wp, se = backtest_cash_signals(df1d, side, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False)
                     _few = tot < SWING_MIN_SETUPS; _ok = (not _few) and exp_r - BT_SE_K * se >= SWING_MIN_EXP_R
                     TEL["sw_buy"]["bt_few"] += int(_few); TEL["sw_buy"]["bt_fail"] += int((not _few) and not _ok); TEL["sw_buy"]["passed"] += int(_ok)
+                    if (not _few) and not _ok:
+                        TEL["sw_buy"]["near"].append((exp_r - BT_SE_K * se - SWING_MIN_EXP_R, sym, side, exp_r, se, tot))
                     if _ok:
                         rs_bonus = float(np.clip(rs_5d_diff * 0.8, -2.0, 5.0))
                         row = build_stock_trade_row(sym, df1d, side, False, flow_tag, is_boosted, exp_r, wp, "3-5D CNC", rs_bonus)
@@ -1144,10 +1200,14 @@ def main():
                 is_blocked, is_boosted, flow_tag = classify_hybrid_flow(daily_chg, oi_chg_pct, rvol, side, ob_ratio)
                 _sig = bool(last["SHORT_Signal"]) or bool(prev["SHORT_Signal"])
                 _t = TEL["sw_short"]; _t["scanned"] += 1; _t["signal"] += int(_sig); _t["blocked"] += int(_sig and is_blocked); _t["no_boost"] += int(_sig and not is_blocked and not is_boosted); _t["laggard"] += int(_sig and not is_blocked and is_boosted and rs_5d_diff > 2.5)
+                if _sig and (is_blocked or not is_boosted):
+                    _shadow_eval(TEL["sw_short"], sym, side, df1d, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False, SWING_MIN_SETUPS, SWING_MIN_EXP_R, "blocked" if is_blocked else "no_boost")
                 if not is_blocked and is_boosted and rs_5d_diff <= 2.5 and (bool(last["SHORT_Signal"]) or bool(prev["SHORT_Signal"])):
                     tot, exp_r, wp, se = backtest_cash_signals(df1d, side, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False)
                     _few = tot < SWING_MIN_SETUPS; _ok = (not _few) and exp_r - BT_SE_K * se >= SWING_MIN_EXP_R
                     TEL["sw_short"]["bt_few"] += int(_few); TEL["sw_short"]["bt_fail"] += int((not _few) and not _ok); TEL["sw_short"]["passed"] += int(_ok)
+                    if (not _few) and not _ok:
+                        TEL["sw_short"]["near"].append((exp_r - BT_SE_K * se - SWING_MIN_EXP_R, sym, side, exp_r, se, tot))
                     if _ok:
                         rs_bonus = float(np.clip(-rs_5d_diff * 0.8, -2.0, 5.0))
                         row = build_stock_trade_row(sym, df1d, side, False, flow_tag, is_boosted, exp_r, wp, "1D Watch", rs_bonus)
@@ -1171,7 +1231,10 @@ def main():
     tel_msg = "\n\n<b>📊 Scan stats</b>\n<code>" + html.escape("\n".join(tel_lines)) + "</code>"
     if len(msg) + len(tel_msg) < 3900:
         msg += tel_msg
+        tel_msg = ""
     send_telegram_alert(msg)
+    if tel_msg:
+        send_telegram_alert(tel_msg)
 
 
 if __name__ == "__main__":
