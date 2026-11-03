@@ -905,7 +905,10 @@ def build_single_master_message(mood_summary, intra_rows, short_1d_rows, buy_1d_
 
     if not market_open and (intra_rows or short_1d_rows or buy_1d_rows):
         lines.append("\n⚠️ <i>Market closed: rows are for planning only (prices are the last close, not tradable now).</i>")
-    lines.append("\n💡 <i>15M Cap uses 2x MIS Margin | 1D Shorts = Trade via Intraday MIS or F&amp;O Puts</i>")
+    if intra_rows or short_1d_rows or buy_1d_rows:
+        lines.append("\n💡 <i>15M cap uses 2x MIS margin | 1D shorts = intraday MIS or F&amp;O puts | Flow: LB/SB/SC/LU = OI build-up, VL = volume surge, OB = order book</i>")
+    else:
+        lines.append("\n✅ <b>No setups passed the gates in this scan.</b>")
     return "\n".join(lines)
 
 
@@ -1007,6 +1010,69 @@ def _telemetry_text(tel, skipped_idx, n_idx_used, n_idx_total, ran):
     return lines
 
 
+def _telemetry_html(tel, skipped_idx, n_idx_used, n_idx_total, ran, market_open):
+    """Telegram-friendly scan summary: headline, funnel table, closest misses, flow-filter check."""
+    esc = html.escape
+    keys = ("intra", "sw_buy", "sw_short")
+    heads = {"intra": "Intra", "sw_buy": "Buy", "sw_short": "Short"}
+    cols = [k for k in keys if ran[k]]                       # columns that were not scanned are hidden
+    out = ["<b>📊 SCAN SUMMARY</b>"]
+    if not ran["intra"]:
+        out.append("<i>Intraday not scanned (market closed).</i>")
+    if not ran["sw_buy"]:
+        out.append("<i>Swing not scanned yet (runs from 15:10 IST).</i>")
+    rows = [("Scanned", lambda t: t["scanned"]),
+            ("With signal", lambda t: t["signal"]),
+            ("Flow-removed", lambda t: t["blocked"] + t["no_boost"]),
+            ("RS-removed", lambda t: t["laggard"]),
+            ("Tested", lambda t: t["bt_few"] + t["bt_fail"] + t["passed"]),
+            ("  too few trades", lambda t: t["bt_few"]),
+            ("  failed gate", lambda t: t["bt_fail"]),
+            ("PASSED", lambda t: t["passed"])]
+    if cols:
+        tbl = [f"{'':<16}" + "".join(f"{heads[k]:>7}" for k in cols)]
+        for label, fn in rows:
+            tbl.append(f"{label:<16}" + "".join(f"{fn(tel[k]):>7}" for k in cols))
+        out.append("<pre>" + esc("\n".join(tbl)) + "</pre>")
+        gate = f"Gate: at least {SWING_MIN_SETUPS} trades and ExpR - {BT_SE_K:g} x SE >= {SWING_MIN_EXP_R:g}"
+        if ran["intra"] and (INTRA_MIN_SETUPS, INTRA_MIN_EXP_R) != (SWING_MIN_SETUPS, SWING_MIN_EXP_R):
+            gate += f" (intraday: {INTRA_MIN_SETUPS} trades, {INTRA_MIN_EXP_R:g})"
+        out.append(f"<i>{esc(gate)}</i>")
+
+    miss = []
+    for k in cols:
+        for g, s_, sd, e, se, n in sorted(tel[k]["near"], key=lambda x: -x[0])[:3]:
+            miss.append(f"{heads[k].upper():<6}{s_:<12}{e:+.2f} ±{se:.2f}  {n:>3} trades  short by {abs(g):.2f}")
+    if miss:
+        out.append("")
+        out.append("<b>Closest misses</b> (how far below the gate)")
+        out.append("<pre>" + esc("\n".join(miss)) + "</pre>")
+
+    flow, would = [], []
+    for k in cols:
+        t = tel[k]
+        rem_n = t["sh_blk_n"] + t["sh_nb_n"]
+        if rem_n == 0:
+            continue
+        kept_n = t["bt_few"] + t["bt_fail"] + t["passed"]
+        rem_p = t["sh_blk_pass"] + t["sh_nb_pass"]
+        flow.append(f"{heads[k].upper():<6}kept {t['passed']} of {kept_n} pass | removed {rem_p} of {rem_n} would pass")
+        for g, s_, sd, e, se, n in sorted(t["shadow_pass"], key=lambda x: -x[0])[:3]:
+            would.append(f"{heads[k].upper():<6}{s_:<12}{e:+.2f} ±{se:.2f}  {n:>3} trades")
+    if flow:
+        out.append("")
+        out.append("<b>Flow-filter check</b> (share passing the same gate)")
+        out.append("<pre>" + esc("\n".join(flow)) + "</pre>")
+        if would:
+            out.append("Removed by the filter but would have passed:")
+            out.append("<pre>" + esc("\n".join(would)) + "</pre>")
+        out.append("<i>Noise alone passes about 1 in 10 swing signals, so judge this over many days, not one run.</i>")
+
+    out.append("")
+    out.append(esc(f"Indices used: {n_idx_used}/{n_idx_total}" + (" (skipped: " + "; ".join(skipped_idx) + ")" if skipped_idx else "")))
+    return "\n".join(out)
+
+
 def main():
     ist = pytz.timezone("Asia/Kolkata")
     now_ist = datetime.now(ist)
@@ -1096,6 +1162,7 @@ def main():
         mood_lines.append("• " + " | ".join(idx_badges[:2]))
     if len(idx_badges) >= 3:
         mood_lines.append("• " + " | ".join(idx_badges[2:]))
+    mood_lines.append("<i>LB long build-up | SB short build-up | SC short covering | LU long unwinding (number = OI change %)</i>")
     mood_summary = "\n".join(mood_lines)
 
     # 2. SCAN STOCKS ON 15M (INTRADAY) & 1D (POSITIONAL SHORT & BUY)
@@ -1228,7 +1295,7 @@ def main():
     msg = build_single_master_message(mood_summary, intra_rows, short_1d_rows, buy_1d_rows, now_str, bool(dhan_eq_quotes), market_open=market_open_now)
     tel_lines = _telemetry_text(TEL, skipped_idx, len(idx_badges), len(INDEX_UNIVERSE), {"intra": run_intraday, "sw_buy": run_swing, "sw_short": run_swing})
     print("SCAN STATS | " + " || ".join(tel_lines))
-    tel_msg = "\n\n<b>📊 Scan stats</b>\n<code>" + html.escape("\n".join(tel_lines)) + "</code>"
+    tel_msg = "\n\n" + _telemetry_html(TEL, skipped_idx, len(idx_badges), len(INDEX_UNIVERSE), {"intra": run_intraday, "sw_buy": run_swing, "sw_short": run_swing}, market_open_now)
     if len(msg) + len(tel_msg) < 3900:
         msg += tel_msg
         tel_msg = ""
