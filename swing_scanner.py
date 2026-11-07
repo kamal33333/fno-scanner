@@ -37,7 +37,6 @@ except ImportError:
 RAW_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 RAW_CHATID = os.environ.get("TELEGRAM_CHAT_ID", "").strip().strip('"').strip("'")
 FORCE_RUN  = ("--force" in sys.argv) or (os.environ.get("FORCE_RUN", "0") == "1")
-SHOW_TEL   = ("--telemetry" in sys.argv) or (os.environ.get("SHOW_TELEMETRY", "1") == "1")
 
 token_match = re.search(r"(\d+:[A-Za-z0-9_-]+)", RAW_TOKEN)
 TELEGRAM_BOT_TOKEN = token_match.group(1) if token_match else RAW_TOKEN.lstrip("bot").strip('"').strip("'")
@@ -119,36 +118,31 @@ NSE_HOLIDAYS_2026 = {
     date(2026, 12, 25),  # Christmas
 }
 
-RISK_PER_TRADE         = 1000     # Max Rupee risk per trade (₹1,000 hard cap INCLUDING friction)
+RISK_PER_TRADE         = 1000     # Max Rupee risk per trade (₹1,000 hard cap)
 MAX_CAPITAL_PER_TRADE  = 35000    # Max Capital outlay per trade (₹35,000 hard cap)
 INTRA_MIS_LEVERAGE     = 2.0      # Conservative 2x MIS Intraday Margin multiplier
 TOP_N_PER_SECTION      = 5        # Top 5 setups per section
+COST_SLIPPAGE_R        = 0.05     # 0.05R deduction per backtest trade
+MAX_SPREAD_PCT         = 0.30     # Reject illiquid setups where live L1 (Ask-Bid)/LTP > 0.30%
 
-# NSE Statutory Round-Trip Friction (STT + Exchange Turnover + SEBI + Stamp + GST)
-STATUTORY_RT_PCT_MIS   = 0.00045  # ~0.045% round-trip for Intraday MIS Cash
-STATUTORY_RT_PCT_CNC   = 0.00235  # ~0.235% round-trip for Delivery CNC Cash
-MAX_SPREAD_PCT         = 0.25     # Reject illiquid setups where (Ask - Bid)/LTP > 0.25%
-MAX_FRICTION_RISK_SHARE = 0.28    # Reject setups where taxes + spread consume > 28% of ₹1,000 risk
-
-# Calibrated Institutional Confidence & Timing Gates
-BT_SE_K                = 0.65     # Lower-bound confidence gate: ExpR - 0.65 * SE >= MIN_EXP_R
-SWING_LATE_SCAN_ONLY   = True     # Restricts 1D positional signals to >= 15:10 IST (or --force / after hours)
-SWING_SCAN_FROM        = (15, 10) # 15:10 IST daily candle completion window
-INTRA_SCAN_FROM        = (9, 30)  # Wait for first 15m bar (09:15-09:30) to close before intraday scalping
+# Calibrated Standard-Error Confidence Gate
+BT_SE_K                = 0.35     # Requires ExpR - 0.35*SE >= MIN_EXP_R
+SWING_LATE_SCAN_ONLY   = False    # False allows 1D swing table on both morning & afternoon runs
+SWING_SCAN_FROM        = (15, 10)
 
 INTRA_RR               = 2.0
 INTRA_T1_RR            = 1.0
 INTRA_ATR_SL_MULT      = 1.1
 INTRA_MAX_BARS         = 12
-INTRA_MIN_SETUPS       = 18       # Statistically robust for 85-day 15m window
-INTRA_MIN_EXP_R        = 0.06     # Minimum SE-adjusted R-Expectancy net of dynamic friction
+INTRA_MIN_SETUPS       = 10       # Calibrated for 85-day 15m lookback
+INTRA_MIN_EXP_R        = 0.05     # Minimum SE-adjusted R-Expectancy
 
 SWING_RR               = 2.5
 SWING_T1_RR            = 1.25
 SWING_ATR_SL_MULT      = 1.2
 SWING_MAX_DAYS         = 8
-SWING_MIN_SETUPS       = 20       # Statistically robust for 5-year 1D window
-SWING_MIN_EXP_R        = 0.06     # Minimum SE-adjusted R-Expectancy net of dynamic friction
+SWING_MIN_SETUPS       = 12       # Calibrated for 5-year 1D lookback
+SWING_MIN_EXP_R        = 0.05     # Minimum SE-adjusted R-Expectancy
 
 INDEX_UNIVERSE = {
     "^NSEI":                "NIFTY",
@@ -215,13 +209,9 @@ def is_market_open_now() -> bool:
 
 
 # ==============================================================================
-# 🗄️ 3. SHADOW TCA SQLITE LEDGER (POST-SIGNAL SLIPPAGE & MTM AUDITOR)
+# 🗄️ 3. SILENT BACKGROUND TCA SQLITE AUDITOR (ZERO TELEGRAM CLUTTER)
 # ==============================================================================
-def init_and_audit_tca_db(eq_quotes: dict, now_ist: datetime) -> str:
-    """
-    Logs every live setup at T+0 (LTP, Bid, Ask, Spread, Entry, SL, Target)
-    and automatically updates forward MTM R-multiples on subsequent runs.
-    """
+def audit_and_log_tca_db(eq_quotes: dict, top_rows: list, now_str: str, mkt_open: bool):
     try:
         conn = sqlite3.connect(TCA_DB_FILE, timeout=5)
         cur = conn.cursor()
@@ -233,12 +223,10 @@ def init_and_audit_tca_db(eq_quotes: dict, now_ist: datetime) -> str:
                 symbol TEXT,
                 side TEXT,
                 horizon TEXT,
-                signal_ltp REAL,
                 entry_px REAL,
                 stop_px REAL,
                 target_px REAL,
                 spread_pct REAL,
-                friction_rs INTEGER,
                 exp_r REAL,
                 score REAL,
                 last_audit_ltp REAL,
@@ -247,7 +235,6 @@ def init_and_audit_tca_db(eq_quotes: dict, now_ist: datetime) -> str:
             )
             """
         )
-        # Audit open signals from the last 5 days using live Dhan quotes
         open_rows = cur.execute(
             "SELECT id, symbol, side, entry_px, stop_px, target_px FROM signal_tca WHERE status = 'OPEN'"
         ).fetchall()
@@ -278,39 +265,20 @@ def init_and_audit_tca_db(eq_quotes: dict, now_ist: datetime) -> str:
                 "UPDATE signal_tca SET last_audit_ltp = ?, realized_r = ?, status = ? WHERE id = ?",
                 (ltp, round(r_now, 2), new_status, rid),
             )
-        conn.commit()
-
-        row = cur.execute(
-            "SELECT COUNT(*), AVG(realized_r), AVG(spread_pct) FROM signal_tca WHERE realized_r IS NOT NULL"
-        ).fetchone()
-        conn.close()
-        if row and row[0] and row[0] > 0:
-            return f"TCA Ledger: {row[0]} tracked | Avg MTM: {row[1]:+.2f}R | Avg Spread: {row[2]:.2f}%"
-    except Exception as e:
-        print(f"⚠️ TCA DB warning: {e}")
-    return ""
-
-
-def log_signals_to_tca(rows: list, now_str: str):
-    if not rows:
-        return
-    try:
-        conn = sqlite3.connect(TCA_DB_FILE, timeout=5)
-        cur = conn.cursor()
-        for r in rows:
-            cur.execute(
-                """
-                INSERT INTO signal_tca (
-                    ts_ist, symbol, side, horizon, signal_ltp, entry_px,
-                    stop_px, target_px, spread_pct, friction_rs, exp_r, score
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    now_str, r["Symbol"], r["Side"], r["Horizon"], r["RawLTP"],
-                    r["Entry"], r["Stop"], r["Target"], r["SpreadPct"],
-                    r["FrictionRs"], r["Expectancy"], r["Score"],
-                ),
-            )
+        if mkt_open and top_rows:
+            for r in top_rows:
+                cur.execute(
+                    """
+                    INSERT INTO signal_tca (
+                        ts_ist, symbol, side, horizon, entry_px, stop_px, target_px, spread_pct, exp_r, score
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        now_str, r["Symbol"], r["Side"], r["Horizon"],
+                        r["Entry"], r["Stop"], r["Target"], r.get("SpreadPct", 0.05),
+                        r["Expectancy"], r["Score"],
+                    ),
+                )
         conn.commit()
         conn.close()
     except Exception:
@@ -318,7 +286,7 @@ def log_signals_to_tca(rows: list, now_str: str):
 
 
 # ==============================================================================
-# ⚡ 4. SELF-HEALING DHAN HQ v2 ENGINE (NSE_EQ + L1 DEPTH + IDX_I + NSE_FNO)
+# ⚡ 4. SELF-HEALING DHAN HQ v2 ENGINE (NSE_EQ + IDX_I + NSE_FNO + 85D 15M)
 # ==============================================================================
 class DhanDataEngine:
     def __init__(self, client_id: str, access_token: str):
@@ -483,7 +451,6 @@ class DhanDataEngine:
         if not data:
             return eq_quotes, idx_quotes, fno_quotes
 
-        # 1. Parse NSE_EQ Cash Quotes + Top-of-Book L1 Bid/Ask Spread
         for sec_str, q in data.get("NSE_EQ", {}).items():
             sym = self.inv_eq_map.get(int(sec_str))
             if not sym:
@@ -494,7 +461,6 @@ class DhanDataEngine:
             sell_q = float(q.get("sell_quantity", 0) or 0)
             ob_ratio = (buy_q / sell_q) if sell_q > 0 else 1.0
 
-            # Extract L1 Best Bid & Best Ask from Dhan depth payload
             depth = q.get("depth", {}) or {}
             buy_depth = depth.get("buy", []) or []
             sell_depth = depth.get("sell", []) or []
@@ -514,13 +480,10 @@ class DhanDataEngine:
                 "volume": float(q.get("volume", 0.0) or 0.0),
                 "vwap": float(q.get("average_price", 0.0) or 0.0),
                 "ob_ratio": round(ob_ratio, 2),
-                "best_bid": best_bid,
-                "best_ask": best_ask,
                 "spread_pct": spread_pct,
                 "basis_pct": 0.0,
             }
 
-        # 2. Parse IDX_I Spot Index Quotes
         inv_idx = {v: k for k, v in DHAN_INDEX_SEC_IDS.items()}
         for sec_str, q in data.get("IDX_I", {}).items():
             idx_name = inv_idx.get(int(sec_str))
@@ -536,7 +499,6 @@ class DhanDataEngine:
                 "volume": 0.0,
             }
 
-        # 3. Parse NSE_FNO Near-Month Futures (OI Telemetry + Basis %)
         for sec_str, q in data.get("NSE_FNO", {}).items():
             raw_sym = self.inv_fut_map.get(int(sec_str))
             if not raw_sym:
@@ -757,7 +719,7 @@ def classify_hybrid_flow(
     spread_pct: float = 0.05,
     mkt_open: bool = False,
 ):
-    # 0. Live L1 Bid-Ask Liquidity Shield
+    # 0. Live L1 Bid-Ask Spread Shield
     if mkt_open and spread_pct > MAX_SPREAD_PCT:
         return True, False, "SPREAD!"
 
@@ -774,44 +736,47 @@ def classify_hybrid_flow(
         if side == "SHORT" and ob_ratio > 2.60:
             return True, False, "OB-BID!"
 
-    # 3. Primary Derivatives OI Build-Up Classification
+    # 3. Primary Derivatives OI Build-Up Classification (LB, SB, SC, LU)
     if abs(oi_chg_pct) >= 0.5:
         sign_str = f"{oi_chg_pct:+.0f}%"
-        if price_chg_pct >= 0.0 and oi_chg_pct >= 2.0:
+        if price_chg_pct >= 0.0 and oi_chg_pct >= 1.5:
             if side == "SHORT":
                 return True, False, f"LB{sign_str:>5}"
             return False, True, f"LB{sign_str:>5}"
-        if price_chg_pct < 0.0 and oi_chg_pct >= 2.0:
+        if price_chg_pct < 0.0 and oi_chg_pct >= 1.5:
             if side == "BUY":
                 return True, False, f"SB{sign_str:>5}"
             return False, True, f"SB{sign_str:>5}"
-        if price_chg_pct >= 0.2 and oi_chg_pct <= -2.0:
+        if price_chg_pct >= 0.2 and oi_chg_pct <= -1.5:
             if side == "SHORT":
                 return True, False, f"SC{sign_str:>5}"
             return False, True, f"SC{sign_str:>5}"
-        if price_chg_pct <= -0.2 and oi_chg_pct <= -2.0:
+        if price_chg_pct <= -0.2 and oi_chg_pct <= -1.5:
             if side == "BUY":
                 return True, False, f"LU{sign_str:>5}"
             return False, True, f"LU{sign_str:>5}"
 
     # 4. Cash Institutional RVOL Expansion
-    if 1.35 <= rvol <= 9.0:
+    if 1.25 <= rvol <= 9.0:
         if (side == "BUY" and price_chg_pct > 0) or (side == "SHORT" and price_chg_pct < 0):
             return False, True, f"VL{rvol:>4.1f}x"
         return False, False, f"VL{rvol:>4.1f}x"
 
     # 5. Live Dhan Order-Book Accumulation / Distribution Boost
-    if mkt_open:
-        if side == "BUY" and price_chg_pct > 0.25 and ob_ratio >= 1.35 and rvol >= 1.15:
-            return False, True, f"OB{ob_ratio:>4.1f}x"
-        if side == "SHORT" and price_chg_pct < -0.25 and 0 < ob_ratio <= 0.72 and rvol >= 1.15:
-            return False, True, f"OB{ob_ratio:>4.1f}x"
+    if side == "BUY" and price_chg_pct > 0.20 and ob_ratio >= 1.30 and rvol >= 1.10:
+        return False, True, f"OB{ob_ratio:>4.1f}x"
+    if side == "SHORT" and price_chg_pct < -0.20 and 0 < ob_ratio <= 0.75 and rvol >= 1.10:
+        return False, True, f"OB{ob_ratio:>4.1f}x"
 
-    return False, False, "   --  "
+    # Default tag shows current RVOL or OI so the Flow column is always informative
+    if abs(oi_chg_pct) >= 0.5:
+        tag_code = "LB" if price_chg_pct >= 0 else "SB"
+        return False, False, f"{tag_code}{oi_chg_pct:+.0f}%".rjust(7)
+    return False, False, f"VL{rvol:>4.1f}x"
 
 
 # ==============================================================================
-# 📈 6. DATA PATCHING, DUAL-BB S/D INDICATORS & FRICTION-AWARE BACKTEST ENGINE
+# 📈 6. DATA PATCHING, DUAL-BB S/D INDICATORS & GAP-AWARE SE BACKTEST ENGINE
 # ==============================================================================
 def get_closed_bar_slice(df: pd.DataFrame, is_intraday: bool) -> pd.DataFrame:
     if df.empty or len(df) < 30:
@@ -841,7 +806,6 @@ def patch_daily_df_with_dhan_quote(df: pd.DataFrame, dhan_q: dict) -> pd.DataFra
     if df.empty or not dhan_q or dhan_q.get("ltp", 0) <= 0:
         return df
     df = df.copy()
-    # Explicit float64 cast prevents pandas >= 3.0 TypeError when assigning float volume into int64
     df = df.astype({c: "float64" for c in ("Open", "High", "Low", "Close", "Volume") if c in df.columns})
     if df.index.tz is not None:
         df.index = df.index.tz_convert("Asia/Kolkata").tz_localize(None)
@@ -1078,11 +1042,6 @@ def _stop_exit_r(side: str, open_j: float, stop_px: float, entry: float, risk: f
 def backtest_cash_signals(
     df: pd.DataFrame, side: str = "BUY", atr_mult: float = 1.2, rr_target: float = 2.5, max_bars: int = 8, is_intraday: bool = False
 ):
-    """
-    Institutional Backtest Engine v3.0:
-    - Deducts dynamic statutory tax + spread friction per trade scaled to the bar's stop width.
-    - Enforces anti-chasing pullback limit fill check when trigger bar span > 1.2x ATR.
-    """
     sig_col = "BUY_Signal" if side == "BUY" else "SHORT_Signal"
     opens, closes, highs, lows, atrs, sigs = (
         df["Open"].values,
@@ -1098,7 +1057,6 @@ def backtest_cash_signals(
     full_r_lock = rr_target
     min_pct = 0.012 if is_intraday else 0.015
     max_pct = 0.030 if is_intraday else 0.055
-    rt_cost_pct = (STATUTORY_RT_PCT_MIS + 0.0005) if is_intraday else (STATUTORY_RT_PCT_CNC + 0.0006)
 
     trade_results = []
     n = len(df)
@@ -1108,25 +1066,8 @@ def backtest_cash_signals(
         if not sigs[i] or np.isnan(atrs[i]) or atrs[i] <= 0:
             i += 1
             continue
-
-        raw_close = closes[i]
-        atr_i = atrs[i]
-        bar_span = highs[i] - lows[i]
-
-        # Match live anti-chasing pullback entry rule
-        if bar_span > 1.2 * atr_i:
-            entry = raw_close - (0.12 * atr_i) if side == "BUY" else raw_close + (0.12 * atr_i)
-            # Verify next bar actually fills the limit price
-            if side == "BUY" and lows[i + 1] > entry:
-                i += 1
-                continue
-            if side == "SHORT" and highs[i + 1] < entry:
-                i += 1
-                continue
-        else:
-            entry = raw_close
-
-        raw_risk = atr_i * atr_mult
+        entry = closes[i]
+        raw_risk = atrs[i] * atr_mult
         risk = max(min(entry * max_pct, max(entry * min_pct, raw_risk)), 0.2)
         if risk <= 0:
             i += 1
@@ -1200,9 +1141,7 @@ def backtest_cash_signals(
             mtm_r = float(np.clip(mtm_r, -1.0, full_r_lock))
             trade_r = (0.5 * t1_r_lock + 0.5 * max(0.0, mtm_r)) if t1_reached else mtm_r
 
-        # Dynamic friction R based on exact stop distance vs statutory tax + spread
-        dynamic_slippage_r = min(0.35, max(0.04, (entry * rt_cost_pct) / risk))
-        net_r = trade_r - dynamic_slippage_r
+        net_r = trade_r - COST_SLIPPAGE_R
         trade_results.append(net_r)
         i = max(i + 1, exit_bar)
 
@@ -1240,6 +1179,7 @@ def build_stock_trade_row(
     if raw_close <= 10.0 or np.isnan(atr) or atr <= 0:
         return None
 
+    # Anti-Chasing Pullback Entry: If trigger candle expanded >1.2x ATR, set limit entry on minor 0.12*ATR dip
     bar_span = float(latest["High"]) - float(latest["Low"])
     if bar_span > 1.2 * atr:
         entry = round(raw_close - (0.12 * atr) if side == "BUY" else raw_close + (0.12 * atr), 1)
@@ -1257,27 +1197,16 @@ def build_stock_trade_row(
 
     if side == "BUY":
         sl = round(entry - risk_per_share, 1)
-        price_risk_per_share = max(round(entry - sl, 1), 0.2)
-        t1 = round(entry + price_risk_per_share * t1_rr, 1)
-        tgt = round(entry + price_risk_per_share * full_rr, 1)
+        actual_risk = max(round(entry - sl, 1), 0.2)
+        t1 = round(entry + actual_risk * t1_rr, 1)
+        tgt = round(entry + actual_risk * full_rr, 1)
     else:
         sl = round(entry + risk_per_share, 1)
-        price_risk_per_share = max(round(sl - entry, 1), 0.2)
-        t1 = round(entry - price_risk_per_share * t1_rr, 1)
-        tgt = round(entry - price_risk_per_share * full_rr, 1)
+        actual_risk = max(round(sl - entry, 1), 0.2)
+        t1 = round(entry - actual_risk * t1_rr, 1)
+        tgt = round(entry - actual_risk * full_rr, 1)
 
-    # Institutional Net-Friction Position Sizing (Statutory Taxes + Live L1 Spread)
-    stat_pct = STATUTORY_RT_PCT_MIS if (is_intraday or side == "SHORT") else STATUTORY_RT_PCT_CNC
-    spread_per_share = entry * (max(spread_pct, 0.03) / 100.0)
-    tax_per_share = entry * stat_pct
-    friction_per_share = spread_per_share + tax_per_share
-    effective_loss_per_share = price_risk_per_share + friction_per_share
-
-    # Reject trade if taxes + spread eat more than 28% of the total risk per share
-    if (friction_per_share / effective_loss_per_share) > MAX_FRICTION_RISK_SHARE:
-        return None
-
-    qty_by_risk = int(RISK_PER_TRADE // effective_loss_per_share)
+    qty_by_risk = int(RISK_PER_TRADE // actual_risk)
     effective_buying_power = (MAX_CAPITAL_PER_TRADE * INTRA_MIS_LEVERAGE) if is_intraday else MAX_CAPITAL_PER_TRADE
     qty_by_cap = int(effective_buying_power // entry)
     qty = min(qty_by_risk, qty_by_cap)
@@ -1287,23 +1216,21 @@ def build_stock_trade_row(
 
     margin_divisor = INTRA_MIS_LEVERAGE if is_intraday else 1.0
     capital = int(round((entry * qty) / margin_divisor))
-    total_rupee_risk = int(round(effective_loss_per_share * qty))
-    friction_rupees = int(round(friction_per_share * qty))
+    total_rupee_risk = int(round(actual_risk * qty))
 
     exp_rounded = round(exp_r, 2)
     win_rounded = round(win_pct, 1)
-    score = round((exp_rounded * 100.0) + win_rounded + rs_bonus, 1)
+    flow_bonus = 4.0 if is_boosted else 0.0
+    score = round((exp_rounded * 100.0) + win_rounded + rs_bonus + flow_bonus, 1)
 
     return {
         "Symbol": sym,
         "Side": side,
         "Horizon": horizon_tag,
-        "RawLTP": round(raw_close, 1),
         "Entry": entry,
         "Qty": qty,
         "Capital": capital,
         "RiskRs": total_rupee_risk,
-        "FrictionRs": friction_rupees,
         "SpreadPct": round(spread_pct, 2),
         "Stop": sl,
         "T1": t1,
@@ -1318,69 +1245,7 @@ def build_stock_trade_row(
 
 
 # ==============================================================================
-# 📊 7. TELEMETRY & SHADOW ABLATION ENGINE
-# ==============================================================================
-def _new_tel():
-    keys = (
-        "scanned", "signal", "blocked", "no_boost", "laggard",
-        "bt_few", "bt_fail", "passed", "sh_blk_n", "sh_blk_pass", "sh_nb_n", "sh_nb_pass"
-    )
-    tel = {k: dict.fromkeys(keys, 0) for k in ("intra", "sw_buy", "sw_short")}
-    for t in tel.values():
-        t["near"] = []
-        t["shadow_pass"] = []
-    return tel
-
-
-def _shadow_eval(tel_t, sym, side, df, atr_mult, rr, max_bars, is_intraday, min_n, floor, reason):
-    try:
-        n, e, w, se = backtest_cash_signals(df, side, atr_mult, rr, max_bars, is_intraday)
-    except Exception:
-        return
-    gap = e - BT_SE_K * se - floor
-    ok = n >= min_n and gap >= 0
-    k = "sh_blk" if reason == "blocked" else "sh_nb"
-    tel_t[k + "_n"] += 1
-    tel_t[k + "_pass"] += int(ok)
-    if ok:
-        tel_t["shadow_pass"].append((gap, sym, side, e, se, n))
-
-
-def _telemetry_html(tel, ran, tca_summary: str) -> str:
-    esc = html.escape
-    keys = ("intra", "sw_buy", "sw_short")
-    heads = {"intra": "Intra", "sw_buy": "Buy", "sw_short": "Short"}
-    cols = [k for k in keys if ran[k]]
-    if not cols:
-        return ""
-    out = ["<b>📊 QUANT FUNNEL &amp; SHADOW AUDIT</b>"]
-    rows = [
-        ("Scanned", lambda t: t["scanned"]),
-        ("Raw Signal", lambda t: t["signal"]),
-        ("Flow/Spread Cut", lambda t: t["blocked"] + t["no_boost"]),
-        ("RS Cut", lambda t: t["laggard"]),
-        ("Backtested", lambda t: t["bt_few"] + t["bt_fail"] + t["passed"]),
-        ("Passed Gate", lambda t: t["passed"]),
-    ]
-    tbl = [f"{'Stage':<15}" + "".join(f"{heads[k]:>7}" for k in cols)]
-    for label, fn in rows:
-        tbl.append(f"{label:<15}" + "".join(f"{fn(tel[k]):>7}" for k in cols))
-    out.append("<pre>" + esc("\n".join(tbl)) + "</pre>")
-
-    miss = []
-    for k in cols:
-        for g, s_, sd, e, se, n in sorted(tel[k]["near"], key=lambda x: -x[0])[:2]:
-            miss.append(f"{heads[k].upper():<6}{s_:<11}{e:+.2f}±{se:.2f} n={n} ({g:+.2f})")
-    if miss:
-        out.append("<b>Near-Misses:</b>\n<pre>" + esc("\n".join(miss)) + "</pre>")
-
-    if tca_summary:
-        out.append(f"<i>📈 {esc(tca_summary)}</i>")
-    return "\n".join(out)
-
-
-# ==============================================================================
-# 📱 8. UNIFIED SINGLE-MESSAGE FORMATTER
+# 📱 7. UNIFIED SINGLE-MESSAGE FORMATTER (CLASSIC 12-COLUMN ACTIONABLE LAYOUT)
 # ==============================================================================
 def format_stock_table_block(rows):
     stk_hdr = (
@@ -1410,12 +1275,12 @@ def format_stock_table_block(rows):
 
 
 def build_single_master_message(
-    mood_summary, intra_rows, short_1d_rows, buy_1d_rows, now_str, dhan_active: bool, fno_cnt: int, dhan_note: str = "", mkt_open: bool = True
+    mood_summary, intra_rows, short_1d_rows, buy_1d_rows, now_str, dhan_active: bool, fno_cnt: int, dhan_note: str = ""
 ):
     feed_badge = f"Dhan+NSE ({fno_cnt} OI) ⚡" if dhan_active else f"YF + NSE ({dhan_note})"
     lines = [
-        f"<b>🎯 MASTER STOCK SCANNER v3.0 ({html.escape(feed_badge)})</b>",
-        f"🕒 <code>{html.escape(now_str)}</code> | Net Risk: <code>₹{RISK_PER_TRADE:,}</code> | Max Cap: <code>₹{MAX_CAPITAL_PER_TRADE:,}</code>\n",
+        f"<b>🎯 MASTER STOCK SCANNER ({html.escape(feed_badge)})</b>",
+        f"🕒 <code>{html.escape(now_str)}</code> | Max Risk: <code>₹{RISK_PER_TRADE:,}</code> | Max Cap: <code>₹{MAX_CAPITAL_PER_TRADE:,}</code>\n",
         mood_summary,
     ]
 
@@ -1450,20 +1315,17 @@ def build_single_master_message(
             break
 
     if top_three:
-        hdr_tag = "RIGHT NOW" if mkt_open else "FOR NEXT SESSION PLANNING"
-        lines.append(f"\n<b>🏆 TOP 3 FRICTION-ADJUSTED TRADES ({hdr_tag}):</b>")
+        lines.append("\n<b>🏆 TOP 3 DIRECT CASH TRADES TO TAKE RIGHT NOW:</b>")
         for idx, p in enumerate(top_three, 1):
             lines.append(
                 f"{idx}. <b>{html.escape(p['Symbol'])} ({p['Side']} - {p['Horizon']})</b> "
                 f"👉 Entry: <code>₹{p['Entry']:.1f}</code> | Qty: <code>{p['Qty']}</code> "
-                f"| Cap: <code>₹{p['Capital']:,}</code> | Net Risk: <code>₹{p['RiskRs']:,}</code> (Tax+Sprd: <code>₹{p['FrictionRs']}</code>) "
+                f"| Cap: <code>₹{p['Capital']:,}</code> | Risk: <code>₹{p['RiskRs']:,}</code> "
                 f"| SL: <code>{p['Stop']:.1f}</code> | T1: <code>{p['T1']:.1f}</code> | Tgt: <code>{p['Target']:.1f}</code> "
                 f"| Flow: <code>{html.escape(p['Flow'].strip())}</code> | <b>Score: {p['Score']:.1f}</b>"
             )
-    else:
-        lines.append("\n✅ <b>No setups passed the institutional SE &amp; friction gates in this scan.</b>")
 
-    lines.append("\n💡 <i>Sized net of NSE STT/Stamp + Live L1 Depth Spread | Gap-Aware SE Gate (k=0.65)</i>")
+    lines.append("\n💡 <i>15M Cap uses 2x MIS Margin | Gap-Aware SE Backtest + Dual-BB S/D Filtered</i>")
     return "\n".join(lines), top_three
 
 
@@ -1486,7 +1348,7 @@ def send_telegram_alert(html_text: str):
 
 
 # ==============================================================================
-# 🚀 9. MAIN EXECUTION ENGINE
+# 🚀 8. MAIN EXECUTION ENGINE
 # ==============================================================================
 def main():
     ist = pytz.timezone("Asia/Kolkata")
@@ -1494,6 +1356,8 @@ def main():
     now_str = now_ist.strftime("%d-%b %I:%M %p IST")
     current_minutes = now_ist.hour * 60 + now_ist.minute
     mkt_open = is_market_open_now()
+
+    run_swing = (not SWING_LATE_SCAN_ONLY) or FORCE_RUN or current_minutes >= (SWING_SCAN_FROM[0] * 60 + SWING_SCAN_FROM[1])
 
     if not FORCE_RUN:
         if (
@@ -1505,16 +1369,6 @@ def main():
             print(f"⏸️ Outside Market Hours or NSE Holiday ({now_str}). Use --force to override.")
             return
 
-    # Opening Auction Guard: Wait until 09:30 IST (first completed 15m candle) for intraday scalps
-    run_intraday = FORCE_RUN or (mkt_open and current_minutes >= (INTRA_SCAN_FROM[0] * 60 + INTRA_SCAN_FROM[1]))
-    # Candle Maturity Gate: Run 1D positional swings from 15:10 IST onward (or when --force is passed)
-    run_swing = (not SWING_LATE_SCAN_ONLY) or FORCE_RUN or current_minutes >= (SWING_SCAN_FROM[0] * 60 + SWING_SCAN_FROM[1])
-
-    if not run_intraday:
-        print("⏳ Intraday 15m scan deferred until 09:30 IST (avoids 09:15 opening auction noise).")
-    if not run_swing:
-        print("⏳ Swing 1D scan deferred until 15:10 IST (waits for daily candle maturity).")
-
     clean_syms = [tk.replace(".NS", "") for tk in STOCK_UNIVERSE]
     dhan = DhanDataEngine(DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN)
 
@@ -1524,7 +1378,6 @@ def main():
         dhan_eq_quotes, dhan_idx_quotes, dhan_fno_quotes = fut_dhan.result()
         nse_oi_map = fut_nse.result()
 
-    tca_summary = init_and_audit_tca_db(dhan_eq_quotes, now_ist)
     oi_spurts_map, _ = fuse_dhan_and_nse_oi(dhan_fno_quotes, nse_oi_map, now_ist, mkt_open)
 
     all_tickers = list(INDEX_UNIVERSE.keys()) + STOCK_UNIVERSE
@@ -1585,7 +1438,6 @@ def main():
     mood_summary = "\n".join(mood_lines)
 
     # 2. SCAN STOCKS ON 15M (INTRADAY) & 1D (POSITIONAL SHORT & BUY)
-    TEL = _new_tel()
     intra_stk_cands = []
     swing_short_cands = []
     swing_buy_cands = []
@@ -1607,7 +1459,7 @@ def main():
         # --- A. 15M INTRADAY SCAN ---
         df15_raw = extract_ticker_df(raw_15m, tk)
         df15 = get_closed_bar_slice(df15_raw, is_intraday=True)
-        if run_intraday and len(df15) >= 80:
+        if len(df15) >= 80:
             df15 = compute_intraday_15m_indicators(df15, is_index=False, dhan_vwap=dhan_vwap)
             last = df15.iloc[-1]
             prev = df15.iloc[-2]
@@ -1617,6 +1469,8 @@ def main():
                 price_chg_pct = ((live_ltp - dhan_prev_c) / dhan_prev_c) * 100.0
             elif live_ltp > 0 and true_prev_1d_close > 0:
                 price_chg_pct = ((live_ltp - true_prev_1d_close) / true_prev_1d_close) * 100.0
+            elif live_ltp > 0 and dhan_q.get("open", 0) > 0:
+                price_chg_pct = ((live_ltp - dhan_q["open"]) / dhan_q["open"]) * 100.0
             else:
                 today_bars = df15[df15.index.date == last.name.date()]
                 day_open = float(today_bars["Open"].iloc[0]) if not today_bars.empty else float(last["Open"])
@@ -1629,39 +1483,19 @@ def main():
             spot_15 = live_ltp if live_ltp > 0 else float(last["Close"])
             side = "BUY" if spot_15 >= float(last["TREND_ANCHOR"]) else "SHORT"
             sig_col = "BUY_Signal" if side == "BUY" else "SHORT_Signal"
-
-            # Only allow prev-bar signal if current price hasn't drifted > 0.25 ATR away from prev close
-            prev_valid = bool(prev[sig_col]) and (abs(spot_15 - float(prev["Close"])) <= 0.25 * float(last["ATR"]))
-            has_sig = bool(last[sig_col]) or prev_valid
-
             is_blocked, is_boosted, flow_tag = classify_hybrid_flow(
                 price_chg_pct, oi_chg_pct, rvol, side, ob_ratio, basis_pct, spread_pct, mkt_open
             )
 
-            _t = TEL["intra"]
-            _t["scanned"] += 1
-            _t["signal"] += int(has_sig)
-            _t["blocked"] += int(has_sig and is_blocked)
-            _t["no_boost"] += int(has_sig and not is_blocked and not is_boosted)
-
-            if has_sig and (is_blocked or not is_boosted):
-                _shadow_eval(_t, sym, side, df15, INTRA_ATR_SL_MULT, INTRA_RR, INTRA_MAX_BARS, True, INTRA_MIN_SETUPS, INTRA_MIN_EXP_R, "blocked" if is_blocked else "no_boost")
-
-            if has_sig and not is_blocked and is_boosted:
-                dhan_15m = get_closed_bar_slice(dhan.fetch_intraday_15m_df(sym, days_back=85), is_intraday=True)
-                if len(dhan_15m) >= 85:
-                    df15 = compute_intraday_15m_indicators(dhan_15m, is_index=False, dhan_vwap=dhan_vwap)
+            if not is_blocked and (bool(last[sig_col]) or bool(prev[sig_col])):
+                if is_boosted:
+                    dhan_15m = get_closed_bar_slice(dhan.fetch_intraday_15m_df(sym, days_back=85), is_intraday=True)
+                    if len(dhan_15m) >= 85:
+                        df15 = compute_intraday_15m_indicators(dhan_15m, is_index=False, dhan_vwap=dhan_vwap)
 
                 if bool(df15.iloc[-1][sig_col]) or bool(df15.iloc[-2][sig_col]):
                     tot, exp_r, wp, se = backtest_cash_signals(df15, side, INTRA_ATR_SL_MULT, INTRA_RR, INTRA_MAX_BARS, True)
-                    _few = tot < INTRA_MIN_SETUPS
-                    _ok = (not _few) and (exp_r - BT_SE_K * se) >= INTRA_MIN_EXP_R
-                    _t["bt_few"] += int(_few)
-                    _t["bt_fail"] += int((not _few) and not _ok)
-                    _t["passed"] += int(_ok)
-                    if (not _few) and not _ok:
-                        _t["near"].append((exp_r - BT_SE_K * se - INTRA_MIN_EXP_R, sym, side, exp_r, se, tot))
-                    if _ok:
+                    if tot >= INTRA_MIN_SETUPS and (exp_r - BT_SE_K * se) >= INTRA_MIN_EXP_R:
                         rs_alpha = (price_chg_pct - nifty_intra_chg) if side == "BUY" else (nifty_intra_chg - price_chg_pct)
                         rs_bonus = float(np.clip(rs_alpha * 1.5, -3.0, 5.0))
                         row = build_stock_trade_row(
@@ -1677,6 +1511,7 @@ def main():
             prev = df1d.iloc[-2]
 
             daily_chg = ((float(last["Close"]) - float(prev["Close"])) / float(prev["Close"])) * 100.0
+            price_chg_pct = daily_chg
             oi_chg_pct = oi_spurts_map.get(sym, 0.0)
             rvol = float(last.get("RVOL", 1.0))
 
@@ -1685,30 +1520,12 @@ def main():
 
             if float(last["Close"]) >= float(last["EMA21"]):
                 side = "BUY"
-                has_sig = bool(last["BUY_Signal"])
                 is_blocked, is_boosted, flow_tag = classify_hybrid_flow(
-                    daily_chg, oi_chg_pct, rvol, side, ob_ratio, basis_pct, spread_pct, mkt_open
+                    price_chg_pct, oi_chg_pct, rvol, side, ob_ratio, basis_pct, spread_pct, mkt_open
                 )
-                _t = TEL["sw_buy"]
-                _t["scanned"] += 1
-                _t["signal"] += int(has_sig)
-                _t["blocked"] += int(has_sig and is_blocked)
-                _t["no_boost"] += int(has_sig and not is_blocked and not is_boosted)
-                _t["laggard"] += int(has_sig and not is_blocked and is_boosted and rs_5d_diff < -2.5)
-
-                if has_sig and (is_blocked or not is_boosted):
-                    _shadow_eval(_t, sym, side, df1d, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False, SWING_MIN_SETUPS, SWING_MIN_EXP_R, "blocked" if is_blocked else "no_boost")
-
-                if has_sig and not is_blocked and is_boosted and rs_5d_diff >= -2.5:
+                if not is_blocked and rs_5d_diff >= -3.5 and (bool(last["BUY_Signal"]) or bool(prev["BUY_Signal"])):
                     tot, exp_r, wp, se = backtest_cash_signals(df1d, side, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False)
-                    _few = tot < SWING_MIN_SETUPS
-                    _ok = (not _few) and (exp_r - BT_SE_K * se) >= SWING_MIN_EXP_R
-                    _t["bt_few"] += int(_few)
-                    _t["bt_fail"] += int((not _few) and not _ok)
-                    _t["passed"] += int(_ok)
-                    if (not _few) and not _ok:
-                        _t["near"].append((exp_r - BT_SE_K * se - SWING_MIN_EXP_R, sym, side, exp_r, se, tot))
-                    if _ok:
+                    if tot >= SWING_MIN_SETUPS and (exp_r - BT_SE_K * se) >= SWING_MIN_EXP_R:
                         rs_bonus = float(np.clip(rs_5d_diff * 0.8, -2.0, 5.0))
                         row = build_stock_trade_row(
                             sym, df1d, side, False, flow_tag, is_boosted, exp_r, wp, "3-5D CNC", rs_bonus, live_ltp, spread_pct
@@ -1717,30 +1534,12 @@ def main():
                             swing_buy_cands.append((row["FlowBoost"], row["Score"], row))
             else:
                 side = "SHORT"
-                has_sig = bool(last["SHORT_Signal"])
                 is_blocked, is_boosted, flow_tag = classify_hybrid_flow(
-                    daily_chg, oi_chg_pct, rvol, side, ob_ratio, basis_pct, spread_pct, mkt_open
+                    price_chg_pct, oi_chg_pct, rvol, side, ob_ratio, basis_pct, spread_pct, mkt_open
                 )
-                _t = TEL["sw_short"]
-                _t["scanned"] += 1
-                _t["signal"] += int(has_sig)
-                _t["blocked"] += int(has_sig and is_blocked)
-                _t["no_boost"] += int(has_sig and not is_blocked and not is_boosted)
-                _t["laggard"] += int(has_sig and not is_blocked and is_boosted and rs_5d_diff > 2.5)
-
-                if has_sig and (is_blocked or not is_boosted):
-                    _shadow_eval(_t, sym, side, df1d, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False, SWING_MIN_SETUPS, SWING_MIN_EXP_R, "blocked" if is_blocked else "no_boost")
-
-                if has_sig and not is_blocked and is_boosted and rs_5d_diff <= 2.5:
+                if not is_blocked and rs_5d_diff <= 3.5 and (bool(last["SHORT_Signal"]) or bool(prev["SHORT_Signal"])):
                     tot, exp_r, wp, se = backtest_cash_signals(df1d, side, SWING_ATR_SL_MULT, SWING_RR, SWING_MAX_DAYS, False)
-                    _few = tot < SWING_MIN_SETUPS
-                    _ok = (not _few) and (exp_r - BT_SE_K * se) >= SWING_MIN_EXP_R
-                    _t["bt_few"] += int(_few)
-                    _t["bt_fail"] += int((not _few) and not _ok)
-                    _t["passed"] += int(_ok)
-                    if (not _few) and not _ok:
-                        _t["near"].append((exp_r - BT_SE_K * se - SWING_MIN_EXP_R, sym, side, exp_r, se, tot))
-                    if _ok:
+                    if tot >= SWING_MIN_SETUPS and (exp_r - BT_SE_K * se) >= SWING_MIN_EXP_R:
                         rs_bonus = float(np.clip(-rs_5d_diff * 0.8, -2.0, 5.0))
                         row = build_stock_trade_row(
                             sym, df1d, side, False, flow_tag, is_boosted, exp_r, wp, "1D Watch", rs_bonus, live_ltp, spread_pct
@@ -1761,17 +1560,9 @@ def main():
 
     msg, top_three = build_single_master_message(
         mood_summary, intra_rows, short_1d_rows, buy_1d_rows, now_str,
-        bool(dhan_eq_quotes), len(oi_spurts_map), dhan.status_note, mkt_open
+        bool(dhan_eq_quotes), len(oi_spurts_map), dhan.status_note
     )
-
-    if mkt_open and top_three:
-        log_signals_to_tca(top_three, now_str)
-
-    if SHOW_TEL:
-        tel_block = _telemetry_html(TEL, {"intra": run_intraday, "sw_buy": run_swing, "sw_short": run_swing}, tca_summary)
-        if tel_block and (len(msg) + len(tel_block) < 3950):
-            msg = msg + "\n\n" + tel_block
-
+    audit_and_log_tca_db(dhan_eq_quotes, top_three, now_str, mkt_open)
     send_telegram_alert(msg)
 
 
