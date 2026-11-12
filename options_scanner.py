@@ -32,13 +32,19 @@ except ImportError:
         pass
 
 # ==============================================================================
-# 🔐 1. CREDENTIALS & ENVIRONMENT VARIABLES (PATCH A: AUTO-EXTRACTED JWT ID)
+# 🔐 1. CREDENTIALS & ENVIRONMENT VARIABLES (AUTO-SANITIZED + JWT SELF-DECODE)
 # ==============================================================================
-RAW_TOKEN  = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-RAW_CHATID = os.environ.get("TELEGRAM_CHAT_ID", "").strip().strip('"').strip("'")
-EVENT_NAME = os.environ.get("GITHUB_EVENT_NAME", "manual")
-FORCE_RUN  = "--force" in sys.argv
-DRY_RUN    = "--dry-run" in sys.argv
+RAW_TOKEN       = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+RAW_CHATID      = os.environ.get("TELEGRAM_CHAT_ID", "").strip().strip('"').strip("'")
+EVENT_NAME      = os.environ.get("GITHUB_EVENT_NAME", "manual")
+FORCE_RUN       = "--force" in sys.argv
+DRY_RUN         = "--dry-run" in sys.argv
+INDEX_ONLY_MODE = ("--index-only" in sys.argv) or (os.environ.get("INDEX_ONLY_MODE", "0") == "1")
+
+ALLOW_SYNTHETIC_INDEX_FLOOR = (
+    ("--allow-synthetic-floor" in sys.argv)
+    or (os.environ.get("ALLOW_SYNTHETIC_INDEX_FLOOR", "0") == "1")
+)
 
 token_match = re.search(r"(\d+:[A-Za-z0-9_-]+)", RAW_TOKEN)
 TELEGRAM_BOT_TOKEN = token_match.group(1) if token_match else RAW_TOKEN.lstrip("bot").strip('"').strip("'")
@@ -91,6 +97,9 @@ SYMBOL_ALIAS_MAP = {
     "M&MFIN": "M&MFIN",
     "BAJAJ_AUTO": "BAJAJ-AUTO",
     "BAJAJ-AUTO": "BAJAJ-AUTO",
+    "GVT_D": "GVT&D",
+    "GVT&D": "GVT&D",
+    "GEVT&D": "GVT&D",
     "ARE_M": "ARE&M",
     "ARE&M": "ARE&M",
     "NAM_INDIA": "NAM-INDIA",
@@ -113,7 +122,7 @@ def normalize_nse_symbol(sym: str) -> str:
 
 def resolve_true_prev_close(spot: float, dhan_prev_c: float, yf_prev_close: float) -> float:
     """
-    Patch C: Guards against Dhan's post-market reset where ohlc.close == last_price (0.0% change).
+    Guards against Dhan's post-market reset where ohlc.close == last_price (0.0% change).
     Falls back to daily historical close (prev1d['Close']) whenever abs(spot - dhan_prev_c) <= 1e-3.
     """
     if dhan_prev_c is None or dhan_prev_c <= 0 or abs(spot - dhan_prev_c) <= 1e-3:
@@ -122,7 +131,7 @@ def resolve_true_prev_close(spot: float, dhan_prev_c: float, yf_prev_close: floa
 
 
 # ==============================================================================
-# ⚖️ 2. OFFICIAL NSE HOLIDAYS 2026 & INSTITUTIONAL PARAMETERS
+# ⚖️ 2. OFFICIAL NSE HOLIDAYS 2026 & INSTITUTIONAL COMPOUNDING PARAMETERS
 # ==============================================================================
 NSE_HOLIDAYS_2026 = {
     date(2026, 1, 26),   # Republic Day
@@ -141,7 +150,7 @@ NSE_HOLIDAYS_2026 = {
 }
 
 TARGET_RISK_PER_TRADE  = 3000     # Target Rupee risk per 1-lot trade (₹3,000)
-MAX_SINGLE_LOT_RISK    = 6000     # Max allowed risk for 1 single lot
+MAX_SINGLE_LOT_RISK    = 7500     # Max allowed risk for 1 single lot (₹7,500 cap for 15+ DTE positional swings)
 MAX_CAPITAL_PER_TRADE  = 50000    # Max 1-lot Option Premium outlay (₹50,000 cap)
 LOCK_TO_SINGLE_LOT     = True     # Exact 1-Lot Exchange Qty (Matches Dhan Order Window 1:1)
 TOP_N_STOCKS           = 10       # Top 10 Stock Option setups per scan
@@ -149,108 +158,193 @@ COST_SLIPPAGE_R        = 0.05     # 0.05R brokerage + STT + slippage deducted pe
 
 # --- Adaptive Spread & Expiry Parameters ---
 MAX_SPREAD_FRONT_PCT   = 4.5      # Max live bid-ask spread % for front-month contracts (DTE <= 10)
-MAX_SPREAD_FAR_PCT     = 7.2      # Relaxed spread % for far-month contracts (DTE > 10)
+MAX_SPREAD_FAR_PCT     = 7.5      # Relaxed spread % for far-month contracts (DTE > 10)
 MIN_DTE_INTRADAY       = 4        # Minimum 4 DTE for Intraday Scalps
 MIN_DTE_POSITIONAL     = 15       # Minimum 15+ DTE for Positional & Index Swings
 
 # --- Risk:Reward & Anti-Stoploss Thresholds (Indices vs. Stocks) ---
-INTRA_OPT_RR           = 1.75     # Aligned 1:1.75 Option Risk:Reward
-INTRA_T1_RR            = 1.0      # Book 50% at +1.0R and trail SL to Entry
-INTRA_UND_RR           = 1.6      # Underlying ATR target multiple
-INTRA_ATR_SL_MULT      = 0.90     # 0.90x ATR stop loss for Index Scalps
-STK_INTRA_ATR_SL_MULT  = 1.30     # 1.30x ATR wider stop loss for Stock Scalps (Anti-Whipsaw)
-INTRA_MAX_BARS         = 12       # 12 bars intraday window
-INTRA_MIN_SETUPS       = 10       # Minimum historical sample size
-INTRA_MIN_EXP_R        = 0.06     # Minimum Net R-Expectancy after costs
+INTRA_OPT_RR            = 1.75    # Aligned 1:1.75 Option Risk:Reward
+INTRA_T1_RR             = 1.0     # Book 50% at +1.0R and trail SL to Entry
+INTRA_UND_RR            = 1.6     # Underlying ATR target multiple
+INTRA_ATR_SL_MULT       = 0.90    # 0.90x ATR stop loss for Index Scalps
+STOCK_INTRA_ATR_SL_MULT = 1.20    # 1.20x ATR wider stop loss for Stock Scalps (Anti-Whipsaw)
+INTRA_MAX_BARS          = 12      # 12 bars intraday window
+INTRA_MIN_SETUPS        = 7       # Calibrated minimum historical sample size on 60d 15m data
+INTRA_MIN_EXP_R         = 0.03    # Minimum Net R-Expectancy after costs
 
-SWING_OPT_RR           = 2.5      # Locked 1:2.5 Option Risk:Reward
-SWING_T1_RR            = 1.25     # Book 50% at +1.25R and trail SL to Entry
-SWING_UND_RR           = 1.8      # Underlying ATR target multiple
-SWING_ATR_SL_MULT      = 1.00     # 1.00x Daily ATR stop loss for Index Swings
-STK_SWING_ATR_SL_MULT  = 1.35     # 1.35x Daily ATR wider stop loss for Stock Swings (Anti-Whipsaw)
-SWING_MAX_DAYS         = 6        # 6 trading days hold window
-SWING_MIN_SETUPS       = 10       # Minimum 5-year historical sample size
-SWING_MIN_EXP_R        = 0.05     # Minimum Net R-Expectancy after costs
+SWING_OPT_RR            = 2.5     # Locked 1:2.5 Option Risk:Reward
+SWING_T1_RR             = 1.25    # Book 50% at +1.25R and trail SL to Entry
+SWING_UND_RR            = 1.8     # Underlying ATR target multiple
+SWING_ATR_SL_MULT       = 1.00    # 1.00x Daily ATR stop loss for Index Swings
+STOCK_SWING_ATR_SL_MULT = 1.25    # 1.25x Daily ATR wider stop loss for Stock Swings (Anti-Whipsaw)
+SWING_MAX_DAYS          = 6       # 6 trading days hold window
+SWING_MIN_SETUPS        = 8       # Calibrated 5-year historical sample size
+SWING_MIN_EXP_R         = 0.03    # Minimum Net R-Expectancy after costs
 
-# --- Stock Option Anti-Stoploss & Penny-Premium Guards ---
-MIN_STOCK_OPT_PRICE    = 10.0     # Reject penny stock options (< ₹10) prone to tick/spread stop-outs
-MIN_STOCK_SL_POINTS    = 1.25     # Minimum ₹1.25 option SL buffer on stocks to survive market-maker noise
-STK_WHIPSAW_PAD        = 0.035    # 3.5% intrabar option bid-ask/vega pullback buffer in replay_executed
+# --- Stock Option Anti-Loophole & Breakout Regime Guards ---
+REQUIRE_LIVE_CHAIN_FOR_STOCKS = True  # Require verified live Dhan Option Chain (*) on stock options
+REQUIRE_MTF_ALIGNMENT_15M     = True  # 15M stock scalps must align with 1D EMA21/55 structure
+MIN_STOCK_RVOL_15M            = 1.10  # Minimum effective 15M RVOL for Track-A (OI-boosted) stocks
+MIN_STOCK_RVOL_1D             = 1.05  # Minimum 1D RVOL for Track-A (OI-boosted) stocks
+HIGH_CONV_RVOL_SQUEEZE        = 1.25  # Track-B RVOL threshold when OI spurt is +0.6% to +1.5% or SC/LU squeeze
+BREAKOUT_REGIME_RVOL          = 1.30  # RVOL threshold that unlocks Day-1 BB_UP_38 / 3.2x ATR breakout bars
+MIN_STOCK_ADX                 = 17.0  # Minimum Wilder ADX(14) trend strength for stock options
+MIN_STOCK_OPT_PRICE           = 6.0   # Reject penny stock options (< ₹6) prone to tick/spread stop-outs
+MIN_STOCK_SL_POINTS           = 1.00  # Minimum ₹1.00 option SL buffer on stocks
+STOCK_INTRA_MIN_SL_PCT        = 0.15  # 15% min option SL on 15M stocks
+STOCK_INTRA_MAX_SL_PCT        = 0.22  # 22% max option SL on 15M stocks
+STOCK_SWING_MIN_SL_PCT        = 0.18  # 18% min option SL on 1D stocks
+STOCK_SWING_MAX_SL_PCT        = 0.24  # 24% max option SL on 1D stocks
+STOCK_PULLBACK_ENTRY_DISC     = 0.975 # 2.5% limit-entry pullback discount when trigger bar > 1.25x ATR
+STK_WHIPSAW_PAD               = 0.006 # Calibrated 0.6% intrabar bid-ask pad in ATR-adaptive replay_executed
 
 EXEC_GATE_ENABLED      = True     # Require positive expectancy in option-premium space (replay_executed)
-EXEC_MIN_EXP_R         = 0.05     # Minimum executed-geometry Expectancy R
-EXEC_MIN_SETUPS        = 12       # Minimum setups in executed-geometry replay
+EXEC_MIN_EXP_R         = 0.01     # Minimum ATR-adaptive executed-geometry Expectancy R
+EXEC_MIN_SETUPS        = 6        # Minimum executed-geometry sample size
 
-# --- High-Risk / High-Reward (HRHR / Gamma Lotto) Index Parameters ---
-MANDATORY_INDEX_HRHR   = True     # Guarantee Major Indices table is populated with HRHR Lotto column
-HRHR_LOTTO_OPT_RR      = 3.5      # 1:3.5 Explosive R:R target for OTM Index Lotto strikes
-HRHR_LOTTO_SL_PCT      = 0.35     # 35% premium stop loss on cheap OTM Lotto contracts
+# --- Mandatory Index Positional Trend & HRHR Gamma-Lotto Parameters ---
+MANDATORY_INDEX_HRHR       = True # Guarantee Major Indices table is populated in both Intraday & Positional
+MANDATORY_INDEX_POSITIONAL = True # Always display all major indices in Positional scan by Trend (1:3.5 RR)
+INDEX_HRHR_OPT_RR          = 3.5  # 1:3.5 High-Reward Option Risk:Reward for Index Positional Trend
+INDEX_HRHR_T1_RR           = 1.5  # Book 50% at +1.5R and trail SL to Entry
+INDEX_HRHR_UND_RR          = 2.4  # 2.4x Daily ATR underlying trend target
+INDEX_HRHR_ATR_SL_MULT     = 1.2  # 1.2x Daily ATR underlying stop distance
+INDEX_HRHR_MAX_SL_PCT      = 0.22 # Up to 22% option premium stop-loss for HRHR index plays
+INDEX_HRHR_MIN_SL_PCT      = 0.14 # Minimum 14% option premium stop-loss
+INDEX_HRHR_OTM_STEPS       = 1    # 1-step OTM strike in trend direction for higher convexity
+HRHR_LOTTO_OPT_RR          = 3.5  # 1:3.5 Explosive R:R target for OTM Index Lotto column
+HRHR_LOTTO_SL_PCT          = 0.35 # 35% premium stop loss on cheap OTM Lotto contracts
 
 # --- Institutional Volatility & Microstructure Guards ---
-MAX_SAFE_IVP           = 75.0     # NYKAA/BDL Guard: Block naked buying above 75 IVP without strong RVOL/OI
-MAX_IV_HV_RATIO        = 1.38     # Reject overpriced ATM options where Live IV > 1.38x HV20
-MIN_BULL_PCR           = 0.78     # Minimum chain PCR required for unboosted Long Call (CE) setups
-MAX_BEAR_PCR           = 1.28     # Maximum chain PCR allowed for unboosted Long Put (PE) setups
+MAX_SAFE_IVP           = 85.0     # Allow high-momentum breakouts when OI & RVOL confirm, block IVP 95-100 traps
+MAX_IV_HV_RATIO        = 1.45     # Reject overpriced ATM options where Live IV > 1.45x HV20 without RVOL
+MIN_BULL_PCR           = 0.68     # Allow strong institutional breakouts when OI boost is active
+MAX_BEAR_PCR           = 1.30     # Maximum chain PCR allowed for unboosted Long Put (PE) setups
 
 RISK_FREE_RATE         = 0.068
 
 # ==============================================================================
-# 📋 3. TRADABLE INDEX OPTIONS + LIQUID NSE F&O STOCKS (LIVE LOT SYNC)
+# 📋 3. EXPANDED 105-SYMBOL F&O UNIVERSE (5 INDICES + 100 LIQUID F&O STOCKS)
 # ==============================================================================
 FNO_UNIVERSE = {
-    "^NSEI":                 {"name": "NIFTY",      "nse": "NIFTY",      "lot": 75,   "step": 50,  "is_idx": True,  "dhan_id": 13,  "dhan_seg": "IDX_I", "exp_rule": "NSE_WEEKLY_TUE"},
-    "^NSEBANK":              {"name": "BANKNIFTY",  "nse": "BANKNIFTY",  "lot": 30,   "step": 100, "is_idx": True,  "dhan_id": 25,  "dhan_seg": "IDX_I", "exp_rule": "NSE_MONTHLY_TUE"},
-    "^BSESN":                {"name": "SENSEX",     "nse": "SENSEX",     "lot": 20,   "step": 100, "is_idx": True,  "dhan_id": 51,  "dhan_seg": "IDX_I", "exp_rule": "BSE_WEEKLY_THU"},
-    "NIFTY_MID_SELECT.NS":   {"name": "MIDCPNIFTY", "nse": "MIDCPNIFTY", "lot": 120,  "step": 25,  "is_idx": True,  "dhan_id": 442, "dhan_seg": "IDX_I", "exp_rule": "NSE_MONTHLY_TUE"},
-    "NIFTY_FIN_SERVICE.NS":  {"name": "FINNIFTY",   "nse": "FINNIFTY",   "lot": 65,   "step": 50,  "is_idx": True,  "dhan_id": 27,  "dhan_seg": "IDX_I", "exp_rule": "NSE_MONTHLY_TUE"},
+    "^NSEI":                 {"name": "NIFTY",      "nse": "NIFTY",      "lot": 75,    "step": 50,  "is_idx": True,  "dhan_id": 13,  "dhan_seg": "IDX_I", "exp_rule": "NSE_WEEKLY_TUE"},
+    "^NSEBANK":              {"name": "BANKNIFTY",  "nse": "BANKNIFTY",  "lot": 30,    "step": 100, "is_idx": True,  "dhan_id": 25,  "dhan_seg": "IDX_I", "exp_rule": "NSE_MONTHLY_TUE"},
+    "^BSESN":                {"name": "SENSEX",     "nse": "SENSEX",     "lot": 20,    "step": 100, "is_idx": True,  "dhan_id": 51,  "dhan_seg": "IDX_I", "exp_rule": "BSE_WEEKLY_THU"},
+    "NIFTY_MID_SELECT.NS":   {"name": "MIDCPNIFTY", "nse": "MIDCPNIFTY", "lot": 120,   "step": 25,  "is_idx": True,  "dhan_id": 442, "dhan_seg": "IDX_I", "exp_rule": "NSE_MONTHLY_TUE"},
+    "NIFTY_FIN_SERVICE.NS":  {"name": "FINNIFTY",   "nse": "FINNIFTY",   "lot": 65,    "step": 50,  "is_idx": True,  "dhan_id": 27,  "dhan_seg": "IDX_I", "exp_rule": "NSE_MONTHLY_TUE"},
 
-    # --- LIQUID NSE F&O STOCKS ---
-    "BAJFINANCE.NS":  {"name": "BAJFINANCE", "nse": "BAJFINANCE", "lot": 125,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "ETERNAL.NS":     {"name": "ETERNAL",    "nse": "ETERNAL",    "lot": 2000, "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "ANGELONE.NS":    {"name": "ANGELONE",   "nse": "ANGELONE",   "lot": 200,  "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "TECHM.NS":       {"name": "TECHM",      "nse": "TECHM",      "lot": 600,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "FEDERALBNK.NS":  {"name": "FEDERALBNK", "nse": "FEDERALBNK", "lot": 5000, "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "WIPRO.NS":       {"name": "WIPRO",      "nse": "WIPRO",      "lot": 3000, "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "LTF.NS":         {"name": "LTF",        "nse": "LTF",        "lot": 4462, "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "CROMPTON.NS":    {"name": "CROMPTON",   "nse": "CROMPTON",   "lot": 1800, "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "PERSISTENT.NS":  {"name": "PERSISTENT", "nse": "PERSISTENT", "lot": 200,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "TCS.NS":         {"name": "TCS",        "nse": "TCS",        "lot": 175,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "OBEROIRLTY.NS":  {"name": "OBEROIRLTY", "nse": "OBEROIRLTY", "lot": 350,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "DIXON.NS":       {"name": "DIXON",      "nse": "DIXON",      "lot": 50,   "step": 200, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "DLF.NS":         {"name": "DLF",        "nse": "DLF",        "lot": 825,  "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "BHARTIARTL.NS":  {"name": "BHARTIARTL", "nse": "BHARTIARTL", "lot": 475,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "AXISBANK.NS":    {"name": "AXISBANK",   "nse": "AXISBANK",   "lot": 625,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "KOTAKBANK.NS":   {"name": "KOTAKBANK",  "nse": "KOTAKBANK",  "lot": 400,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "MARUTI.NS":      {"name": "MARUTI",     "nse": "MARUTI",     "lot": 50,   "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "M&M.NS":         {"name": "M&M",        "nse": "M&M",        "lot": 175,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "LT.NS":          {"name": "LT",         "nse": "LT",         "lot": 150,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "INFY.NS":        {"name": "INFY",       "nse": "INFY",       "lot": 400,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "AUROPHARMA.NS":  {"name": "AUROPHARMA", "nse": "AUROPHARMA", "lot": 550,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "ZYDUSLIFE.NS":   {"name": "ZYDUSLIFE",  "nse": "ZYDUSLIFE",  "lot": 900,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "RBLBANK.NS":     {"name": "RBLBANK",    "nse": "RBLBANK",    "lot": 2500, "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "CONCOR.NS":      {"name": "CONCOR",     "nse": "CONCOR",     "lot": 1250, "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "VOLTAS.NS":      {"name": "VOLTAS",     "nse": "VOLTAS",     "lot": 375,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "TITAN.NS":       {"name": "TITAN",      "nse": "TITAN",      "lot": 175,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "ABB.NS":         {"name": "ABB",        "nse": "ABB",        "lot": 125,  "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "RELIANCE.NS":    {"name": "RELIANCE",   "nse": "RELIANCE",   "lot": 500,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "HDFCBANK.NS":    {"name": "HDFCBANK",   "nse": "HDFCBANK",   "lot": 1100, "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "ICICIBANK.NS":   {"name": "ICICIBANK",  "nse": "ICICIBANK",  "lot": 700,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "SBIN.NS":        {"name": "SBIN",       "nse": "SBIN",       "lot": 750,  "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "TATASTEEL.NS":   {"name": "TATASTEEL",  "nse": "TATASTEEL",  "lot": 5500, "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "HAL.NS":         {"name": "HAL",        "nse": "HAL",        "lot": 150,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "BEL.NS":         {"name": "BEL",        "nse": "BEL",        "lot": 2850, "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "TRENT.NS":       {"name": "TRENT",      "nse": "TRENT",      "lot": 100,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "CAMS.NS":        {"name": "CAMS",       "nse": "CAMS",       "lot": 750,  "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "NTPC.NS":        {"name": "NTPC",       "nse": "NTPC",       "lot": 1500, "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "ADANIPORTS.NS":  {"name": "ADANIPORTS", "nse": "ADANIPORTS", "lot": 400,  "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "INDHOTEL.NS":    {"name": "INDHOTEL",   "nse": "INDHOTEL",   "lot": 1000, "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "MOTHERSON.NS":   {"name": "MOTHERSON",  "nse": "MOTHERSON",  "lot": 4100, "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "NYKAA.NS":       {"name": "NYKAA",      "nse": "NYKAA",      "lot": 3125, "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
-    "SUPREMEIND.NS":  {"name": "SUPREMEIND", "nse": "SUPREMEIND", "lot": 175,  "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    # --- CORE 42 LIQUID NSE F&O STOCKS ---
+    "BAJFINANCE.NS":  {"name": "BAJFINANCE", "nse": "BAJFINANCE", "lot": 125,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ETERNAL.NS":     {"name": "ETERNAL",    "nse": "ETERNAL",    "lot": 2000,  "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ANGELONE.NS":    {"name": "ANGELONE",   "nse": "ANGELONE",   "lot": 200,   "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "TECHM.NS":       {"name": "TECHM",      "nse": "TECHM",      "lot": 600,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "FEDERALBNK.NS":  {"name": "FEDERALBNK", "nse": "FEDERALBNK", "lot": 5000,  "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "WIPRO.NS":       {"name": "WIPRO",      "nse": "WIPRO",      "lot": 3000,  "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "LTF.NS":         {"name": "LTF",        "nse": "LTF",        "lot": 4462,  "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "CROMPTON.NS":    {"name": "CROMPTON",   "nse": "CROMPTON",   "lot": 1800,  "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "PERSISTENT.NS":  {"name": "PERSISTENT", "nse": "PERSISTENT", "lot": 200,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "TCS.NS":         {"name": "TCS",        "nse": "TCS",        "lot": 175,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "OBEROIRLTY.NS":  {"name": "OBEROIRLTY", "nse": "OBEROIRLTY", "lot": 350,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "DIXON.NS":       {"name": "DIXON",      "nse": "DIXON",      "lot": 50,    "step": 200, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "DLF.NS":         {"name": "DLF",        "nse": "DLF",        "lot": 825,   "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "BHARTIARTL.NS":  {"name": "BHARTIARTL", "nse": "BHARTIARTL", "lot": 475,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "AXISBANK.NS":    {"name": "AXISBANK",   "nse": "AXISBANK",   "lot": 625,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "KOTAKBANK.NS":   {"name": "KOTAKBANK",  "nse": "KOTAKBANK",  "lot": 400,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "MARUTI.NS":      {"name": "MARUTI",     "nse": "MARUTI",     "lot": 50,    "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "M&M.NS":         {"name": "M&M",        "nse": "M&M",        "lot": 175,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "LT.NS":          {"name": "LT",         "nse": "LT",         "lot": 150,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "INFY.NS":        {"name": "INFY",       "nse": "INFY",       "lot": 400,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "AUROPHARMA.NS":  {"name": "AUROPHARMA", "nse": "AUROPHARMA", "lot": 550,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ZYDUSLIFE.NS":   {"name": "ZYDUSLIFE",  "nse": "ZYDUSLIFE",  "lot": 900,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "RBLBANK.NS":     {"name": "RBLBANK",    "nse": "RBLBANK",    "lot": 2500,  "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "CONCOR.NS":      {"name": "CONCOR",     "nse": "CONCOR",     "lot": 1250,  "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "VOLTAS.NS":      {"name": "VOLTAS",     "nse": "VOLTAS",     "lot": 375,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "TITAN.NS":       {"name": "TITAN",      "nse": "TITAN",      "lot": 175,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ABB.NS":         {"name": "ABB",        "nse": "ABB",        "lot": 125,   "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "RELIANCE.NS":    {"name": "RELIANCE",   "nse": "RELIANCE",   "lot": 500,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "HDFCBANK.NS":    {"name": "HDFCBANK",   "nse": "HDFCBANK",   "lot": 1100,  "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ICICIBANK.NS":   {"name": "ICICIBANK",  "nse": "ICICIBANK",  "lot": 700,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "SBIN.NS":        {"name": "SBIN",       "nse": "SBIN",       "lot": 750,   "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "TATASTEEL.NS":   {"name": "TATASTEEL",  "nse": "TATASTEEL",  "lot": 5500,  "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "HAL.NS":         {"name": "HAL",        "nse": "HAL",        "lot": 150,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "BEL.NS":         {"name": "BEL",        "nse": "BEL",        "lot": 2850,  "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "TRENT.NS":       {"name": "TRENT",      "nse": "TRENT",      "lot": 100,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "CAMS.NS":        {"name": "CAMS",       "nse": "CAMS",       "lot": 750,   "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "NTPC.NS":        {"name": "NTPC",       "nse": "NTPC",       "lot": 1500,  "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ADANIPORTS.NS":  {"name": "ADANIPORTS", "nse": "ADANIPORTS", "lot": 400,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "INDHOTEL.NS":    {"name": "INDHOTEL",   "nse": "INDHOTEL",   "lot": 1000,  "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "MOTHERSON.NS":   {"name": "MOTHERSON",  "nse": "MOTHERSON",  "lot": 4100,  "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "NYKAA.NS":       {"name": "NYKAA",      "nse": "NYKAA",      "lot": 3125,  "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "SUPREMEIND.NS":  {"name": "SUPREMEIND", "nse": "SUPREMEIND", "lot": 175,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+
+    # --- EXPANDED 58 SENSIBULL F&O STOCKS (NOV-08 & NOV-11 MERGED, AUTO LOT-SYNCED) ---
+    "APOLLOHOSP.NS":  {"name": "APOLLOHOSP", "nse": "APOLLOHOSP", "lot": 75,    "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ASHOKLEY.NS":    {"name": "ASHOKLEY",   "nse": "ASHOKLEY",   "lot": 2500,  "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ASIANPAINT.NS":  {"name": "ASIANPAINT", "nse": "ASIANPAINT", "lot": 150,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ASTRAL.NS":      {"name": "ASTRAL",     "nse": "ASTRAL",     "lot": 300,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ATHERENERG.NS":  {"name": "ATHERENERG", "nse": "ATHERENERG", "lot": 300,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "BAJAJ-AUTO.NS":  {"name": "BAJAJ-AUTO", "nse": "BAJAJ-AUTO", "lot": 75,    "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "BANKBARODA.NS":  {"name": "BANKBARODA", "nse": "BANKBARODA", "lot": 2925,  "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "BHARATFORG.NS":  {"name": "BHARATFORG", "nse": "BHARATFORG", "lot": 300,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "BHEL.NS":        {"name": "BHEL",       "nse": "BHEL",       "lot": 1250,  "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "BPCL.NS":        {"name": "BPCL",       "nse": "BPCL",       "lot": 1250,  "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "BSE.NS":         {"name": "BSE",        "nse": "BSE",        "lot": 150,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "CANBK.NS":       {"name": "CANBK",      "nse": "CANBK",      "lot": 5000,  "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "CDSL.NS":        {"name": "CDSL",       "nse": "CDSL",       "lot": 350,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "CGPOWER.NS":     {"name": "CGPOWER",    "nse": "CGPOWER",    "lot": 600,   "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "CHOLAFIN.NS":    {"name": "CHOLAFIN",   "nse": "CHOLAFIN",   "lot": 300,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "COALINDIA.NS":   {"name": "COALINDIA",  "nse": "COALINDIA",  "lot": 1250,  "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "COCHINSHIP.NS":  {"name": "COCHINSHIP", "nse": "COCHINSHIP", "lot": 300,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "COFORGE.NS":     {"name": "COFORGE",    "nse": "COFORGE",    "lot": 300,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "CUMMINSIND.NS":  {"name": "CUMMINSIND", "nse": "CUMMINSIND", "lot": 150,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "DATAPATTNS.NS":  {"name": "DATAPATTNS", "nse": "DATAPATTNS", "lot": 150,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "DIVISLAB.NS":    {"name": "DIVISLAB",   "nse": "DIVISLAB",   "lot": 75,    "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "EICHERMOT.NS":   {"name": "EICHERMOT",  "nse": "EICHERMOT",  "lot": 75,    "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "GLENMARK.NS":    {"name": "GLENMARK",   "nse": "GLENMARK",   "lot": 150,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "GRASIM.NS":      {"name": "GRASIM",     "nse": "GRASIM",     "lot": 250,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "GVT&D.NS":       {"name": "GVT&D",      "nse": "GVT&D",      "lot": 150,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "HCLTECH.NS":     {"name": "HCLTECH",    "nse": "HCLTECH",    "lot": 300,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "HDFCAMC.NS":     {"name": "HDFCAMC",    "nse": "HDFCAMC",    "lot": 150,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "HINDALCO.NS":    {"name": "HINDALCO",   "nse": "HINDALCO",   "lot": 600,   "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "HINDPETRO.NS":   {"name": "HINDPETRO",  "nse": "HINDPETRO",  "lot": 1350,  "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "INDIGO.NS":      {"name": "INDIGO",     "nse": "INDIGO",     "lot": 75,    "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "INDUSINDBK.NS":  {"name": "INDUSINDBK", "nse": "INDUSINDBK", "lot": 600,   "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "IREDA.NS":       {"name": "IREDA",      "nse": "IREDA",      "lot": 3000,  "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "IRFC.NS":        {"name": "IRFC",       "nse": "IRFC",       "lot": 4000,  "step": 1.0, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ITC.NS":         {"name": "ITC",        "nse": "ITC",        "lot": 2500,  "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "JIOFIN.NS":      {"name": "JIOFIN",     "nse": "JIOFIN",     "lot": 2500,  "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "JSWSTEEL.NS":    {"name": "JSWSTEEL",   "nse": "JSWSTEEL",   "lot": 300,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "KALYANKJIL.NS":  {"name": "KALYANKJIL", "nse": "KALYANKJIL", "lot": 1250,  "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "LAURUSLABS.NS":  {"name": "LAURUSLABS", "nse": "LAURUSLABS", "lot": 300,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "MANKIND.NS":     {"name": "MANKIND",    "nse": "MANKIND",    "lot": 250,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "MCX.NS":         {"name": "MCX",        "nse": "MCX",        "lot": 150,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "MPHASIS.NS":     {"name": "MPHASIS",    "nse": "MPHASIS",    "lot": 150,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "MUTHOOTFIN.NS":  {"name": "MUTHOOTFIN", "nse": "MUTHOOTFIN", "lot": 275,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "NAVINFLUOR.NS":  {"name": "NAVINFLUOR", "nse": "NAVINFLUOR", "lot": 75,    "step": 100, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ONGC.NS":        {"name": "ONGC",       "nse": "ONGC",       "lot": 2500,  "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "PATANJALI.NS":   {"name": "PATANJALI",  "nse": "PATANJALI",  "lot": 1250,  "step": 5,   "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "PAYTM.NS":       {"name": "PAYTM",      "nse": "PAYTM",      "lot": 300,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "PIIND.NS":       {"name": "PIIND",      "nse": "PIIND",      "lot": 300,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "PNB.NS":         {"name": "PNB",        "nse": "PNB",        "lot": 4000,  "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "POWERGRID.NS":   {"name": "POWERGRID",  "nse": "POWERGRID",  "lot": 2500,  "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "POWERINDIA.NS":  {"name": "POWERINDIA", "nse": "POWERINDIA", "lot": 25,    "step": 200, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "RVNL.NS":        {"name": "RVNL",       "nse": "RVNL",       "lot": 2500,  "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "SHRIRAMFIN.NS":  {"name": "SHRIRAMFIN", "nse": "SHRIRAMFIN", "lot": 600,   "step": 10,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "SOLARINDS.NS":   {"name": "SOLARINDS",  "nse": "SOLARINDS",  "lot": 25,    "step": 200, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "SUNPHARMA.NS":   {"name": "SUNPHARMA",  "nse": "SUNPHARMA",  "lot": 300,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "SWIGGY.NS":      {"name": "SWIGGY",     "nse": "SWIGGY",     "lot": 2500,  "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "SYRMA.NS":       {"name": "SYRMA",      "nse": "SYRMA",      "lot": 300,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "TVSMOTOR.NS":    {"name": "TVSMOTOR",   "nse": "TVSMOTOR",   "lot": 175,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "ULTRACEMCO.NS":  {"name": "ULTRACEMCO", "nse": "ULTRACEMCO", "lot": 25,    "step": 200, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "UNIONBANK.NS":   {"name": "UNIONBANK",  "nse": "UNIONBANK",  "lot": 2500,  "step": 2.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "UNOMINDA.NS":    {"name": "UNOMINDA",   "nse": "UNOMINDA",   "lot": 300,   "step": 20,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "WAAREEENER.NS":  {"name": "WAAREEENER", "nse": "WAAREEENER", "lot": 200,   "step": 50,  "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
+    "YESBANK.NS":     {"name": "YESBANK",    "nse": "YESBANK",    "lot": 15000, "step": 0.5, "is_idx": False, "exp_rule": "NSE_MONTHLY_TUE"},
 }
 
 
 def _tick(x: float) -> float:
+    """Round to the 0.05 NSE option tick."""
     return round(round(x / 0.05) * 0.05, 2)
 
 
@@ -262,6 +356,14 @@ def is_market_open_now() -> bool:
         and now.date() not in NSE_HOLIDAYS_2026
         and (9, 15) <= (now.hour, now.minute) < (15, 30)
     )
+
+
+def get_last_trading_day(ref_dt: date) -> date:
+    """Returns the most recent valid NSE trading day on or before ref_dt."""
+    d = ref_dt
+    while d.weekday() >= 5 or d in NSE_HOLIDAYS_2026:
+        d -= timedelta(days=1)
+    return d
 
 
 # ==============================================================================
@@ -325,13 +427,12 @@ class DhanOptionEngine:
         self.enabled = bool(self.client_id and self.access_token)
         self.eq_sec_map = {}
         self.fut_sec_map = {}
-        self.fut_prev_oi_map = {}   # OI-FIX: Dhan previous-close futures OI (true baseline)
         self.lot_map = {}
         self.expiry_cache = {}
         self.chain_cache = {}
         self.last_call_start = 0.0
         self.last_call_end = 0.0
-        self.chain_gap = 3.8
+        self.chain_gap = 3.2
         self.consec_429 = 0
         self.attempted_401_heal = False
         self.live_quotes_fetched = 0
@@ -387,9 +488,9 @@ class DhanOptionEngine:
 
     def _on_429(self, label: str):
         self.consec_429 += 1
-        self.chain_gap = min(self.chain_gap + 0.8, 6.0)
-        print(f"⚠️ Dhan {label} HTTP 429 -- cooling down 6s, gap now {self.chain_gap:.1f}s")
-        time.sleep(6)
+        self.chain_gap = min(self.chain_gap + 0.6, 5.5)
+        print(f"⚠️ Dhan {label} HTTP 429 -- cooling down 4s, gap now {self.chain_gap:.1f}s")
+        time.sleep(4)
 
     def _load_public_security_master(self):
         cache_file = "dhan_scrip_master_cache.csv"
@@ -523,11 +624,12 @@ class DhanOptionEngine:
                     if sym and isinstance(q, dict):
                         oi_val = float(q.get("oi") or q.get("open_interest") or 0.0)
                         if oi_val > 0:
-                            curr_oi_map[sym] = oi_val
-                            # OI-FIX: keep Dhan's own previous-close OI (same field swing_scanner uses)
-                            prev_oi_val = float(q.get("previous_close_oi") or 0.0)
-                            if prev_oi_val > 0:
-                                self.fut_prev_oi_map[sym] = prev_oi_val
+                            curr_oi_map[sym] = {
+                                "curr_oi": oi_val,
+                                "prev_oi": float(q.get("previous_close_oi") or 0.0),
+                                "oi_day_high": float(q.get("oi_day_high") or 0.0),
+                                "oi_day_low": float(q.get("oi_day_low") or 0.0),
+                            }
                 except Exception:
                     continue
 
@@ -550,7 +652,7 @@ class DhanOptionEngine:
     def _fetch_expiry_list(self, sec_id: int, seg: str, cache_key: str) -> list:
         if cache_key in self.expiry_cache:
             return self.expiry_cache[cache_key]
-        if self.consec_429 >= 2:
+        if self.consec_429 >= 4:
             return []
         for attempt in (1, 2):
             self._throttle()
@@ -583,7 +685,7 @@ class DhanOptionEngine:
         ck = (int(sec_id), expiry)
         if ck in self.chain_cache:
             return self.chain_cache[ck]
-        if self.consec_429 >= 2:
+        if self.consec_429 >= 4:
             return None
         for attempt in (1, 2):
             self._throttle()
@@ -653,8 +755,10 @@ class DhanOptionEngine:
 
         return {"pcr": pcr, "max_pain": max_pain, "call_wall": call_wall, "put_wall": put_wall}
 
-    def get_live_atm_option(self, meta: dict, atm_strike: float, opt_type: str, min_dte: int, otm_steps: int = 0):
-        if not self.enabled or self.consec_429 >= 2:
+    def get_live_atm_option(
+        self, meta: dict, atm_strike: float, opt_type: str, min_dte: int, otm_steps: int = 0, use_target_strike: bool = False
+    ):
+        if not self.enabled or self.consec_429 >= 4:
             return None
         sec_id = meta.get("dhan_id") or self.eq_sec_map.get(meta["nse"])
         seg = meta.get("dhan_seg", "NSE_EQ")
@@ -683,25 +787,24 @@ class DhanOptionEngine:
             if not chosen_expiry:
                 return None
 
+            ck_before = (int(sec_id), chosen_expiry) in self.chain_cache
             chain_data = self._fetch_option_chain(int(sec_id), seg, chosen_expiry)
             if not chain_data or not chain_data.get("oc"):
                 return None
 
             oc_data = chain_data["oc"]
             raw_und_ltp = float(chain_data.get("last_price") or atm_strike)
-            if abs(raw_und_ltp - atm_strike) / max(atm_strike, 1.0) > 0.05:
-                und_ltp = float(atm_strike)
-            else:
-                und_ltp = raw_und_ltp
+            und_ltp = float(atm_strike) if abs(raw_und_ltp - atm_strike) / max(atm_strike, 1.0) > 0.05 else raw_und_ltp
 
             strike_keys = sorted([float(k) for k in oc_data.keys()])
             if not strike_keys:
                 return None
 
             step = get_dynamic_strike_step(und_ltp, meta)
-            target_ref = und_ltp + (otm_steps * step if opt_type == "CE" else -otm_steps * step)
+            base_ref = atm_strike if use_target_strike else und_ltp
+            target_ref = base_ref + (otm_steps * step if opt_type == "CE" else -otm_steps * step)
             best_strike = min(strike_keys, key=lambda x: abs(x - target_ref))
-            if abs(best_strike - target_ref) / max(target_ref, 1.0) > 0.06:
+            if abs(best_strike - target_ref) / max(target_ref, 1.0) > 0.08:
                 return None
 
             raw_key = next(k for k in oc_data.keys() if abs(float(k) - best_strike) < 1e-4)
@@ -716,14 +819,14 @@ class DhanOptionEngine:
             exp_label = datetime.strptime(chosen_expiry, "%Y-%m-%d").strftime("%d%b").upper()
 
             structure = self._compute_chain_structure(oc_data, und_ltp)
-            if otm_steps == 0:
+            if not ck_before:
                 self.live_quotes_fetched += 1
             return {
                 "ltp": ltp,
                 "bid": bid,
                 "ask": ask,
                 "und_ltp": und_ltp,
-                "delta": max(abs(float(greeks.get("delta") or (0.32 if otm_steps > 0 else 0.48))), 0.15),
+                "delta": max(abs(float(greeks.get("delta") or (0.34 if otm_steps > 0 else 0.48))), 0.16),
                 "gamma": max(float(greeks.get("gamma") or 0.0015), 0.0001),
                 "theta": abs(float(greeks.get("theta") or 0.0)),
                 "iv": max(float(leg.get("implied_volatility") or 18.0) / 100.0, 0.11),
@@ -740,7 +843,7 @@ class DhanOptionEngine:
 
 
 # ==============================================================================
-# 🕸️ 5. PATCH B: UNIFIED DUAL-SOURCE OI FUSION ENGINE (dhan_oi_baseline.json)
+# 🕸️ 5. UNIFIED FUTURES-FIRST OI FUSION ENGINE (HOLIDAY/WEEKEND-SAFE)
 # ==============================================================================
 def fetch_nse_oi_spurts_map() -> dict:
     base_url = "https://www.nseindia.com"
@@ -773,9 +876,52 @@ def fetch_nse_oi_spurts_map() -> dict:
     return oi_map
 
 
+def _load_oi_baseline_cache() -> dict:
+    if os.path.exists(OI_BASELINE_CACHE_FILE):
+        try:
+            with open(OI_BASELINE_CACHE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            if isinstance(raw, dict):
+                if "prev_oi" in raw or "latest_oi" in raw:
+                    raw.setdefault("latest_date", "")
+                    raw.setdefault("prev_oi", {})
+                    raw.setdefault("latest_oi", {})
+                    return raw
+                src_node = raw.get("baseline") if isinstance(raw.get("baseline"), dict) else raw
+                migrated_prev = {}
+                for k, v in src_node.items():
+                    norm_k = normalize_nse_symbol(k)
+                    if isinstance(v, (int, float)) and v > 0:
+                        migrated_prev[norm_k] = int(round(float(v)))
+                    elif isinstance(v, dict):
+                        b_val = v.get("baseline_oi") or v.get("prev_oi") or v.get("oi")
+                        if isinstance(b_val, (int, float)) and b_val > 0:
+                            migrated_prev[norm_k] = int(round(float(b_val)))
+                return {"latest_date": "", "prev_oi": migrated_prev, "latest_oi": {}}
+        except Exception as e:
+            print(f"⚠️ OI Baseline cache read warning: {e}")
+    return {"latest_date": "", "prev_oi": {}, "latest_oi": {}}
+
+
+def _save_oi_baseline_cache(cache_obj: dict) -> None:
+    try:
+        with open(OI_BASELINE_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache_obj, f, indent=2)
+    except Exception as e:
+        print(f"⚠️ OI Baseline cache write warning: {e}")
+
+
 def fuse_dhan_and_nse_oi(dhan_engine: DhanOptionEngine) -> tuple[dict, dict, str]:
+    """
+    Unified Futures-First OI Arbitration Engine (Synchronized with swing_scanner.py & Sensibull):
+    1. Uses get_last_trading_day() so weekends and NSE holidays (e.g. 2026-11-10) never roll `prev_oi`.
+    2. Prioritizes Dhan Near-Month Futures OI (`dhan_pct`) whenever `base_oi > 0` so index & stock OI
+       match Sensibull's `FutureOIPercentChange` instead of NSE's combined Options+Futures `avgInOI`.
+    3. Never overwrites an existing Futures `prev_oi` baseline with NSE's combined Options+Futures percentage.
+    """
     ist = pytz.timezone("Asia/Kolkata")
-    today_str = datetime.now(ist).strftime("%Y-%m-%d")
+    now_ist = datetime.now(ist)
+    active_trade_str = get_last_trading_day(now_ist.date()).strftime("%Y-%m-%d")
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         fut_nse = pool.submit(fetch_nse_oi_spurts_map)
@@ -783,99 +929,122 @@ def fuse_dhan_and_nse_oi(dhan_engine: DhanOptionEngine) -> tuple[dict, dict, str
         nse_oi_map = fut_nse.result()
         dhan_curr_oi, dhan_spot_snap = fut_dhan.result()
 
-    cache_data = {"latest_date": today_str, "prev_oi": {}, "latest_oi": {}}
-    if os.path.exists(OI_BASELINE_CACHE_FILE):
-        try:
-            with open(OI_BASELINE_CACHE_FILE, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-            if isinstance(loaded, dict):
-                if "prev_oi" in loaded and "latest_oi" in loaded:
-                    cache_data = loaded
-                else:
-                    flat_prev = {normalize_nse_symbol(k): float(v) for k, v in loaded.items() if isinstance(v, (int, float))}
-                    cache_data = {"latest_date": today_str, "prev_oi": flat_prev, "latest_oi": dict(flat_prev)}
-        except Exception as e:
-            print(f"⚠️ OI Baseline cache read warning: {e}")
+    cache = _load_oi_baseline_cache()
+    cached_dt_str = str(cache.get("latest_date") or "")
 
-    prev_oi_map = {normalize_nse_symbol(k): float(v) for k, v in (cache_data.get("prev_oi") or {}).items() if isinstance(v, (int, float))}
-    latest_oi_map = {normalize_nse_symbol(k): float(v) for k, v in (cache_data.get("latest_oi") or {}).items() if isinstance(v, (int, float))}
-    cached_date = str(cache_data.get("latest_date") or "")
+    # Roll latest_oi -> prev_oi ONLY when active_trade_str advances to a new valid NSE trading day
+    if cached_dt_str and cached_dt_str != active_trade_str and cache.get("latest_oi"):
+        for sym_k, l_val in cache["latest_oi"].items():
+            if isinstance(l_val, (int, float)) and l_val > 0:
+                cache.setdefault("prev_oi", {})[normalize_nse_symbol(sym_k)] = int(round(float(l_val)))
 
-    if cached_date and cached_date != today_str and latest_oi_map:
-        for sym_k, l_val in latest_oi_map.items():
-            if l_val > 0:
-                prev_oi_map[sym_k] = l_val
-        cached_date = today_str
+    prev_oi_store = cache.setdefault("prev_oi", {})
+    latest_oi_store = cache.setdefault("latest_oi", {})
 
-    fused_oi_map = dict(nse_oi_map)
+    norm_nse = {normalize_nse_symbol(k): float(v) for k, v in (nse_oi_map or {}).items()}
+    norm_dhan = {normalize_nse_symbol(k): v for k, v in (dhan_curr_oi or {}).items()}
+
+    fused_oi_map = {}
     dhan_computed_cnt = 0
-    cache_dirty = (cached_date != cache_data.get("latest_date"))
+    all_syms = set(norm_nse.keys()) | set(norm_dhan.keys())
 
-    for sym, curr_oi in dhan_curr_oi.items():
-        norm_sym = normalize_nse_symbol(sym)
-        if curr_oi <= 0:
-            continue
-        latest_oi_map[norm_sym] = round(float(curr_oi), 2)
-        # OI-FIX: prefer Dhan's true previous-close OI; ignore it if it equals current OI
-        # (post-market reset, same trap as Patch C) and fall back to the local JSON baseline.
-        api_prev_oi = float(dhan_engine.fut_prev_oi_map.get(sym, 0.0) or 0.0)
-        if api_prev_oi > 0 and abs(api_prev_oi - curr_oi) > 1e-6:
-            base_oi = api_prev_oi
+    for sym in all_syms:
+        dq = norm_dhan.get(sym, {})
+        if isinstance(dq, (int, float)):
+            curr_oi, api_prev_oi, oi_high, oi_low = float(dq), 0.0, 0.0, 0.0
         else:
-            base_oi = prev_oi_map.get(norm_sym, 0.0)
-        nse_pct = nse_oi_map.get(norm_sym)
+            curr_oi = float(dq.get("curr_oi", 0.0) or 0.0)
+            api_prev_oi = float(dq.get("prev_oi", 0.0) or 0.0)
+            oi_high = float(dq.get("oi_day_high", 0.0) or 0.0)
+            oi_low = float(dq.get("oi_day_low", 0.0) or 0.0)
 
-        if base_oi > 0:
-            dhan_pct = ((curr_oi - base_oi) / base_oi) * 100.0
-            if abs(dhan_pct) >= 0.05 or nse_pct is None:
-                fused_oi_map[norm_sym] = round(dhan_pct, 2)
+        nse_pct = norm_nse.get(sym, None)
+
+        # Only seed prev_oi from NSE if sym has NO baseline at all (cold start for brand-new stock)
+        if sym not in prev_oi_store and curr_oi > 0 and nse_pct is not None and abs(nse_pct) > 0.01:
+            denom = 1.0 + (nse_pct / 100.0)
+            if denom > 0.1:
+                prev_oi_store[sym] = int(round(curr_oi / denom))
+
+        dhan_pct = None
+        base_oi = api_prev_oi if api_prev_oi > 0 else float(prev_oi_store.get(sym, 0) or 0)
+        if curr_oi > 0 and base_oi > 0:
+            dhan_pct = round(((curr_oi - base_oi) / base_oi) * 100.0, 2)
+            dhan_computed_cnt += 1
+        elif curr_oi > 0 and (oi_low > 0 or oi_high > 0):
+            if oi_low > 0 and (oi_high - curr_oi) <= (curr_oi - oi_low):
+                dhan_pct = round(((curr_oi - oi_low) / oi_low) * 100.0, 2)
+            elif oi_high > 0:
+                dhan_pct = round(((curr_oi - oi_high) / oi_high) * 100.0, 2)
+            if dhan_pct is not None:
                 dhan_computed_cnt += 1
-            elif nse_pct is not None:
-                fused_oi_map[norm_sym] = round(float(nse_pct), 2)
-            cache_dirty = True
-        elif nse_pct is not None and (1.0 + (nse_pct / 100.0)) > 0.1:
-            seeded_base = round(curr_oi / (1.0 + (nse_pct / 100.0)), 2)
-            prev_oi_map[norm_sym] = seeded_base
-            fused_oi_map[norm_sym] = round(float(nse_pct), 2)
-            cache_dirty = True
 
-    if cache_dirty or dhan_curr_oi:
-        try:
-            out_payload = {"latest_date": today_str, "prev_oi": prev_oi_map, "latest_oi": latest_oi_map}
-            with open(OI_BASELINE_CACHE_FILE, "w", encoding="utf-8") as f:
-                json.dump(out_payload, f, indent=2)
-        except Exception as e:
-            print(f"⚠️ OI Baseline cache write warning: {e}")
+        if curr_oi > 0:
+            latest_oi_store[sym] = int(round(curr_oi))
 
-    status_tag = f"Dual-OI ({len(fused_oi_map)} | Dhan:{dhan_computed_cnt} NSE:{len(nse_oi_map)})"
+        # Unified Futures-First Arbitration: Always prefer Dhan near-month Futures OI when non-zero
+        if dhan_pct is not None and abs(dhan_pct) >= 0.05:
+            fused_oi_map[sym] = round(float(dhan_pct), 2)
+        elif nse_pct is not None:
+            fused_oi_map[sym] = round(float(nse_pct), 2)
+        elif dhan_pct is not None:
+            fused_oi_map[sym] = round(float(dhan_pct), 2)
+
+    if latest_oi_store:
+        cache["latest_date"] = active_trade_str
+        _save_oi_baseline_cache(cache)
+
+    status_tag = f"Dual-OI ({len(fused_oi_map)} | D:{dhan_computed_cnt} N:{len(norm_nse)})"
     print(f"✅ Dual-Source OI Fusion Complete: {status_tag}")
     return fused_oi_map, dhan_spot_snap, status_tag
 
 
-def classify_institutional_oi(price_chg_pct: float, oi_chg_pct: float, opt_type: str):
-    if abs(oi_chg_pct) < 0.5:
-        return False, False, "   --  "
+def classify_institutional_oi(
+    price_chg_pct: float, oi_chg_pct: float, opt_type: str, is_idx: bool = False, rvol: float = 1.0, adx: float = 20.0
+):
+    if not is_idx:
+        if opt_type == "CE" and price_chg_pct < 0.12:
+            return True, False, f"PX{price_chg_pct:+4.1f}%"
+        if opt_type == "PE" and price_chg_pct > -0.12:
+            return True, False, f"PX{price_chg_pct:+4.1f}%"
+
+    if abs(oi_chg_pct) < 0.4:
+        has_rvol_squeeze = (not is_idx) and (rvol >= HIGH_CONV_RVOL_SQUEEZE) and (adx >= 18.0) and (abs(price_chg_pct) >= 0.45)
+        return False, has_rvol_squeeze, ("RV-SQZ " if has_rvol_squeeze else "   --  ")
 
     sign_str = f"{oi_chg_pct:+.0f}%"
-    if price_chg_pct >= 0.0 and oi_chg_pct >= 2.5:
+
+    # 1. Long Buildup (Price Up + OI Up >= +1.5%)
+    if price_chg_pct >= 0.0 and oi_chg_pct >= 1.5:
         if opt_type == "PE":
             return True, False, f"LB{sign_str:>5}"
         return False, True, f"LB{sign_str:>5}"
 
-    if price_chg_pct < 0.0 and oi_chg_pct >= 2.5:
+    # 2. Short Buildup (Price Down + OI Up >= +1.5%)
+    if price_chg_pct < 0.0 and oi_chg_pct >= 1.5:
         if opt_type == "CE":
             return True, False, f"SB{sign_str:>5}"
         return False, True, f"SB{sign_str:>5}"
 
-    if price_chg_pct >= 0.2 and oi_chg_pct <= -2.0:
+    # 3. Short Covering Rally (Price Up + OI Down <= -1.0%)
+    if price_chg_pct >= 0.20 and oi_chg_pct <= -1.0:
         if opt_type == "PE":
             return True, False, f"SC{sign_str:>5}"
-        return False, True, f"SC{sign_str:>5}"
+        allow_sc_boost = is_idx or (rvol >= HIGH_CONV_RVOL_SQUEEZE and price_chg_pct >= 0.45 and adx >= 17.5)
+        return False, allow_sc_boost, f"SC{sign_str:>5}"
 
-    if price_chg_pct <= -0.2 and oi_chg_pct <= -2.0:
+    # 4. Long Unwinding Drop (Price Down + OI Down <= -1.0%)
+    if price_chg_pct <= -0.20 and oi_chg_pct <= -1.0:
         if opt_type == "CE":
             return True, False, f"LU{sign_str:>5}"
-        return False, True, f"LU{sign_str:>5}"
+        allow_lu_boost = is_idx or (rvol >= HIGH_CONV_RVOL_SQUEEZE and price_chg_pct <= -0.45 and adx >= 17.5)
+        return False, allow_lu_boost, f"LU{sign_str:>5}"
+
+    # 5. Early Accumulation (+0.6% to +1.5% OI) with High RVOL
+    if not is_idx and oi_chg_pct >= 0.6 and rvol >= HIGH_CONV_RVOL_SQUEEZE and adx >= 17.5:
+        if (opt_type == "CE" and price_chg_pct >= 0.35) or (opt_type == "PE" and price_chg_pct <= -0.35):
+            tag_prefix = "LB" if opt_type == "CE" else "SB"
+            return False, True, f"{tag_prefix}{sign_str:>5}"
 
     return False, False, f"OI{sign_str:>5}"
 
@@ -955,7 +1124,11 @@ def black_scholes_greeks(S, K, T, r, sigma, option_type="CE"):
 def get_dynamic_strike_step(spot: float, meta: dict) -> float:
     if meta["is_idx"] or meta.get("step", 0) >= 50:
         return float(meta["step"])
-    if spot < 250:
+    if spot < 50:
+        return 0.5 if meta.get("step") == 0.5 else 1.0
+    elif spot < 110:
+        return 1.0 if meta.get("step") == 1.0 else 2.5
+    elif spot < 250:
         return 2.5 if meta["step"] == 2.5 else 5.0
     elif spot < 600:
         return 5.0 if spot < 400 else 10.0
@@ -968,10 +1141,29 @@ def get_dynamic_strike_step(spot: float, meta: dict) -> float:
     return 100.0
 
 
+def compute_wilder_atr_and_adx(df: pd.DataFrame, period: int = 14):
+    h, l, c = df["High"], df["Low"], df["Close"]
+    prev_c = c.shift(1)
+    tr = pd.concat([h - l, (h - prev_c).abs(), (l - prev_c).abs()], axis=1).max(axis=1)
+    atr = tr.ewm(alpha=1.0 / period, adjust=False).mean()
+
+    up_move = h.diff()
+    down_move = -l.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+
+    plus_di = 100.0 * pd.Series(plus_dm, index=df.index).ewm(alpha=1.0 / period, adjust=False).mean() / atr.replace(0, np.nan)
+    minus_di = 100.0 * pd.Series(minus_dm, index=df.index).ewm(alpha=1.0 / period, adjust=False).mean() / atr.replace(0, np.nan)
+    dx = (100.0 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0.0)
+    adx = dx.ewm(alpha=1.0 / period, adjust=False).mean().fillna(20.0)
+    return atr, adx
+
+
 def compute_daily_indicators(df):
     df = df.copy()
     c, o, h, l = df["Close"], df["Open"], df["High"], df["Low"]
 
+    df["EMA9"]  = c.ewm(span=9, adjust=False).mean()
     df["EMA21"] = c.ewm(span=21, adjust=False).mean()
     df["EMA55"] = c.ewm(span=55, adjust=False).mean()
 
@@ -991,8 +1183,7 @@ def compute_daily_indicators(df):
     df["RSI"] = (100 - (100 / (1 + (gain / loss.replace(0, np.nan))))).fillna(50.0)
     df["RSI_SMA"] = df["RSI"].rolling(14).mean().fillna(50.0)
 
-    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    df["ATR"] = tr.rolling(14).mean()
+    df["ATR"], df["ADX"] = compute_wilder_atr_and_adx(df, 14)
     df["HV20"] = np.log(c / c.shift(1)).rolling(20).std() * np.sqrt(252)
 
     hv_min = df["HV20"].rolling(252, min_periods=40).min()
@@ -1017,19 +1208,23 @@ def compute_daily_indicators(df):
         & (upper_wick_ratio >= 0.55)
     )
 
+    is_rvol_breakout = df["RVOL"] >= BREAKOUT_REGIME_RVOL
+    ce_bb_ok = (c < df["BB_UP_38"] * 0.998) | (is_rvol_breakout & (c <= df["BB_UP_38"] * 1.022) & (c > o))
+    pe_bb_ok = (c > df["BB_LO_38"] * 1.002) | (is_rvol_breakout & (c >= df["BB_LO_38"] * 0.978) & (c < o))
+    ce_rsi_ok = (df["RSI"] >= 46) & ((df["RSI"] <= 71) | (is_rvol_breakout & (df["RSI"] <= 77)))
+    pe_rsi_ok = (df["RSI"] <= 54) & ((df["RSI"] >= 29) | (is_rvol_breakout & (df["RSI"] >= 23)))
+
     df["CE_Signal"] = (
         (c >= df["EMA21"] * 0.997)
-        & (c < df["BB_UP_38"] * 0.995)
-        & (df["RSI"] >= 46)
-        & (df["RSI"] <= 70)
+        & ce_bb_ok
+        & ce_rsi_ok
         & (df["RSI"] >= df["RSI_SMA"] * 0.98)
         & (~supply_rejection)
     )
     df["PE_Signal"] = (
         (c <= df["EMA21"] * 1.003)
-        & (c > df["BB_LO_38"] * 1.005)
-        & (df["RSI"] >= 30)
-        & (df["RSI"] <= 54)
+        & pe_bb_ok
+        & pe_rsi_ok
         & (df["RSI"] <= df["RSI_SMA"] * 1.02)
         & (~demand_bounce)
     )
@@ -1053,8 +1248,10 @@ def compute_intraday_15m_indicators(df, is_index=False):
         vol_clean = df["Volume"].replace(0, 1)
         dates = pd.Series(df.index.date, index=df.index)
         df["TREND_ANCHOR"] = (tp * vol_clean).groupby(dates).cumsum() / vol_clean.groupby(dates).cumsum()
-        vol_sma20 = df["Volume"].rolling(20).mean().replace(0, np.nan)
-        df["RVOL"] = (df["Volume"] / vol_sma20).fillna(1.0)
+        tod_groups = df["Volume"].groupby(df.index.time)
+        tod_mean = tod_groups.transform(lambda x: x.rolling(10, min_periods=3).mean()).replace(0, np.nan)
+        fallback_mean = df["Volume"].rolling(20).mean().replace(0, np.nan)
+        df["RVOL"] = (df["Volume"] / tod_mean.fillna(fallback_mean)).fillna(1.0)
 
     df["BB_SMA_38"] = c.rolling(38).mean()
     std_38 = c.rolling(38).std(ddof=0)
@@ -1072,8 +1269,7 @@ def compute_intraday_15m_indicators(df, is_index=False):
     df["RSI"] = (100 - (100 / (1 + (gain / loss.replace(0, np.nan))))).fillna(50.0)
     df["RSI_SMA"] = df["RSI"].rolling(14).mean().fillna(50.0)
 
-    tr = pd.concat([h - l, (h - c.shift()).abs(), (l - c.shift()).abs()], axis=1).max(axis=1)
-    df["ATR"] = tr.rolling(14).mean()
+    df["ATR"], df["ADX"] = compute_wilder_atr_and_adx(df, 14)
     df["HV20"] = np.log(c / c.shift(1)).rolling(50).std() * np.sqrt(252 * 25)
 
     hv_min = df["HV20"].rolling(500, min_periods=40).min()
@@ -1095,20 +1291,24 @@ def compute_intraday_15m_indicators(df, is_index=False):
         & (upper_wick_ratio >= 0.55)
     )
 
+    is_rvol_breakout = df["RVOL"] >= BREAKOUT_REGIME_RVOL
+    ce_bb_ok = (c < df["BB_UP_38"]) | (is_rvol_breakout & (c <= df["BB_UP_38"] * 1.015) & (c > o))
+    pe_bb_ok = (c > df["BB_LO_38"]) | (is_rvol_breakout & (c >= df["BB_LO_38"] * 0.985) & (c < o))
+
     df["CE_Signal"] = (
         (c >= df["TREND_ANCHOR"])
         & (df["EMA9"] >= df["EMA21"] * 0.998)
-        & (c < df["BB_UP_38"])
+        & ce_bb_ok
         & (df["RSI"] >= 48)
-        & (df["RSI"] <= 72)
+        & (df["RSI"] <= 74)
         & (df["RSI"] >= df["RSI_SMA"] * 0.98)
         & (~supply_rejection)
     )
     df["PE_Signal"] = (
         (c <= df["TREND_ANCHOR"])
         & (df["EMA9"] <= df["EMA21"] * 1.002)
-        & (c > df["BB_LO_38"])
-        & (df["RSI"] >= 28)
+        & pe_bb_ok
+        & (df["RSI"] >= 26)
         & (df["RSI"] <= 52)
         & (df["RSI"] <= df["RSI_SMA"] * 1.02)
         & (~demand_bounce)
@@ -1206,12 +1406,22 @@ def backtest_signals(df, direction="CE", atr_mult=1.0, und_rr=1.8, max_bars=6, i
 
 def replay_executed(df: pd.DataFrame, direction: str, eps: float, kappa: float, stop_rel: float, rr: float,
                     cost_r: float, is_intraday: bool, max_bars: int, theta_bar: float = 0.0, whipsaw_pad: float = 0.0) -> dict:
+    """
+    ATR-Adaptive Option-Premium Replay Engine:
+    Normalizes historical percentage excursions (`fav`, `adv`) by the ratio of today's ATR% (`curr_atr_pct`)
+    to historical bar `i`'s ATR% (`hist_atr_pct`), eliminating fixed-percentage stop distortion across
+    multi-year volatility regimes while preserving second-order Gamma convexity and Theta decay.
+    """
     sig = df["CE_Signal" if direction == "CE" else "PE_Signal"].values
-    cl, hi, lo = df["Close"].values, df["High"].values, df["Low"].values
+    cl, hi, lo, atrs = df["Close"].values, df["High"].values, df["Low"].values, df["ATR"].values
     n = len(df)
     sgn = 1.0 if direction == "CE" else -1.0
     tgt = rr * stop_rel
-    t1_rel = (INTRA_T1_RR if is_intraday else SWING_T1_RR) * stop_rel
+    t1_r_lock = INTRA_T1_RR if is_intraday else SWING_T1_RR
+    t1_rel = t1_r_lock * stop_rel
+
+    curr_atr_pct = float(atrs[-1] / cl[-1]) if (n > 0 and cl[-1] > 0 and atrs[-1] > 0) else 0.015
+    eff_theta_bar = min(theta_bar, stop_rel * (0.04 if is_intraday else 0.08))
 
     if is_intraday:
         day_id = (df.index.year * 10000 + df.index.month * 100 + df.index.day).values
@@ -1227,40 +1437,57 @@ def replay_executed(df: pd.DataFrame, direction: str, eps: float, kappa: float, 
     out = []
     i = 65
     while i < n - 1:
-        if not sig[i] or cl[i] <= 0 or (is_intraday and not (570 <= mins[i] <= 870)):
+        if not sig[i] or cl[i] <= 0 or np.isnan(atrs[i]) or atrs[i] <= 0 or (is_intraday and not (570 <= mins[i] <= 870)):
             i += 1
             continue
         entry = cl[i]
+        hist_atr_pct = max(float(atrs[i] / entry), 1e-4)
+        vol_scale = float(np.clip(curr_atr_pct / hist_atr_pct, 0.55, 1.65))
+
         end = last_of_day[i] if is_intraday else min(i + max_bars, n - 1)
         if end <= i:
             i += 1
             continue
         level, r_val, exit_j = -stop_rel, None, end
         t1_hit = False
-        t1_r_lock = INTRA_T1_RR if is_intraday else SWING_T1_RR
 
         for j in range(i + 1, end + 1):
-            fav = sgn * ((hi[j] if sgn > 0 else lo[j]) - entry) / entry
-            adv = sgn * ((lo[j] if sgn > 0 else hi[j]) - entry) / entry
-            decay = theta_bar * (j - i)
+            fav = sgn * ((hi[j] if sgn > 0 else lo[j]) - entry) / entry * vol_scale
+            adv = sgn * ((lo[j] if sgn > 0 else hi[j]) - entry) / entry * vol_scale
+            decay = eff_theta_bar * (j - i)
             p_hi = prem(fav) - decay
             p_lo = prem(adv) - decay - whipsaw_pad
             curr_stop = 0.0 if t1_hit else level
 
-            if p_lo <= curr_stop:
-                raw_r = (0.5 * t1_r_lock) if t1_hit else (level / stop_rel)
-                r_val, exit_j = raw_r - cost_r, j
-                break
-            if p_hi >= tgt:
-                raw_r = (0.5 * t1_r_lock + 0.5 * rr) if t1_hit else rr
-                r_val, exit_j = raw_r - cost_r, j
-                break
-            if p_hi >= t1_rel:
-                t1_hit = True
+            bar_favorable_close = (cl[j] >= entry) if sgn > 0 else (cl[j] <= entry)
+
+            if bar_favorable_close:
+                if p_hi >= tgt:
+                    raw_r = (0.5 * t1_r_lock + 0.5 * rr) if t1_hit else rr
+                    r_val, exit_j = raw_r - cost_r, j
+                    break
+                if p_hi >= t1_rel:
+                    t1_hit = True
+                    curr_stop = 0.0
+                if p_lo <= curr_stop:
+                    raw_r = (0.5 * t1_r_lock) if t1_hit else (level / stop_rel)
+                    r_val, exit_j = raw_r - cost_r, j
+                    break
+            else:
+                if p_lo <= curr_stop:
+                    raw_r = (0.5 * t1_r_lock) if t1_hit else (level / stop_rel)
+                    r_val, exit_j = raw_r - cost_r, j
+                    break
+                if p_hi >= tgt:
+                    raw_r = (0.5 * t1_r_lock + 0.5 * rr) if t1_hit else rr
+                    r_val, exit_j = raw_r - cost_r, j
+                    break
+                if p_hi >= t1_rel:
+                    t1_hit = True
 
         if r_val is None:
-            x = sgn * (cl[end] - entry) / entry
-            rem_r = max(prem(x) - theta_bar * (end - i), level) / stop_rel
+            x = sgn * (cl[end] - entry) / entry * vol_scale
+            rem_r = max(prem(x) - eff_theta_bar * (end - i), level) / stop_rel
             raw_r = (0.5 * t1_r_lock + 0.5 * max(0.0, rem_r)) if t1_hit else rem_r
             r_val = raw_r - cost_r
         out.append(r_val)
@@ -1274,6 +1501,20 @@ def replay_executed(df: pd.DataFrame, direction: str, eps: float, kappa: float, 
         "win": float((arr > 0).mean() * 100.0),
         "full_loss": float((arr <= -0.9).mean() * 100.0),
     }
+
+
+def classify_trend_tag(df: pd.DataFrame, spot: float, opt_type: str, is_intraday: bool, force_index_hrhr: bool = False) -> str:
+    """Returns a concise 7-char Trend/Mode tag for the mandatory Trend column."""
+    last = df.iloc[-1]
+    ema21 = float(last.get("EMA21", spot))
+    ema55 = float(last.get("EMA55", ema21))
+    if force_index_hrhr:
+        if opt_type == "CE":
+            return "BULL-HR" if ema21 >= ema55 * 0.998 else "RECV-HR"
+        return "BEAR-HR" if ema21 <= ema55 * 1.002 else "PULL-HR"
+    if is_intraday:
+        return "BULL-15" if opt_type == "CE" else "BEAR-15"
+    return "BULL-SW" if opt_type == "CE" else "BEAR-SW"
 
 
 def _compute_index_hrhr_lotto_tag(
@@ -1334,7 +1575,9 @@ def build_option_trade_row(
     oi_tag,
     is_oi_boosted,
     dhan_engine: DhanOptionEngine,
+    force_index_hrhr: bool = False,
     allow_hrhr_index_fallback: bool = False,
+    trend_tag: str = "",
 ):
     latest = df.iloc[-1]
     spot = float(latest["Close"])
@@ -1344,103 +1587,155 @@ def build_option_trade_row(
     ivp_proxy = float(latest.get("IVP_PROXY", 50.0))
 
     step = get_dynamic_strike_step(spot, meta)
-    atm_strike = int(round(spot / step) * step) if step >= 5 else round(spot / step) * step
+    base_atm = int(round(spot / step) * step) if step >= 5 else round(spot / step) * step
+    if force_index_hrhr and INDEX_HRHR_OTM_STEPS > 0:
+        shift = (INDEX_HRHR_OTM_STEPS * step) if opt_type == "CE" else -(INDEX_HRHR_OTM_STEPS * step)
+        atm_strike = int(round((base_atm + shift) / step) * step) if step >= 5 else round((base_atm + shift) / step) * step
+    else:
+        atm_strike = base_atm
 
+    if not trend_tag:
+        trend_tag = classify_trend_tag(
+            df, spot, opt_type, is_intraday, force_index_hrhr=(force_index_hrhr or allow_hrhr_index_fallback)
+        )
+
+    # 1. NYKAA / NAVINFLUOR Trap Filter (Block Low-Volume + High-IVP Traps)
     if not meta["is_idx"] and not is_oi_boosted:
         if rvol < 0.85 and ivp_proxy > MAX_SAFE_IVP:
             return None
 
     min_dte_req = MIN_DTE_INTRADAY if is_intraday else MIN_DTE_POSITIONAL
     mkt_open = is_market_open_now()
-
-    dhan_quote = dhan_engine.get_live_atm_option(meta, atm_strike, opt_type, min_dte=min_dte_req) if dhan_engine else None
-    if dhan_quote:
-        bid = dhan_quote["bid"]
-        ask = dhan_quote["ask"]
-        dte = dhan_quote["dte"] or min_dte_req
-        max_allowed_spread = MAX_SPREAD_FRONT_PCT if dte <= 10 else MAX_SPREAD_FAR_PCT
-        if mkt_open and bid > 0 and ask > 0:
-            spread_pct = (ask - bid) / ((ask + bid) / 2.0) * 100.0
-            if spread_pct > max_allowed_spread and not allow_hrhr_index_fallback:
-                return None
-            opt_entry = ask
-        else:
-            opt_entry = dhan_quote["ltp"]
-
-        delta      = dhan_quote["delta"]
-        gamma      = dhan_quote["gamma"]
-        theta      = dhan_quote["theta"]
-        live_iv    = dhan_quote["iv"]
-        und_ltp    = dhan_quote["und_ltp"]
-        atm_strike = dhan_quote["strike"]
-        exp_tag    = dhan_quote["exp_tag"]
-        pcr        = dhan_quote["pcr"]
-        call_wall  = dhan_quote["call_wall"]
-        put_wall   = dhan_quote["put_wall"]
-        src_flag   = "*"
-
-        if not meta["is_idx"] and hv20 > 0:
-            if (live_iv / hv20) > MAX_IV_HV_RATIO and rvol < 1.15:
-                return None
-
-        und_atr_mult = (
-            (INTRA_ATR_SL_MULT if meta["is_idx"] else STK_INTRA_ATR_SL_MULT)
-            if is_intraday
-            else (SWING_ATR_SL_MULT if meta["is_idx"] else STK_SWING_ATR_SL_MULT)
-        )
-        und_rr_mult  = INTRA_UND_RR if is_intraday else SWING_UND_RR
-        und_target_dist = atr * und_atr_mult * und_rr_mult
-
-        if not allow_hrhr_index_fallback:
-            if opt_type == "CE":
-                if pcr < MIN_BULL_PCR and not is_oi_boosted:
-                    return None
-                if call_wall > und_ltp and (call_wall - und_ltp) < (0.45 * und_target_dist) and pcr < 0.95:
-                    return None
-            else:
-                if pcr > MAX_BEAR_PCR and not is_oi_boosted:
-                    return None
-                if put_wall < und_ltp and (und_ltp - put_wall) < (0.45 * und_target_dist) and pcr > 1.05:
-                    return None
-    else:
-        dte, exp_tag = get_exchange_accurate_expiry(meta, min_dte=min_dte_req)
-        live_iv = india_vix * 1.12 if meta["is_idx"] else max(hv20 * 1.05, india_vix * 1.35)
-        opt_entry, delta, gamma, theta = black_scholes_greeks(
-            S=spot, K=atm_strike, T=dte / 365.0, r=RISK_FREE_RATE, sigma=live_iv, option_type=opt_type
-        )
-        bid = ask = 0.0
-        und_ltp = spot
-        pcr = 1.0
-        src_flag = ""
-
-    opt_entry = _tick(opt_entry)
-    if not meta["is_idx"] and opt_entry < MIN_STOCK_OPT_PRICE:
-        return None
-
-    strike_str = f"{int(atm_strike)}" if atm_strike == int(atm_strike) else f"{atm_strike:.1f}"
     lot_size = dhan_engine.lot_map.get(meta["nse"], meta["lot"]) if dhan_engine else meta["lot"]
 
-    atr_mult = (
-        (INTRA_ATR_SL_MULT if meta["is_idx"] else STK_INTRA_ATR_SL_MULT)
-        if is_intraday
-        else (SWING_ATR_SL_MULT if meta["is_idx"] else STK_SWING_ATR_SL_MULT)
-    )
-    und_risk = atr * atr_mult
-    raw_opt_sl_dist = delta * und_risk - 0.5 * gamma * (und_risk ** 2)
-
-    if meta["is_idx"]:
-        max_pct_sl, min_pct_sl, min_sl_pts = 0.15, 0.10, 0.50
+    if force_index_hrhr:
+        atr_mult   = INDEX_HRHR_ATR_SL_MULT
+        max_pct_sl = INDEX_HRHR_MAX_SL_PCT
+        min_pct_sl = INDEX_HRHR_MIN_SL_PCT
+        min_sl_pts = 0.50
+    elif meta["is_idx"]:
+        atr_mult   = INTRA_ATR_SL_MULT if is_intraday else SWING_ATR_SL_MULT
+        max_pct_sl = 0.15
+        min_pct_sl = 0.10
+        min_sl_pts = 0.50
     else:
-        max_pct_sl = 0.26 if is_intraday else 0.30
-        min_pct_sl = 0.18 if is_intraday else 0.20
+        atr_mult   = STOCK_INTRA_ATR_SL_MULT if is_intraday else STOCK_SWING_ATR_SL_MULT
+        max_pct_sl = STOCK_INTRA_MAX_SL_PCT if is_intraday else STOCK_SWING_MAX_SL_PCT
+        min_pct_sl = STOCK_INTRA_MIN_SL_PCT if is_intraday else STOCK_SWING_MIN_SL_PCT
         min_sl_pts = MIN_STOCK_SL_POINTS
 
-    opt_risk = max(round(min(opt_entry * max_pct_sl, max(opt_entry * min_pct_sl, raw_opt_sl_dist)), 1), min_sl_pts)
-    opt_sl = _tick(max(0.5, opt_entry - opt_risk))
-    actual_risk = max(round(opt_entry - opt_sl, 2), min_sl_pts)
+    # Smart Strike Selector: Try ATM (0), then 1-step, 2-step, or 3-step OTM if 1-lot risk/cap is exceeded
+    candidate_steps = [0] if meta["is_idx"] else [0, 1, 2, 3]
+    selected = None
 
-    target_rr = INTRA_OPT_RR if is_intraday else SWING_OPT_RR
-    t1_rr = INTRA_T1_RR if is_intraday else SWING_T1_RR
+    for otm_step_try in candidate_steps:
+        dhan_quote = (
+            dhan_engine.get_live_atm_option(
+                meta, atm_strike, opt_type, min_dte=min_dte_req, otm_steps=otm_step_try, use_target_strike=force_index_hrhr
+            )
+            if dhan_engine
+            else None
+        )
+        if dhan_quote:
+            bid = dhan_quote["bid"]
+            ask = dhan_quote["ask"]
+            dte = dhan_quote["dte"] or min_dte_req
+            max_allowed_spread = MAX_SPREAD_FRONT_PCT if dte <= 10 else MAX_SPREAD_FAR_PCT
+            if mkt_open and bid > 0 and ask > 0:
+                spread_pct = (ask - bid) / ((ask + bid) / 2.0) * 100.0
+                if spread_pct > max_allowed_spread and not (force_index_hrhr or allow_hrhr_index_fallback):
+                    continue
+                opt_entry_raw = ask
+            else:
+                opt_entry_raw = dhan_quote["ltp"]
+
+            delta_c     = dhan_quote["delta"]
+            gamma_c     = dhan_quote["gamma"]
+            theta_c     = dhan_quote["theta"]
+            live_iv_c   = dhan_quote["iv"]
+            und_ltp_c   = dhan_quote["und_ltp"]
+            strike_c    = dhan_quote["strike"]
+            exp_tag_c   = dhan_quote["exp_tag"]
+            pcr_c       = dhan_quote["pcr"]
+            call_wall_c = dhan_quote["call_wall"]
+            put_wall_c  = dhan_quote["put_wall"]
+            src_flag_c  = "*"
+
+            # Block extreme IV spikes (e.g., NAVINFLUOR 198% IV)
+            if not meta["is_idx"] and live_iv_c > 0.85:
+                return None
+            if not meta["is_idx"] and hv20 > 0:
+                if (live_iv_c / hv20) > MAX_IV_HV_RATIO and rvol < 1.30 and not is_oi_boosted:
+                    return None
+
+            und_rr_mult = INDEX_HRHR_UND_RR if force_index_hrhr else (INTRA_UND_RR if is_intraday else SWING_UND_RR)
+            und_target_dist = atr * atr_mult * und_rr_mult
+
+            if not (force_index_hrhr or allow_hrhr_index_fallback):
+                is_strong_breakout = is_oi_boosted and rvol >= BREAKOUT_REGIME_RVOL
+                if opt_type == "CE":
+                    if pcr_c < MIN_BULL_PCR and not is_oi_boosted:
+                        return None
+                    if not is_strong_breakout and call_wall_c > und_ltp_c and (call_wall_c - und_ltp_c) < (0.35 * und_target_dist) and pcr_c < 0.80:
+                        return None
+                else:
+                    if pcr_c > MAX_BEAR_PCR and not is_oi_boosted:
+                        return None
+                    if not is_strong_breakout and put_wall_c < und_ltp_c and (und_ltp_c - put_wall_c) < (0.35 * und_target_dist) and pcr_c > 1.20:
+                        return None
+        else:
+            if not meta["is_idx"] and REQUIRE_LIVE_CHAIN_FOR_STOCKS:
+                return None
+            dte, exp_tag_c = get_exchange_accurate_expiry(meta, min_dte=min_dte_req)
+            live_iv_c = india_vix * 1.12 if meta["is_idx"] else max(hv20 * 1.05, india_vix * 1.35)
+            strike_c = atm_strike + (otm_step_try * step if opt_type == "CE" else -otm_step_try * step)
+            opt_entry_raw, delta_c, gamma_c, theta_c = black_scholes_greeks(
+                S=spot, K=strike_c, T=dte / 365.0, r=RISK_FREE_RATE, sigma=live_iv_c, option_type=opt_type
+            )
+            bid = ask = 0.0
+            und_ltp_c = spot
+            pcr_c = 1.0
+            src_flag_c = ""
+
+        bar_span = float(latest["High"]) - float(latest["Low"])
+        if not meta["is_idx"] and bar_span > (1.25 * atr):
+            opt_entry_c = _tick(opt_entry_raw * STOCK_PULLBACK_ENTRY_DISC)
+        else:
+            opt_entry_c = _tick(opt_entry_raw)
+
+        if not meta["is_idx"] and opt_entry_c < MIN_STOCK_OPT_PRICE:
+            continue
+
+        und_risk = atr * atr_mult
+        raw_opt_sl_dist = delta_c * und_risk - 0.5 * gamma_c * (und_risk ** 2)
+        opt_risk_c = max(round(min(opt_entry_c * max_pct_sl, max(opt_entry_c * min_pct_sl, raw_opt_sl_dist)), 1), min_sl_pts)
+        opt_sl_c = _tick(max(0.5, opt_entry_c - opt_risk_c))
+        actual_risk_c = max(round(opt_entry_c - opt_sl_c, 2), min_sl_pts)
+
+        risk_per_lot_c = max(actual_risk_c * lot_size, 1.0)
+        cost_per_lot_c = max(opt_entry_c * lot_size, 1.0)
+
+        if LOCK_TO_SINGLE_LOT and not (force_index_hrhr or allow_hrhr_index_fallback):
+            if risk_per_lot_c > MAX_SINGLE_LOT_RISK or cost_per_lot_c > MAX_CAPITAL_PER_TRADE:
+                continue
+
+        selected = (
+            opt_entry_c, opt_sl_c, actual_risk_c, delta_c, gamma_c, theta_c,
+            live_iv_c, und_ltp_c, strike_c, dte, exp_tag_c, pcr_c, src_flag_c, bid, ask
+        )
+        break
+
+    if not selected:
+        return None
+
+    (
+        opt_entry, opt_sl, actual_risk, delta, gamma, theta,
+        live_iv, und_ltp, atm_strike, dte, exp_tag, pcr, src_flag, bid, ask
+    ) = selected
+
+    strike_str = f"{int(atm_strike)}" if atm_strike == int(atm_strike) else f"{atm_strike:.1f}"
+    target_rr = INDEX_HRHR_OPT_RR if force_index_hrhr else (INTRA_OPT_RR if is_intraday else SWING_OPT_RR)
+    t1_rr = INDEX_HRHR_T1_RR if force_index_hrhr else (INTRA_T1_RR if is_intraday else SWING_T1_RR)
     opt_t1 = _tick(opt_entry + (actual_risk * t1_rr))
     opt_tgt = _tick(opt_entry + (actual_risk * target_rr))
 
@@ -1448,38 +1743,48 @@ def build_option_trade_row(
     cost_per_lot = max(opt_entry * lot_size, 1.0)
 
     if LOCK_TO_SINGLE_LOT:
-        if not allow_hrhr_index_fallback and (risk_per_lot > MAX_SINGLE_LOT_RISK or cost_per_lot > MAX_CAPITAL_PER_TRADE):
-            return None
         num_lots = 1
     else:
         lots_by_risk = int(TARGET_RISK_PER_TRADE // risk_per_lot)
         lots_by_cap = int(MAX_CAPITAL_PER_TRADE // cost_per_lot)
-        num_lots = min(lots_by_risk, lots_by_cap)
+        num_lots = max(1, min(lots_by_risk, lots_by_cap)) if (force_index_hrhr or allow_hrhr_index_fallback) else min(lots_by_risk, lots_by_cap)
         if num_lots < 1:
             return None
 
+    # 3. ATR-Adaptive Executed-Geometry Replay Gate (in Option-Premium Space)
     stop_rel = actual_risk / opt_entry
     eps_ = delta * und_ltp / opt_entry
     kap_ = gamma * und_ltp * und_ltp / opt_entry
-    spread_r = (0.5 * (ask - bid) / actual_risk) if (mkt_open and ask > 0 and bid > 0) else 0.05
-    spread_r = min(spread_r, 0.20)
+    spread_r = (0.5 * (ask - bid) / actual_risk) if (mkt_open and ask > 0 and bid > 0) else 0.03
+    spread_r = min(spread_r, 0.15)
     cost_r = COST_SLIPPAGE_R + spread_r
-    theta_rel_day = min(theta / opt_entry, 0.20) if opt_entry > 0 else 0.0
+    theta_rel_day = min(theta / opt_entry, 0.12) if opt_entry > 0 else 0.0
     theta_bar = theta_rel_day / 25.0 if is_intraday else theta_rel_day
     whipsaw_pad = 0.0 if meta["is_idx"] else STK_WHIPSAW_PAD
 
     ex = replay_executed(
         df, opt_type, eps_, kap_, stop_rel, target_rr, cost_r, is_intraday, SWING_MAX_DAYS, theta_bar, whipsaw_pad
     )
-    if EXEC_GATE_ENABLED and not allow_hrhr_index_fallback:
+    if EXEC_GATE_ENABLED and not (force_index_hrhr or allow_hrhr_index_fallback):
         min_req_n = 6 if meta["is_idx"] else EXEC_MIN_SETUPS
         min_req_exp = 0.01 if meta["is_idx"] else EXEC_MIN_EXP_R
-        if ex["n"] < min_req_n or ex["exp"] < min_req_exp:
+        blended_check_exp = 0.55 * ex["exp"] + 0.45 * expectancy if ex["n"] >= min_req_n else expectancy
+        if ex["n"] < min_req_n or (ex["exp"] < min_req_exp and blended_check_exp < 0.04):
             return None
 
-    final_exp = ex["exp"] if ex["n"] >= 8 else expectancy
-    final_win = ex["win"] if ex["n"] >= 8 else win_pct
-    sample_n  = max(ex["n"] if ex["n"] >= 8 else total_trades, 1)
+    if ALLOW_SYNTHETIC_INDEX_FLOOR and (force_index_hrhr or allow_hrhr_index_fallback) and (ex["n"] < 5 or ex["exp"] <= 0.0):
+        final_exp = max(expectancy, 0.06)
+        final_win = max(win_pct, 42.0)
+        sample_n  = max(total_trades, 12)
+    else:
+        if ex["n"] >= 6:
+            final_exp = (0.60 * ex["exp"] + 0.40 * expectancy) if ex["exp"] > -0.05 else ex["exp"]
+            final_win = 0.60 * ex["win"] + 0.40 * win_pct
+            sample_n  = ex["n"]
+        else:
+            final_exp = expectancy
+            final_win = win_pct
+            sample_n  = max(total_trades, 1)
 
     shrunk_win = ((final_win * sample_n) + (46.0 * 8.0)) / (sample_n + 8.0)
 
@@ -1489,9 +1794,16 @@ def build_option_trade_row(
 
     exp_rounded = round(final_exp, 2)
     win_rounded = round(shrunk_win, 1)
-    quality_score = round((exp_rounded * 85.0) + (win_rounded * 1.25), 1)
 
-    hrhr_prefix = "🎲" if allow_hrhr_index_fallback else src_flag
+    # Half-Kelly Compounding Edge Calculation
+    p_win = shrunk_win / 100.0
+    q_loss = 1.0 - p_win
+    eff_payoff = 0.5 * t1_rr + 0.5 * target_rr
+    half_kelly_pct = round(max(0.0, ((p_win * eff_payoff - q_loss) / max(eff_payoff, 0.5)) * 0.5) * 100.0, 1)
+
+    quality_score = round((exp_rounded * 85.0) + (win_rounded * 1.25) + (half_kelly_pct * 0.35), 1)
+
+    hrhr_prefix = ("🎲" + src_flag) if allow_hrhr_index_fallback else src_flag
     full_contract_name = f"{hrhr_prefix}{meta['nse']} {strike_str}{opt_type}"
 
     hrhr_lotto_str = _compute_index_hrhr_lotto_tag(
@@ -1509,6 +1821,7 @@ def build_option_trade_row(
     return {
         "Contract": full_contract_name,
         "Expiry": exp_tag,
+        "Trend": trend_tag,
         "Entry": opt_entry,
         "Qty": qty,
         "Capital": capital,
@@ -1520,13 +1833,17 @@ def build_option_trade_row(
         "PCR": pcr,
         "Expectancy": exp_rounded,
         "WinProb": win_rounded,
+        "KellyPct": half_kelly_pct,
         "Score": quality_score,
         "OIBoost": 1 if is_oi_boosted else 0,
+        "IsFallback": 1 if allow_hrhr_index_fallback else 0,
         "HRHR_Lotto": hrhr_lotto_str,
     }
 
 
-def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine: DhanOptionEngine, oi_status_str: str):
+def format_combined_table(
+    idx_records, stk_records, title, now_str, dhan_engine: DhanOptionEngine, oi_status_str: str, is_positional: bool = False
+):
     lot_sync_cnt = len(dhan_engine.lot_map) if dhan_engine else 0
     if dhan_engine and dhan_engine.enabled and dhan_engine.live_quotes_fetched > 0:
         feed_str = f"Dhan Chain ({dhan_engine.live_quotes_fetched}) + {lot_sync_cnt} Lots + {oi_status_str}"
@@ -1534,13 +1851,13 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
         feed_str = f"Lots ({lot_sync_cnt}) + {oi_status_str}"
 
     idx_col_hdr = (
-        f"{'Contract':<19}|{'Exp':>5}|{'Entry':>6}|{'Qty':>4}|{'Cap(₹)':>6}|"
+        f"{'Contract':<19}|{'Exp':>5}|{'Trend':<7}|{'Entry':>6}|{'Qty':>4}|{'Cap(₹)':>6}|"
         f"{'SL':>6}|{'T1-50%':>6}|{'Target':>6}|{'OI_Flow':>7}|{'ExpR':>5}|{'Win%':>5}|{'Score':>5}|{'HRHR_Lotto(3.5R)':<17}"
     )
     idx_sep = "-" * len(idx_col_hdr)
 
     stk_col_hdr = (
-        f"{'Contract':<19}|{'Exp':>5}|{'Entry':>6}|{'Qty':>4}|{'Cap(₹)':>6}|"
+        f"{'Contract':<19}|{'Exp':>5}|{'Trend':<7}|{'Entry':>6}|{'Qty':>4}|{'Cap(₹)':>6}|"
         f"{'SL':>6}|{'T1-50%':>6}|{'Target':>6}|{'OI_Flow':>7}|{'ExpR':>5}|{'Win%':>5}|{'Score':>5}"
     )
     stk_sep = "-" * len(stk_col_hdr)
@@ -1551,7 +1868,12 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
     ]
 
     if idx_records:
-        lines.append("<b>📌 MAJOR INDICES F&amp;O (MANDATORY + HRHR GAMMA-LOTTO COLUMN)</b>")
+        idx_hdr_title = (
+            "<b>📌 MAJOR INDICES F&amp;O (MANDATORY POSITIONAL TREND | ATR-ADAPTIVE STATS + GAMMA LOTTO)</b>"
+            if is_positional else
+            "<b>📌 MAJOR INDICES F&amp;O (ATR-ADAPTIVE STATS + WILSON SCORE + GAMMA LOTTO)</b>"
+        )
+        lines.append(idx_hdr_title)
         lines.append("<pre>")
         lines.append(html.escape(idx_col_hdr))
         lines.append(html.escape(idx_sep))
@@ -1559,6 +1881,7 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
             row_str = (
                 f"{r['Contract']:<19}|"
                 f"{r['Expiry']:>5}|"
+                f"{r.get('Trend', 'TREND'):<7}|"
                 f"{r['Entry']:>6.1f}|"
                 f"{r['Qty']:>4d}|"
                 f"{r['Capital']:>6d}|"
@@ -1575,7 +1898,7 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
         lines.append("</pre>\n")
 
     if stk_records:
-        lines.append(f"<b>🚀 TOP {len(stk_records[:TOP_N_STOCKS])} STOCK OPTIONS (MTF ALIGNED &amp; ANTI-WHIPSAW SL)</b>")
+        lines.append(f"<b>🚀 TOP {len(stk_records[:TOP_N_STOCKS])} STOCK OPTIONS (105-SYM UNIVERSE + BREAKOUT BYPASS + OTM SOLVER)</b>")
         lines.append("<pre>")
         lines.append(html.escape(stk_col_hdr))
         lines.append(html.escape(stk_sep))
@@ -1583,6 +1906,7 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
             row_str = (
                 f"{r['Contract']:<19}|"
                 f"{r['Expiry']:>5}|"
+                f"{r.get('Trend', 'SWING'):<7}|"
                 f"{r['Entry']:>6.1f}|"
                 f"{r['Qty']:>4d}|"
                 f"{r['Capital']:>6d}|"
@@ -1597,31 +1921,36 @@ def format_combined_table(idx_records, stk_records, title, now_str, dhan_engine:
             lines.append(html.escape(row_str))
         lines.append("</pre>")
 
-    all_cands = list(idx_records) + list(stk_records[:TOP_N_STOCKS])
+    all_cands = [r for r in (list(idx_records) + list(stk_records[:TOP_N_STOCKS])) if r.get("IsFallback", 0) == 0]
     prime_picks = [
         r for r in all_cands
-        if r["Expectancy"] >= 0.08 and r["WinProb"] >= 49.0 and r["OIBoost"] == 1
+        if r["Expectancy"] >= 0.08 and r["WinProb"] >= 48.0 and r["OIBoost"] == 1
     ]
     if not prime_picks:
-        prime_picks = [r for r in all_cands if r["Expectancy"] >= 0.05 and r["WinProb"] >= 48.0]
+        prime_picks = [r for r in all_cands if r["Expectancy"] >= 0.04 and r["WinProb"] >= 46.5]
 
     prime_picks.sort(key=lambda x: (x["OIBoost"], x["Score"]), reverse=True)
     top_two = prime_picks[:2]
 
     if top_two:
-        lines.append("\n<b>🏆 TOP HIGH-CONVICTION TRADES (AUTO 3-STEP TRIAGE):</b>")
+        lines.append("\n<b>🏆 TOP HIGH-CONVICTION COMPOUNDING TRADES (HALF-KELLY TRIAGE):</b>")
         for idx, p in enumerate(top_two, 1):
-            lotto_note = f" | Lotto: <code>{html.escape(p['HRHR_Lotto'])}</code>" if p.get("HRHR_Lotto") and p["HRHR_Lotto"] != "--" else ""
+            lotto_note = (
+                f" | Lotto: <code>{html.escape(p['HRHR_Lotto'])}</code>"
+                if p.get("HRHR_Lotto") and p["HRHR_Lotto"] != "--"
+                else ""
+            )
             lines.append(
                 f"{idx}. <b>{html.escape(p['Contract'])} ({html.escape(p['Expiry'])})</b> "
                 f"👉 Entry: <code>₹{p['Entry']:.2f}</code> | 1-Lot Qty: <code>{p['Qty']}</code> "
                 f"| Cap: <code>₹{p['Capital']:,}</code> | Risk: <code>₹{p['RiskRs']:,}</code> "
                 f"| SL: <code>{p['Stop']:.2f}</code> | T1: <code>{p['T1']:.2f}</code> | Tgt: <code>{p['Target']:.2f}</code> "
-                f"| OI: <code>{html.escape(p['OI_Flow'].strip())}</code> | PCR: <code>{p['PCR']:.2f}</code>{lotto_note} | <b>Score: {p['Score']:.1f}</b>"
+                f"| Trend: <code>{html.escape(p.get('Trend', 'TREND'))}</code> | OI: <code>{html.escape(p['OI_Flow'].strip())}</code> "
+                f"| PCR: <code>{p['PCR']:.2f}</code> | ½-Kelly: <code>{p.get('KellyPct', 0.0):.1f}%</code>{lotto_note} | <b>Score: {p['Score']:.1f}</b>"
             )
 
     lines.append(
-        "\n💡 <i>&ast; = Live Dhan Chain | &#x1F3B2; = Mandatory Index HRHR Fallback | HRHR_Lotto = OTM Gamma Play (1:3.5 RR)</i>"
+        "\n💡 <i>* = Live Dhan Chain | &#x1F3B2; = Watchlist Index | 105-Symbol Universe | Futures-First OI &amp; ATR-Adaptive Replay</i>"
     )
     return "\n".join(lines)
 
@@ -1683,19 +2012,21 @@ def main():
     raw_15m = yf.download(tickers, period="60d", interval="15m", group_by="ticker", progress=False)
     raw_1d = yf.download(tickers, period="5y", interval="1d", group_by="ticker", progress=False)
 
-    daily_slices = {}
+    daily_ind_map = {}
     for tk in tickers:
         df1d_raw = extract_ticker_df(raw_1d, tk)
         sliced_1d = get_closed_bar_slice(df1d_raw, is_intraday=False)
         if sliced_1d is not None and len(sliced_1d) >= 65:
-            daily_slices[tk] = compute_daily_indicators(sliced_1d)
-        else:
-            daily_slices[tk] = sliced_1d
+            daily_ind_map[tk] = compute_daily_indicators(sliced_1d)
 
-    # 1. INTRADAY 15M SCALPS (MTF 1D+15M ALIGNED + ANTI-WHIPSAW SL + MANDATORY INDEX HRHR)
+    # ==========================================================================
+    # 1. INTRADAY 15M SCALPS (105-SYM UNIVERSE + ATR-ADAPTIVE REPLAY + OTM SOLVER)
+    # ==========================================================================
     intra_idx, intra_idx_hrhr_pool, intra_stk = [], [], []
 
     for tk, meta in FNO_UNIVERSE.items():
+        if INDEX_ONLY_MODE and not meta["is_idx"]:
+            continue
         df15_raw = extract_ticker_df(raw_15m, tk)
         df15 = get_closed_bar_slice(df15_raw, is_intraday=True)
         if len(df15) < 85:
@@ -1704,12 +2035,13 @@ def main():
         last = df15.iloc[-1]
 
         nse_sym = normalize_nse_symbol(meta["nse"])
-        dhan_ltp = dhan_spot_snap.get(nse_sym, {}).get("ltp", 0.0)
-        spot_close = float(dhan_ltp) if (is_market_open_now() and dhan_ltp > 0) else float(last["Close"])
+        dhan_snap = dhan_spot_snap.get(nse_sym, {})
+        live_ltp = float(dhan_snap.get("ltp", 0.0) or 0.0)
+        spot_close = live_ltp if live_ltp > 0 else float(last["Close"])
 
-        df1d_ref = daily_slices.get(tk)
+        df1d_ref = daily_ind_map.get(tk)
         yf_prev_c = float(df1d_ref["Close"].iloc[-2]) if (df1d_ref is not None and len(df1d_ref) >= 2) else 0.0
-        dhan_prev_c = dhan_spot_snap.get(nse_sym, {}).get("prev_close", 0.0)
+        dhan_prev_c = float(dhan_snap.get("prev_close", 0.0) or 0.0)
 
         today_bars = df15[df15.index.date == last.name.date()]
         day_open = float(today_bars["Open"].iloc[0]) if not today_bars.empty else float(last["Open"])
@@ -1720,13 +2052,22 @@ def main():
         opt_type = "CE" if spot_close >= float(last["TREND_ANCHOR"]) else "PE"
         sig_col = "CE_Signal" if opt_type == "CE" else "PE_Signal"
 
-        is_blocked, is_boosted, oi_tag = classify_institutional_oi(price_chg_pct, oi_chg_pct, opt_type)
-        atr_sl_mult = INTRA_ATR_SL_MULT if meta["is_idx"] else STK_INTRA_ATR_SL_MULT
-        tot, exp_r, wp = backtest_signals(df15, opt_type, atr_sl_mult, INTRA_UND_RR, INTRA_MAX_BARS, True, t1_on=True)
+        rvol_1d_fallback = float(df1d_ref["RVOL"].iloc[-1]) * 0.90 if (df1d_ref is not None and "RVOL" in df1d_ref.columns) else 1.0
+        rvol_15m = max(float(last.get("RVOL", 1.0)), rvol_1d_fallback)
+        adx_15m = float(last.get("ADX", 20.0))
+
+        is_blocked, is_boosted, oi_tag = classify_institutional_oi(
+            price_chg_pct, oi_chg_pct, opt_type, is_idx=meta["is_idx"], rvol=rvol_15m, adx=adx_15m
+        )
+        atr_sl_m = INTRA_ATR_SL_MULT if meta["is_idx"] else STOCK_INTRA_ATR_SL_MULT
+        tot, exp_r, wp = backtest_signals(df15, opt_type, atr_sl_m, INTRA_UND_RR, INTRA_MAX_BARS, True, t1_on=True)
         q_score = (round(exp_r, 2) * 85.0) + (round(wp, 1) * 1.25)
 
         if meta["is_idx"]:
-            intra_idx_hrhr_pool.append((q_score, is_boosted, meta, df15, opt_type, max(tot, 5), max(exp_r, 0.02), max(wp, 44.0), oi_tag))
+            p_tot = max(tot, 6) if ALLOW_SYNTHETIC_INDEX_FLOOR else max(tot, 1)
+            p_exp = max(exp_r, 0.04) if ALLOW_SYNTHETIC_INDEX_FLOOR else exp_r
+            p_wp  = max(wp, 44.0) if ALLOW_SYNTHETIC_INDEX_FLOOR else wp
+            intra_idx_hrhr_pool.append((q_score, is_boosted, meta, df15, opt_type, p_tot, p_exp, p_wp, oi_tag))
 
         if not bool(last[sig_col]) or is_blocked:
             continue
@@ -1735,16 +2076,24 @@ def main():
             if tot >= 6 and exp_r > 0.0:
                 intra_idx.append((q_score, is_boosted, meta, df15, opt_type, tot, exp_r, wp, oi_tag))
         else:
-            if df1d_ref is not None and "EMA21" in df1d_ref.columns:
-                d_last = df1d_ref.iloc[-1]
-                d_ema21 = float(d_last["EMA21"])
-                d_rsi = float(d_last["RSI"])
-                if opt_type == "CE" and (spot_close < d_ema21 * 0.995 or d_rsi < 45.0):
-                    continue
-                if opt_type == "PE" and (spot_close > d_ema21 * 1.005 or d_rsi > 55.0):
-                    continue
-            if not (is_boosted or float(last.get("RVOL", 1.0)) >= 1.15):
+            if REQUIRE_MTF_ALIGNMENT_15M and df1d_ref is not None and len(df1d_ref) >= 65:
+                last_1d = df1d_ref.iloc[-1]
+                ema21_1d = float(last_1d["EMA21"])
+                ema55_1d = float(last_1d["EMA55"])
+                if opt_type == "CE":
+                    if spot_close < (ema21_1d * 0.994) or ema21_1d < (ema55_1d * 0.985):
+                        continue
+                else:
+                    if spot_close > (ema21_1d * 1.006) or ema21_1d > (ema55_1d * 1.015):
+                        continue
+
+            bar_rng_15m = float(last["High"]) - float(last["Low"])
+            max_bar_mult = 3.2 if rvol_15m >= BREAKOUT_REGIME_RVOL else 2.3
+            if bar_rng_15m > (max_bar_mult * float(last["ATR"])):
                 continue
+            if not is_boosted or rvol_15m < MIN_STOCK_RVOL_15M or adx_15m < MIN_STOCK_ADX:
+                continue
+
             if tot >= INTRA_MIN_SETUPS and exp_r >= INTRA_MIN_EXP_R:
                 intra_stk.append((q_score, is_boosted, meta, df15, opt_type, tot, exp_r, wp, oi_tag))
 
@@ -1774,7 +2123,7 @@ def main():
                 break
 
     intra_stk_rows = []
-    for _, b, m, d, o, t, exp_r, wp, tag in intra_stk[:TOP_N_STOCKS + 10]:
+    for _, b, m, d, o, t, exp_r, wp, tag in intra_stk[:TOP_N_STOCKS + 14]:
         if len(intra_stk_rows) >= TOP_N_STOCKS:
             break
         row = build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, True, tag, b, dhan_engine)
@@ -1785,26 +2134,32 @@ def main():
 
     if intra_idx_rows or intra_stk_rows:
         msg = format_combined_table(
-            intra_idx_rows, intra_stk_rows, "15M INTRADAY F&O SCALPS (LOCKED 1:1.75 RR)", now_str, dhan_engine, oi_status_str
+            intra_idx_rows, intra_stk_rows, "15M INTRADAY F&O SCALPS (LOCKED 1:1.75 RR)", now_str, dhan_engine, oi_status_str,
+            is_positional=False
         )
         send_telegram_alert(msg)
         messages_sent += 1
 
-    # 2. POSITIONAL 3-5D SWINGS (DUAL-BB 38/61 + T1 ENABLED + MANDATORY INDEX HRHR)
-    swing_idx, swing_idx_hrhr_pool, swing_stk = [], [], []
+    # ==========================================================================
+    # 2. POSITIONAL 3-5D SWINGS (105-SYM UNIVERSE + ATR-ADAPTIVE REPLAY)
+    # ==========================================================================
+    swing_idx, swing_stk = [], []
 
     for tk, meta in FNO_UNIVERSE.items():
-        df1d = daily_slices.get(tk)
-        if df1d is None or len(df1d) < 200 or "EMA21" not in df1d.columns:
+        if INDEX_ONLY_MODE and not meta["is_idx"]:
+            continue
+        df1d = daily_ind_map.get(tk)
+        if df1d is None or len(df1d) < 200:
             continue
         last = df1d.iloc[-1]
         prev = df1d.iloc[-2]
 
         nse_sym = normalize_nse_symbol(meta["nse"])
-        dhan_ltp = dhan_spot_snap.get(nse_sym, {}).get("ltp", 0.0)
-        spot_close = float(dhan_ltp) if (is_market_open_now() and dhan_ltp > 0) else float(last["Close"])
+        dhan_snap = dhan_spot_snap.get(nse_sym, {})
+        live_ltp = float(dhan_snap.get("ltp", 0.0) or 0.0)
+        spot_close = live_ltp if live_ltp > 0 else float(last["Close"])
         yf_prev_c = float(prev["Close"])
-        dhan_prev_c = dhan_spot_snap.get(nse_sym, {}).get("prev_close", 0.0)
+        dhan_prev_c = float(dhan_snap.get("prev_close", 0.0) or 0.0)
         true_prev_c = resolve_true_prev_close(spot_close, dhan_prev_c, yf_prev_c)
 
         price_chg_pct = ((spot_close - true_prev_c) / true_prev_c) * 100.0 if true_prev_c > 0 else 0.0
@@ -1813,23 +2168,62 @@ def main():
         opt_type = "CE" if spot_close >= float(last["EMA21"]) else "PE"
         sig_col = "CE_Signal" if opt_type == "CE" else "PE_Signal"
 
-        is_blocked, is_boosted, oi_tag = classify_institutional_oi(price_chg_pct, oi_chg_pct, opt_type)
-        atr_sl_mult = SWING_ATR_SL_MULT if meta["is_idx"] else STK_SWING_ATR_SL_MULT
-        tot, exp_r, wp = backtest_signals(df1d, opt_type, atr_sl_mult, SWING_UND_RR, SWING_MAX_DAYS, False, t1_on=True)
-        q_score = (round(exp_r, 2) * 85.0) + (round(wp, 1) * 1.25)
+        rvol_1d = float(last.get("RVOL", 1.0))
+        adx_1d = float(last.get("ADX", 20.0))
 
-        if meta["is_idx"]:
-            swing_idx_hrhr_pool.append((q_score, is_boosted, meta, df1d, opt_type, max(tot, 5), max(exp_r, 0.02), max(wp, 44.0), oi_tag))
+        is_blocked, is_boosted, oi_tag = classify_institutional_oi(
+            price_chg_pct, oi_chg_pct, opt_type, is_idx=meta["is_idx"], rvol=rvol_1d, adx=adx_1d
+        )
+
+        if meta["is_idx"] and MANDATORY_INDEX_POSITIONAL:
+            tot, exp_r, wp = backtest_signals(
+                df1d, opt_type, INDEX_HRHR_ATR_SL_MULT, INDEX_HRHR_UND_RR, SWING_MAX_DAYS, False, t1_on=True
+            )
+            if tot < 6:
+                df_trend = df1d.copy()
+                c_ser = df_trend["Close"]
+                df_trend["CE_Signal"] = (c_ser >= df_trend["EMA21"]) & (df_trend["RSI"] >= 45)
+                df_trend["PE_Signal"] = (c_ser < df_trend["EMA21"]) & (df_trend["RSI"] <= 55)
+                tot_t, exp_t, wp_t = backtest_signals(
+                    df_trend, opt_type, INDEX_HRHR_ATR_SL_MULT, INDEX_HRHR_UND_RR, SWING_MAX_DAYS, False, t1_on=True
+                )
+                if tot_t >= 5:
+                    tot   = tot_t
+                    exp_r = max(exp_t, 0.06) if ALLOW_SYNTHETIC_INDEX_FLOOR else exp_t
+                    wp    = max(wp_t, 42.0) if ALLOW_SYNTHETIC_INDEX_FLOOR else wp_t
+                    df1d  = df_trend
+
+            trend_lbl = classify_trend_tag(df1d, spot_close, opt_type, False, force_index_hrhr=True)
+            q_score = (round(exp_r, 2) * 85.0) + (round(wp, 1) * 1.25)
+            swing_idx.append((q_score, is_boosted, meta, df1d, opt_type, tot, exp_r, wp, oi_tag, trend_lbl))
+            continue
 
         if not bool(last[sig_col]) or is_blocked:
             continue
 
+        if not meta["is_idx"]:
+            ema21_1d = float(last["EMA21"])
+            ema55_1d = float(last["EMA55"])
+            if opt_type == "CE" and ema21_1d < (ema55_1d * 0.980):
+                continue
+            if opt_type == "PE" and ema21_1d > (ema55_1d * 1.020):
+                continue
+            bar_rng_1d = float(last["High"]) - float(last["Low"])
+            max_bar_mult_1d = 3.2 if rvol_1d >= BREAKOUT_REGIME_RVOL else 2.3
+            if bar_rng_1d > (max_bar_mult_1d * float(last["ATR"])):
+                continue
+            if not is_boosted or rvol_1d < MIN_STOCK_RVOL_1D or adx_1d < MIN_STOCK_ADX:
+                continue
+
+        atr_sl_m = SWING_ATR_SL_MULT if meta["is_idx"] else STOCK_SWING_ATR_SL_MULT
+        tot, exp_r, wp = backtest_signals(df1d, opt_type, atr_sl_m, SWING_UND_RR, SWING_MAX_DAYS, False, t1_on=True)
+        q_score = (round(exp_r, 2) * 85.0) + (round(wp, 1) * 1.25)
+
         if meta["is_idx"]:
             if tot >= 6 and exp_r > 0.0:
-                swing_idx.append((q_score, is_boosted, meta, df1d, opt_type, tot, exp_r, wp, oi_tag))
+                trend_lbl = classify_trend_tag(df1d, spot_close, opt_type, False, force_index_hrhr=False)
+                swing_idx.append((q_score, is_boosted, meta, df1d, opt_type, tot, exp_r, wp, oi_tag, trend_lbl))
         else:
-            if not (is_boosted or float(last.get("RVOL", 1.0)) >= 1.10):
-                continue
             if tot >= SWING_MIN_SETUPS and exp_r >= SWING_MIN_EXP_R:
                 swing_stk.append((q_score, is_boosted, meta, df1d, opt_type, tot, exp_r, wp, oi_tag))
 
@@ -1838,28 +2232,15 @@ def main():
 
     swing_idx_rows = [
         r for r in (
-            build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, False, tag, b, dhan_engine)
-            for _, b, m, d, o, t, exp_r, wp, tag in swing_idx
+            build_option_trade_row(
+                m, d, o, t, exp_r, wp, india_vix, False, tag, b, dhan_engine,
+                force_index_hrhr=MANDATORY_INDEX_POSITIONAL, trend_tag=tr_lbl
+            )
+            for _, b, m, d, o, t, exp_r, wp, tag, tr_lbl in swing_idx
         ) if r
     ]
-
-    if MANDATORY_INDEX_HRHR and len(swing_idx_rows) < 2 and swing_idx_hrhr_pool:
-        existing_idx_names = {r["Contract"].split()[0].lstrip("*🎲") for r in swing_idx_rows}
-        swing_idx_hrhr_pool.sort(key=lambda x: (1 if x[1] else 0, x[0]), reverse=True)
-        for _, b, m, d, o, t, exp_r, wp, tag in swing_idx_hrhr_pool:
-            if m["nse"] in existing_idx_names:
-                continue
-            hrhr_row = build_option_trade_row(
-                m, d, o, t, exp_r, wp, india_vix, False, tag, b, dhan_engine, allow_hrhr_index_fallback=True
-            )
-            if hrhr_row:
-                swing_idx_rows.append(hrhr_row)
-                existing_idx_names.add(m["nse"])
-            if len(swing_idx_rows) >= 3:
-                break
-
     swing_stk_rows = []
-    for _, b, m, d, o, t, exp_r, wp, tag in swing_stk[:TOP_N_STOCKS + 10]:
+    for _, b, m, d, o, t, exp_r, wp, tag in swing_stk[:TOP_N_STOCKS + 15]:
         if len(swing_stk_rows) >= TOP_N_STOCKS:
             break
         row = build_option_trade_row(m, d, o, t, exp_r, wp, india_vix, False, tag, b, dhan_engine)
@@ -1870,7 +2251,8 @@ def main():
 
     if swing_idx_rows or swing_stk_rows:
         msg = format_combined_table(
-            swing_idx_rows, swing_stk_rows, "3-5D POSITIONAL F&O (15+ DTE FAR EXPIRY | 1:2.5 RR)", now_str, dhan_engine, oi_status_str
+            swing_idx_rows, swing_stk_rows, "3-5D POSITIONAL F&O (15+ DTE FAR EXPIRY | 1:2.5 RR)", now_str, dhan_engine, oi_status_str,
+            is_positional=True
         )
         send_telegram_alert(msg)
         messages_sent += 1
